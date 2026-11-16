@@ -1,5 +1,12 @@
 import { initializeApp } from 'firebase/app';
-import { getAuth, GoogleAuthProvider, signInWithPopup, signOut } from 'firebase/auth';
+import {
+  getAuth,
+  getRedirectResult,
+  GoogleAuthProvider,
+  signInWithPopup,
+  signInWithRedirect,
+  signOut,
+} from 'firebase/auth';
 import { doc, getDocFromServer, getFirestore } from 'firebase/firestore';
 import firebaseConfig from '../firebase-applet-config.json';
 
@@ -7,6 +14,7 @@ const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 export const auth = getAuth(app);
 export const googleProvider = new GoogleAuthProvider();
+export const firebaseProjectId = firebaseConfig.projectId;
 
 export enum OperationType {
   CREATE = 'create',
@@ -76,6 +84,15 @@ export async function loginWithGoogle() {
   return signInWithPopup(auth, googleProvider);
 }
 
+export async function loginWithGoogleRedirect() {
+  return signInWithRedirect(auth, googleProvider);
+}
+
+export async function checkGoogleRedirectResult() {
+  return getRedirectResult(auth);
+}
+
 export async function logoutUser() {
   return signOut(auth);
 }
+

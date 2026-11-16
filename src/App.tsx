@@ -16,6 +16,7 @@ import {
   deleteDoc,
   updateDoc,
   setDoc,
+  Timestamp,
 } from 'firebase/firestore';
 import {
   Mic,
@@ -48,9 +49,12 @@ import {
 } from 'lucide-react';
 import {
   auth,
+  checkGoogleRedirectResult,
   db,
+  firebaseProjectId,
   handleFirestoreError,
   loginWithGoogle,
+  loginWithGoogleRedirect,
   logoutUser,
   OperationType,
 } from './firebase';
@@ -116,6 +120,14 @@ interface SpeechRecognitionInstance extends EventTarget {
 
 type ActiveSection = 'comandas' | 'equipe_comercio' | 'auditoria' | 'cardapio';
 
+interface DirectBarSession {
+  uid: string;
+  userName: string;
+  userRole: UserRoleType;
+  storeName: string;
+  storeCode: string;
+}
+
 interface TabSnapshotUndoState {
   tabId: string;
   createdNewTab: boolean;
@@ -146,6 +158,8 @@ interface MarceloReportCard {
   remainingBalance: number;
 }
 
+const DIRECT_SESSION_STORAGE_KEY = 'comanda_voz_direct_session_v1';
+
 const MARCELO_VOICE_EXAMPLES = [
   'Marcelo, marca 1 litrão para Thiago, marca 1 litrão para Jonas',
   'Marcelo, marque 2 espetinhos e 1 coca lata para Thiago',
@@ -160,9 +174,38 @@ const TRAINING_PHRASES = [
   'Marcelo, dê baixa na conta do cliente agora',
 ];
 
-function formatTime(ts: { toDate?: () => Date } | null | undefined): string {
-  if (!ts || typeof ts.toDate !== 'function') return 'Agora';
-  return ts.toDate().toLocaleTimeString('pt-BR', {
+function getTimestampMillis(ts: unknown): number {
+  if (!ts) return Date.now();
+  if (typeof ts === 'number') return ts;
+  if (typeof ts === 'object') {
+    const obj = ts as {
+      toMillis?: () => number;
+      toDate?: () => Date;
+      seconds?: number;
+      _ms?: number;
+    };
+    if (typeof obj.toMillis === 'function') return obj.toMillis();
+    if (typeof obj.toDate === 'function') return obj.toDate().getTime();
+    if (typeof obj._ms === 'number') return obj._ms;
+    if (typeof obj.seconds === 'number') return obj.seconds * 1000;
+  }
+  return Date.now();
+}
+
+function makeLocalTimestamp(): Timestamp {
+  const now = Date.now();
+  return {
+    seconds: Math.floor(now / 1000),
+    nanoseconds: 0,
+    toMillis: () => now,
+    toDate: () => new Date(now),
+  } as unknown as Timestamp;
+}
+
+function formatTime(ts: unknown): string {
+  if (!ts) return 'Agora';
+  const ms = getTimestampMillis(ts);
+  return new Date(ms).toLocaleTimeString('pt-BR', {
     hour: '2-digit',
     minute: '2-digit',
     second: '2-digit',
@@ -175,11 +218,51 @@ function getRemainingBalance(tab: BarTab): number {
 }
 
 function ComandaVozWorkspace() {
-  const [user, setUser] = useState<User | null>(null);
+  const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
+  const [directSession, setDirectSession] = useState<DirectBarSession | null>(() => {
+    try {
+      const saved = localStorage.getItem(DIRECT_SESSION_STORAGE_KEY);
+      if (saved) {
+        const parsed = JSON.parse(saved) as DirectBarSession;
+        if (parsed && parsed.uid && parsed.storeCode) return parsed;
+      }
+    } catch {
+      // ignore storage errors
+    }
+    return null;
+  });
+
   const [authReady, setAuthReady] = useState(false);
   const [activeSection, setActiveSection] = useState<ActiveSection>('comandas');
 
-  // Firestore Real-Time State
+  // Login Screen State (Google Error Diagnostic + Direct Bar Access on Render)
+  const [googleLoginBusy, setGoogleLoginBusy] = useState(false);
+  const [googleAuthError, setGoogleAuthError] = useState<{
+    code: string;
+    domain: string;
+    message: string;
+  } | null>(null);
+  const [copiedDomain, setCopiedDomain] = useState(false);
+  const [directNameInput, setDirectNameInput] = useState('Operador Principal');
+  const [directRoleInput, setDirectRoleInput] = useState<UserRoleType>('Proprietário');
+  const [directStoreNameInput, setDirectStoreNameInput] = useState('Bar & Comércio Central');
+  const [directStoreCodeInput, setDirectStoreCodeInput] = useState('BAR-01');
+
+  // Unified user accessor (works for both Firebase Auth User and Render Direct Session)
+  const isDirectSession = !firebaseUser && Boolean(directSession);
+  const user = useMemo(() => {
+    if (firebaseUser) return firebaseUser;
+    if (directSession) {
+      return {
+        uid: directSession.uid,
+        displayName: directSession.userName,
+        email: `${directSession.storeCode.toLowerCase()}@comandavoz.bar`,
+      } as User;
+    }
+    return null;
+  }, [firebaseUser, directSession]);
+
+  // Firestore / Store Real-Time State
   const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
   const [menuItems, setMenuItems] = useState<MenuItem[]>([]);
   const [tabs, setTabs] = useState<BarTab[]>([]);
@@ -254,35 +337,280 @@ function ComandaVozWorkspace() {
   const continuousModeRef = useRef(continuousMode);
   continuousModeRef.current = continuousMode;
 
-  // 1. Auth Listener
-  useEffect(() => {
-    const unsub = onAuthStateChanged(auth, (currentUser) => {
-      setUser(currentUser);
-      setAuthReady(true);
-      if (!currentUser) {
-        setUserProfile(null);
-        setMenuItems([]);
-        setTabs([]);
-        setTabItems([]);
-        setVoiceOperators([]);
-        setDataLoading(false);
+  // Helper to persist Direct Render Store snapshot to localStorage + Render Express server
+  const syncDirectStoreSnapshot = async (
+    nextData: {
+      storeCode?: string;
+      storeName?: string;
+      menuItems?: MenuItem[];
+      tabs?: BarTab[];
+      tabItems?: TabItem[];
+      voiceOperators?: VoiceOperator[];
+    }
+  ) => {
+    const code = sanitizeStoreCode(
+      nextData.storeCode || directSession?.storeCode || profileStoreCode || 'BAR-01'
+    );
+    const sName = sanitizeString(
+      nextData.storeName || directSession?.storeName || profileStoreName || 'Bar & Comércio Central',
+      VALIDATION_LIMITS.STORE_NAME_MAX_LEN
+    );
+    const payload = {
+      storeCode: code,
+      storeName: sName,
+      menuItems: nextData.menuItems ?? menuItems,
+      tabs: nextData.tabs ?? tabs,
+      tabItems: nextData.tabItems ?? tabItems,
+      voiceOperators: nextData.voiceOperators ?? voiceOperators,
+      updatedAtMs: Date.now(),
+    };
+    try {
+      localStorage.setItem(`comanda_voz_store_${code}`, JSON.stringify(payload));
+    } catch {
+      // ignore storage quota errors
+    }
+    try {
+      await fetch(`/api/store/${encodeURIComponent(code)}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+    } catch {
+      // offline fallback handled by localStorage
+    }
+  };
+
+  // Google Login Handler with Redirect Fallback & Render Unauthorized-Domain Diagnostic
+  const handleGoogleSignIn = async () => {
+    setGoogleLoginBusy(true);
+    setGoogleAuthError(null);
+    const currentDomain = window.location.hostname || 'seu-app.onrender.com';
+    try {
+      await loginWithGoogle();
+    } catch (err: unknown) {
+      const code =
+        err && typeof err === 'object' && 'code' in err
+          ? String((err as { code?: string }).code)
+          : 'auth/unknown';
+      const msg = err instanceof Error ? err.message : String(err);
+
+      if (code === 'auth/popup-blocked' || code === 'auth/cancelled-popup-request') {
+        try {
+          await loginWithGoogleRedirect();
+          return;
+        } catch {
+          // continue to error display
+        }
       }
+
+      if (code === 'auth/unauthorized-domain' || msg.includes('unauthorized-domain')) {
+        setGoogleAuthError({
+          code: 'auth/unauthorized-domain',
+          domain: currentDomain,
+          message: `O domínio "${currentDomain}" ainda não está na lista de domínios autorizados do Firebase para abrir o pop-up do Google. Use o Acesso Direto do Bar ao lado para entrar imediatamente no Render ou adicione o domínio no Firebase Console.`,
+        });
+      } else if (code !== 'auth/popup-closed-by-user') {
+        setGoogleAuthError({
+          code,
+          domain: currentDomain,
+          message: `Não foi possível abrir o login Google (${code}). Você pode entrar agora mesmo usando o Acesso Direto do Bar / Comércio ao lado.`,
+        });
+      }
+    } finally {
+      setGoogleLoginBusy(false);
+    }
+  };
+
+  // Direct Bar Login Handler (Works immediately on Render without Google OAuth domain restrictions)
+  const handleDirectBarLogin = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    const cleanName = sanitizeString(
+      directNameInput,
+      VALIDATION_LIMITS.OPERATOR_NAME_MAX_LEN,
+      'Operador Principal'
+    );
+    const cleanStore = sanitizeString(
+      directStoreNameInput,
+      VALIDATION_LIMITS.STORE_NAME_MAX_LEN,
+      'Bar & Comércio Central'
+    );
+    const cleanCode = sanitizeStoreCode(directStoreCodeInput, 'BAR-01');
+    const session: DirectBarSession = {
+      uid: `bar_${cleanCode.toLowerCase().replace(/[^a-z0-9]/g, '')}`,
+      userName: cleanName,
+      userRole: directRoleInput,
+      storeName: cleanStore,
+      storeCode: cleanCode,
+    };
+    try {
+      localStorage.setItem(DIRECT_SESSION_STORAGE_KEY, JSON.stringify(session));
+    } catch {
+      // ignore
+    }
+    setDirectSession(session);
+    setGoogleAuthError(null);
+  };
+
+  const handleSignOutAll = async () => {
+    try {
+      localStorage.removeItem(DIRECT_SESSION_STORAGE_KEY);
+    } catch {
+      // ignore
+    }
+    setDirectSession(null);
+    if (firebaseUser) {
+      await logoutUser();
+    }
+  };
+
+  // 1. Auth Listener (Firebase Auth + Redirect Check)
+  useEffect(() => {
+    checkGoogleRedirectResult().catch(() => {});
+    const unsub = onAuthStateChanged(auth, (currentUser) => {
+      setFirebaseUser(currentUser);
+      setAuthReady(true);
     });
     return () => unsub();
   }, []);
 
-  // 2. Real-time Firestore Listeners
+  // 2A. Direct Render Mode Loader & Real-Time Polling Sync
   useEffect(() => {
-    if (!authReady || !user) return;
+    if (!authReady || firebaseUser || !directSession) return;
     setDataLoading(true);
 
-    const profileRef = doc(db, 'userProfiles', user.uid);
-    const menuQuery = query(collection(db, 'menuItems'), where('ownerId', '==', user.uid));
-    const tabsQuery = query(collection(db, 'tabs'), where('ownerId', '==', user.uid));
-    const tabItemsQuery = query(collection(db, 'tabItems'), where('ownerId', '==', user.uid));
+    const code = sanitizeStoreCode(directSession.storeCode, 'BAR-01');
+    const nowTs = makeLocalTimestamp();
+    const initialProfile: UserProfile = {
+      id: directSession.uid,
+      ownerId: directSession.uid,
+      userName: directSession.userName,
+      userRole: directSession.userRole,
+      storeName: directSession.storeName,
+      storeCode: code,
+      createdAt: nowTs,
+      updatedAt: nowTs,
+    };
+    setUserProfile(initialProfile);
+    setProfileUserName(initialProfile.userName);
+    setProfileUserRole(initialProfile.userRole);
+    setProfileStoreName(initialProfile.storeName);
+    setProfileStoreCode(initialProfile.storeCode);
+
+    const buildSeededMenu = (): MenuItem[] =>
+      DEFAULT_BAR_MENU.map((seed) => ({
+        id: `${seed.id}_${code.toLowerCase()}`,
+        ownerId: directSession.uid,
+        name: sanitizeString(seed.name, VALIDATION_LIMITS.NAME_MAX_LEN),
+        category: sanitizeCategory(seed.category),
+        price: Math.min(Math.max(seed.price, 0), VALIDATION_LIMITS.MAX_PRICE),
+        synonyms: sanitizeString(seed.synonyms, VALIDATION_LIMITS.SYNONYMS_MAX_LEN),
+        createdAt: nowTs,
+        updatedAt: nowTs,
+      }));
+
+    let isCancelled = false;
+
+    const loadFromServerOrLocal = async (isInitial: boolean) => {
+      try {
+        const res = await fetch(`/api/store/${encodeURIComponent(code)}`);
+        if (res.ok) {
+          const data = (await res.json()) as {
+            exists?: boolean;
+            menuItems?: MenuItem[];
+            tabs?: BarTab[];
+            tabItems?: TabItem[];
+            voiceOperators?: VoiceOperator[];
+          };
+          if (!isCancelled && data.exists) {
+            const loadedMenu =
+              Array.isArray(data.menuItems) && data.menuItems.length > 0
+                ? data.menuItems
+                : buildSeededMenu();
+            setMenuItems(loadedMenu);
+            setTabs(Array.isArray(data.tabs) ? data.tabs : []);
+            setTabItems(Array.isArray(data.tabItems) ? data.tabItems : []);
+            setVoiceOperators(Array.isArray(data.voiceOperators) ? data.voiceOperators : []);
+            setDataLoading(false);
+            return;
+          }
+        }
+      } catch {
+        // fallback to localStorage
+      }
+
+      if (isCancelled) return;
+
+      if (isInitial) {
+        try {
+          const localRaw = localStorage.getItem(`comanda_voz_store_${code}`);
+          if (localRaw) {
+            const parsed = JSON.parse(localRaw) as {
+              menuItems?: MenuItem[];
+              tabs?: BarTab[];
+              tabItems?: TabItem[];
+              voiceOperators?: VoiceOperator[];
+            };
+            const loadedMenu =
+              Array.isArray(parsed.menuItems) && parsed.menuItems.length > 0
+                ? parsed.menuItems
+                : buildSeededMenu();
+            setMenuItems(loadedMenu);
+            setTabs(Array.isArray(parsed.tabs) ? parsed.tabs : []);
+            setTabItems(Array.isArray(parsed.tabItems) ? parsed.tabItems : []);
+            setVoiceOperators(Array.isArray(parsed.voiceOperators) ? parsed.voiceOperators : []);
+            setDataLoading(false);
+            return;
+          }
+        } catch {
+          // ignore
+        }
+
+        const seeded = buildSeededMenu();
+        setMenuItems(seeded);
+        setTabs([]);
+        setTabItems([]);
+        setVoiceOperators([]);
+        setDataLoading(false);
+        await syncDirectStoreSnapshot({
+          storeCode: code,
+          storeName: directSession.storeName,
+          menuItems: seeded,
+          tabs: [],
+          tabItems: [],
+          voiceOperators: [],
+        });
+      }
+    };
+
+    loadFromServerOrLocal(true);
+    const intervalId = window.setInterval(() => {
+      loadFromServerOrLocal(false);
+    }, 3500);
+
+    return () => {
+      isCancelled = true;
+      window.clearInterval(intervalId);
+    };
+  }, [authReady, firebaseUser, directSession]);
+
+  // 2B. Real-time Firestore Listeners (When logged in via Firebase Google Auth)
+  useEffect(() => {
+    if (!authReady || !firebaseUser) return;
+    setDataLoading(true);
+
+    const profileRef = doc(db, 'userProfiles', firebaseUser.uid);
+    const menuQuery = query(
+      collection(db, 'menuItems'),
+      where('ownerId', '==', firebaseUser.uid)
+    );
+    const tabsQuery = query(collection(db, 'tabs'), where('ownerId', '==', firebaseUser.uid));
+    const tabItemsQuery = query(
+      collection(db, 'tabItems'),
+      where('ownerId', '==', firebaseUser.uid)
+    );
     const operatorsQuery = query(
       collection(db, 'voiceOperators'),
-      where('ownerId', '==', user.uid)
+      where('ownerId', '==', firebaseUser.uid)
     );
 
     const unsubProfile = onSnapshot(
@@ -297,27 +625,30 @@ function ComandaVozWorkspace() {
           setProfileStoreName(loaded.storeName);
           setProfileStoreCode(loaded.storeCode);
         } else {
-          // Initialize default store & user profile automatically on first login
           const defaultUserName = sanitizeString(
-            user.displayName || user.email?.split('@')[0] || 'Operador Principal',
+            firebaseUser.displayName ||
+              firebaseUser.email?.split('@')[0] ||
+              'Operador Principal',
             VALIDATION_LIMITS.OPERATOR_NAME_MAX_LEN,
             'Operador Principal'
           );
           const defaultStoreName = 'Bar & Comércio Central';
-          const defaultStoreCode = `BAR-${user.uid.slice(0, 5).toUpperCase()}`;
+          const defaultStoreCode = `BAR-${firebaseUser.uid.slice(0, 5).toUpperCase()}`;
 
           setDoc(profileRef, {
-            ownerId: user.uid,
+            ownerId: firebaseUser.uid,
             userName: defaultUserName,
             userRole: 'Proprietário',
             storeName: defaultStoreName,
             storeCode: sanitizeStoreCode(defaultStoreCode),
             createdAt: serverTimestamp(),
             updatedAt: serverTimestamp(),
-          }).catch((err) => handleFirestoreError(err, OperationType.CREATE, `userProfiles/${user.uid}`));
+          }).catch((err) =>
+            handleFirestoreError(err, OperationType.CREATE, `userProfiles/${firebaseUser.uid}`)
+          );
         }
       },
-      (err) => handleFirestoreError(err, OperationType.GET, `userProfiles/${user.uid}`)
+      (err) => handleFirestoreError(err, OperationType.GET, `userProfiles/${firebaseUser.uid}`)
     );
 
     const unsubMenu = onSnapshot(
@@ -344,11 +675,7 @@ function ComandaVozWorkspace() {
             paidAmount: typeof raw.paidAmount === 'number' ? raw.paidAmount : 0,
           };
         });
-        loaded.sort((a, b) => {
-          const tA = a.updatedAt?.toMillis?.() ?? 0;
-          const tB = b.updatedAt?.toMillis?.() ?? 0;
-          return tB - tA;
-        });
+        loaded.sort((a, b) => getTimestampMillis(b.updatedAt) - getTimestampMillis(a.updatedAt));
         setTabs(loaded);
         setDataLoading(false);
       },
@@ -362,11 +689,7 @@ function ComandaVozWorkspace() {
           id: d.id,
           ...(d.data() as Omit<TabItem, 'id'>),
         }));
-        loaded.sort((a, b) => {
-          const tA = a.createdAt?.toMillis?.() ?? Date.now();
-          const tB = b.createdAt?.toMillis?.() ?? Date.now();
-          return tB - tA;
-        });
+        loaded.sort((a, b) => getTimestampMillis(b.createdAt) - getTimestampMillis(a.createdAt));
         setTabItems(loaded);
       },
       (err) => handleFirestoreError(err, OperationType.LIST, 'tabItems')
@@ -391,21 +714,21 @@ function ComandaVozWorkspace() {
       unsubTabItems();
       unsubOperators();
     };
-  }, [authReady, user]);
+  }, [authReady, firebaseUser]);
 
-  // Seed default Brazilian bar catalog automatically if user has 0 menu items
+  // Seed default Brazilian bar catalog automatically if Firebase user has 0 menu items
   useEffect(() => {
-    if (!authReady || !user || dataLoading || seedingMenu) return;
+    if (!authReady || !firebaseUser || dataLoading || seedingMenu) return;
     if (menuItems.length === 0) {
       setSeedingMenu(true);
       const seedDefaultMenu = async () => {
         try {
           const batch = writeBatch(db);
           for (const seed of DEFAULT_BAR_MENU) {
-            const docId = `${seed.id}_${user.uid.slice(0, 8)}`;
+            const docId = `${seed.id}_${firebaseUser.uid.slice(0, 8)}`;
             const ref = doc(db, 'menuItems', docId);
             batch.set(ref, {
-              ownerId: user.uid,
+              ownerId: firebaseUser.uid,
               name: sanitizeString(seed.name, VALIDATION_LIMITS.NAME_MAX_LEN),
               category: sanitizeCategory(seed.category),
               price: Math.min(Math.max(seed.price, 0), VALIDATION_LIMITS.MAX_PRICE),
@@ -423,21 +746,21 @@ function ComandaVozWorkspace() {
       };
       seedDefaultMenu();
     }
-  }, [authReady, user, dataLoading, menuItems.length, seedingMenu]);
+  }, [authReady, firebaseUser, dataLoading, menuItems.length, seedingMenu]);
 
   // Active Waiter & Store Attribution Resolver
   const currentStoreName = useMemo(
     () =>
       sanitizeString(
-        userProfile?.storeName || 'Bar & Comércio Central',
+        userProfile?.storeName || directSession?.storeName || 'Bar & Comércio Central',
         VALIDATION_LIMITS.STORE_NAME_MAX_LEN,
         'Bar & Comércio Central'
       ),
-    [userProfile]
+    [userProfile, directSession]
   );
 
   const currentStoreCode = useMemo(
-    () => sanitizeStoreCode(userProfile?.storeCode || 'BAR-01'),
+    () => sanitizeStoreCode(userProfile?.storeCode || directSession?.storeCode || 'BAR-01'),
     [userProfile]
   );
 
@@ -609,8 +932,8 @@ function ComandaVozWorkspace() {
       'Bar Central'
     );
 
-    const batch = writeBatch(db);
     const addedItemIds: string[] = [];
+    const newLocalTabItems: TabItem[] = [];
     const tabsAffectedMap = new Map<
       string,
       {
@@ -633,6 +956,7 @@ function ComandaVozWorkspace() {
     let grandTotalConsumed = 0;
     let grandTotalPaid = 0;
     let grandRemainingBalance = 0;
+    const localTs = makeLocalTimestamp();
 
     for (const cmd of marcarCommands) {
       const cleanCustomerName = sanitizeString(
@@ -700,9 +1024,9 @@ function ComandaVozWorkspace() {
         const category = sanitizeCategory(rawItem.category);
 
         const itemId = `item_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
-        const itemRef = doc(db, 'tabItems', itemId);
 
-        batch.set(itemRef, {
+        newLocalTabItems.push({
+          id: itemId,
           ownerId: user.uid,
           tabId: tabState.tabId,
           customerName: tabState.customerName,
@@ -715,8 +1039,8 @@ function ComandaVozWorkspace() {
           voiceTranscript: cleanTranscript,
           launchedByName: cleanWaiterName,
           storeName: cleanStoreName,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
+          createdAt: localTs,
+          updatedAt: localTs,
         });
 
         tabState.runningTotal = Math.min(
@@ -741,32 +1065,6 @@ function ComandaVozWorkspace() {
     if (tabsAffectedMap.size === 0) return;
 
     for (const tabState of tabsAffectedMap.values()) {
-      const tabRef = doc(db, 'tabs', tabState.tabId);
-      if (tabState.createdNewTab) {
-        batch.set(tabRef, {
-          ownerId: user.uid,
-          customerName: tabState.customerName,
-          tableLabel: tabState.tableLabel,
-          status: 'open',
-          totalAmount: tabState.runningTotal,
-          paidAmount: 0,
-          itemCount: tabState.runningCount,
-          paymentMethod: '',
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
-      } else {
-        batch.update(tabRef, {
-          status: 'open',
-          customerName: tabState.customerName,
-          tableLabel: tabState.tableLabel,
-          totalAmount: tabState.runningTotal,
-          paidAmount: tabState.previousPaid,
-          itemCount: tabState.runningCount,
-          updatedAt: serverTimestamp(),
-        });
-      }
-
       grandTotalConsumed += tabState.runningTotal;
       grandTotalPaid += tabState.previousPaid;
       grandRemainingBalance += Math.max(
@@ -776,7 +1074,94 @@ function ComandaVozWorkspace() {
     }
 
     try {
-      await batch.commit();
+      if (isDirectSession) {
+        const nextTabs = [...tabs];
+        for (const tabState of tabsAffectedMap.values()) {
+          if (tabState.createdNewTab) {
+            nextTabs.unshift({
+              id: tabState.tabId,
+              ownerId: user.uid,
+              customerName: tabState.customerName,
+              tableLabel: tabState.tableLabel,
+              status: 'open',
+              totalAmount: tabState.runningTotal,
+              paidAmount: 0,
+              itemCount: tabState.runningCount,
+              paymentMethod: '',
+              createdAt: localTs,
+              updatedAt: localTs,
+            });
+          } else {
+            const idx = nextTabs.findIndex((t) => t.id === tabState.tabId);
+            if (idx >= 0) {
+              nextTabs[idx] = {
+                ...nextTabs[idx],
+                status: 'open',
+                customerName: tabState.customerName,
+                tableLabel: tabState.tableLabel,
+                totalAmount: tabState.runningTotal,
+                paidAmount: tabState.previousPaid,
+                itemCount: tabState.runningCount,
+                updatedAt: localTs,
+              };
+            }
+          }
+        }
+        const nextTabItems = [...newLocalTabItems, ...tabItems];
+        setTabs(nextTabs);
+        setTabItems(nextTabItems);
+        await syncDirectStoreSnapshot({ tabs: nextTabs, tabItems: nextTabItems });
+      } else {
+        const batch = writeBatch(db);
+        for (const newItem of newLocalTabItems) {
+          const itemRef = doc(db, 'tabItems', newItem.id);
+          batch.set(itemRef, {
+            ownerId: newItem.ownerId,
+            tabId: newItem.tabId,
+            customerName: newItem.customerName,
+            itemName: newItem.itemName,
+            category: newItem.category,
+            quantity: newItem.quantity,
+            unitPrice: newItem.unitPrice,
+            totalPrice: newItem.totalPrice,
+            source: newItem.source,
+            voiceTranscript: newItem.voiceTranscript,
+            launchedByName: newItem.launchedByName,
+            storeName: newItem.storeName,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        }
+        for (const tabState of tabsAffectedMap.values()) {
+          const tabRef = doc(db, 'tabs', tabState.tabId);
+          if (tabState.createdNewTab) {
+            batch.set(tabRef, {
+              ownerId: user.uid,
+              customerName: tabState.customerName,
+              tableLabel: tabState.tableLabel,
+              status: 'open',
+              totalAmount: tabState.runningTotal,
+              paidAmount: 0,
+              itemCount: tabState.runningCount,
+              paymentMethod: '',
+              createdAt: serverTimestamp(),
+              updatedAt: serverTimestamp(),
+            });
+          } else {
+            batch.update(tabRef, {
+              status: 'open',
+              customerName: tabState.customerName,
+              tableLabel: tabState.tableLabel,
+              totalAmount: tabState.runningTotal,
+              paidAmount: tabState.previousPaid,
+              itemCount: tabState.runningCount,
+              updatedAt: serverTimestamp(),
+            });
+          }
+        }
+        await batch.commit();
+      }
+
       if (lastTargetTabId) {
         setSelectedTabId(lastTargetTabId);
       }
@@ -864,13 +1249,24 @@ function ComandaVozWorkspace() {
     const remaining = getRemainingBalance(targetTab);
 
     try {
-      await updateDoc(doc(db, 'tabs', targetTab.id), {
-        status: 'closing',
-        totalAmount: targetTab.totalAmount,
-        paidAmount: targetTab.paidAmount,
-        itemCount: targetTab.itemCount,
-        updatedAt: serverTimestamp(),
-      });
+      if (isDirectSession) {
+        const localTs = makeLocalTimestamp();
+        const nextTabs = tabs.map((t) =>
+          t.id === targetTab.id
+            ? { ...t, status: 'closing' as TabStageStatus, updatedAt: localTs }
+            : t
+        );
+        setTabs(nextTabs);
+        await syncDirectStoreSnapshot({ tabs: nextTabs });
+      } else {
+        await updateDoc(doc(db, 'tabs', targetTab.id), {
+          status: 'closing',
+          totalAmount: targetTab.totalAmount,
+          paidAmount: targetTab.paidAmount,
+          itemCount: targetTab.itemCount,
+          updatedAt: serverTimestamp(),
+        });
+      }
 
       setSelectedTabId(targetTab.id);
       setBaixaAmountInput(remaining.toFixed(2));
@@ -946,14 +1342,31 @@ function ComandaVozWorkspace() {
       nextRemaining > 0 || keepOpenToConsume ? 'open' : 'paid';
 
     try {
-      await updateDoc(doc(db, 'tabs', targetTab.id), {
-        status: nextStatus,
-        paidAmount: nextPaidAmount,
-        paymentMethod: sanitizeString(paymentMethod, 40, 'PIX'),
-        totalAmount: targetTab.totalAmount,
-        itemCount: targetTab.itemCount,
-        updatedAt: serverTimestamp(),
-      });
+      if (isDirectSession) {
+        const localTs = makeLocalTimestamp();
+        const nextTabs = tabs.map((t) =>
+          t.id === targetTab.id
+            ? {
+                ...t,
+                status: nextStatus,
+                paidAmount: nextPaidAmount,
+                paymentMethod: sanitizeString(paymentMethod, 40, 'PIX'),
+                updatedAt: localTs,
+              }
+            : t
+        );
+        setTabs(nextTabs);
+        await syncDirectStoreSnapshot({ tabs: nextTabs });
+      } else {
+        await updateDoc(doc(db, 'tabs', targetTab.id), {
+          status: nextStatus,
+          paidAmount: nextPaidAmount,
+          paymentMethod: sanitizeString(paymentMethod, 40, 'PIX'),
+          totalAmount: targetTab.totalAmount,
+          itemCount: targetTab.itemCount,
+          updatedAt: serverTimestamp(),
+        });
+      }
 
       setSelectedTabId(targetTab.id);
       setShowBaixaDrawer(false);
@@ -1260,20 +1673,52 @@ function ComandaVozWorkspace() {
     if (!user || !profileUserName.trim() || !profileStoreName.trim()) return;
     setSavingProfile(true);
     try {
-      await setDoc(doc(db, 'userProfiles', user.uid), {
-        ownerId: user.uid,
-        userName: sanitizeString(profileUserName, VALIDATION_LIMITS.OPERATOR_NAME_MAX_LEN),
-        userRole: VALIDATION_LIMITS.VALID_ROLES.includes(profileUserRole)
-          ? profileUserRole
-          : 'Proprietário',
-        storeName: sanitizeString(profileStoreName, VALIDATION_LIMITS.STORE_NAME_MAX_LEN),
-        storeCode: sanitizeStoreCode(profileStoreCode, 'BAR-01'),
-        createdAt: userProfile?.createdAt || serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
+      const cleanName = sanitizeString(profileUserName, VALIDATION_LIMITS.OPERATOR_NAME_MAX_LEN);
+      const cleanRole: UserRoleType = VALIDATION_LIMITS.VALID_ROLES.includes(profileUserRole)
+        ? profileUserRole
+        : 'Proprietário';
+      const cleanStore = sanitizeString(profileStoreName, VALIDATION_LIMITS.STORE_NAME_MAX_LEN);
+      const cleanCode = sanitizeStoreCode(profileStoreCode, 'BAR-01');
+
+      if (isDirectSession) {
+        const nextSession: DirectBarSession = {
+          uid: `bar_${cleanCode.toLowerCase().replace(/[^a-z0-9]/g, '')}`,
+          userName: cleanName,
+          userRole: cleanRole,
+          storeName: cleanStore,
+          storeCode: cleanCode,
+        };
+        try {
+          localStorage.setItem(DIRECT_SESSION_STORAGE_KEY, JSON.stringify(nextSession));
+        } catch {
+          // ignore
+        }
+        setDirectSession(nextSession);
+        setUserProfile({
+          id: nextSession.uid,
+          ownerId: nextSession.uid,
+          userName: cleanName,
+          userRole: cleanRole,
+          storeName: cleanStore,
+          storeCode: cleanCode,
+          createdAt: userProfile?.createdAt || makeLocalTimestamp(),
+          updatedAt: makeLocalTimestamp(),
+        });
+        await syncDirectStoreSnapshot({ storeCode: cleanCode, storeName: cleanStore });
+      } else {
+        await setDoc(doc(db, 'userProfiles', user.uid), {
+          ownerId: user.uid,
+          userName: cleanName,
+          userRole: cleanRole,
+          storeName: cleanStore,
+          storeCode: cleanCode,
+          createdAt: userProfile?.createdAt || serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      }
       setFeedbackBanner({
         type: 'success',
-        message: `Perfil de usuário (${profileUserName}) e Comércio (${profileStoreName}) atualizados!`,
+        message: `Perfil de usuário (${cleanName}) e Comércio (${cleanStore}) atualizados!`,
       });
     } catch (err) {
       handleFirestoreError(err, OperationType.WRITE, `userProfiles/${user.uid}`);
@@ -1299,7 +1744,7 @@ function ComandaVozWorkspace() {
     }
   };
 
-  // Save Trained Waiter / Operator Profile to Firestore (Linked to Store / Comércio)
+  // Save Trained Waiter / Operator Profile to Firestore or Render Store
   const handleSaveTrainedOperator = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!user || !newOpName.trim() || trainingSamples.length === 0) return;
@@ -1312,7 +1757,8 @@ function ComandaVozWorkspace() {
 
     const opId = `op_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     try {
-      await setDoc(doc(db, 'voiceOperators', opId), {
+      const opPayload: VoiceOperator = {
+        id: opId,
         ownerId: user.uid,
         operatorName: sanitizeString(newOpName, VALIDATION_LIMITS.OPERATOR_NAME_MAX_LEN),
         roleLabel: sanitizeString(newOpRole, VALIDATION_LIMITS.TABLE_MAX_LEN, 'Garçom'),
@@ -1322,9 +1768,29 @@ function ComandaVozWorkspace() {
         spectralCentroid: Math.min(Math.max(Number(avgCentroid.toFixed(1)), 100), 9500),
         voicePin: sanitizeString(newOpPin, VALIDATION_LIMITS.VOICE_PIN_MAX_LEN, ''),
         samplesCount: trainingSamples.length,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
+        createdAt: makeLocalTimestamp(),
+        updatedAt: makeLocalTimestamp(),
+      };
+
+      if (isDirectSession) {
+        const nextOps = [...voiceOperators, opPayload];
+        setVoiceOperators(nextOps);
+        await syncDirectStoreSnapshot({ voiceOperators: nextOps });
+      } else {
+        await setDoc(doc(db, 'voiceOperators', opId), {
+          ownerId: opPayload.ownerId,
+          operatorName: opPayload.operatorName,
+          roleLabel: opPayload.roleLabel,
+          storeName: opPayload.storeName,
+          storeCode: opPayload.storeCode,
+          pitchHz: opPayload.pitchHz,
+          spectralCentroid: opPayload.spectralCentroid,
+          voicePin: opPayload.voicePin,
+          samplesCount: opPayload.samplesCount,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      }
 
       setNewOpName('');
       setNewOpPin('');
@@ -1342,7 +1808,13 @@ function ComandaVozWorkspace() {
   const handleDeleteOperator = async (opId: string) => {
     if (!user) return;
     try {
-      await deleteDoc(doc(db, 'voiceOperators', opId));
+      if (isDirectSession) {
+        const nextOps = voiceOperators.filter((op) => op.id !== opId);
+        setVoiceOperators(nextOps);
+        await syncDirectStoreSnapshot({ voiceOperators: nextOps });
+      } else {
+        await deleteDoc(doc(db, 'voiceOperators', opId));
+      }
       if (selectedWaiterId === opId) {
         setSelectedWaiterId('logged_user');
       }
@@ -1358,27 +1830,56 @@ function ComandaVozWorkspace() {
     setLastUndo(null);
 
     try {
-      const batch = writeBatch(db);
-      for (const itemId of undoInfo.addedItemIds) {
-        batch.delete(doc(db, 'tabItems', itemId));
-      }
-      for (const tSnap of undoInfo.tabsAffected) {
-        const tabRef = doc(db, 'tabs', tSnap.tabId);
-        if (tSnap.createdNewTab) {
-          batch.delete(tabRef);
-        } else {
-          batch.update(tabRef, {
-            status: tSnap.previousStatus,
-            customerName: tSnap.customerName,
-            tableLabel: tSnap.tableLabel,
-            totalAmount: Math.max(0, tSnap.previousTotal),
-            paidAmount: Math.max(0, tSnap.previousPaid),
-            itemCount: Math.max(0, tSnap.previousCount),
-            updatedAt: serverTimestamp(),
-          });
+      if (isDirectSession) {
+        const nextTabItems = tabItems.filter((i) => !undoInfo.addedItemIds.includes(i.id));
+        let nextTabs = [...tabs];
+        const localTs = makeLocalTimestamp();
+        for (const tSnap of undoInfo.tabsAffected) {
+          if (tSnap.createdNewTab) {
+            nextTabs = nextTabs.filter((t) => t.id !== tSnap.tabId);
+          } else {
+            nextTabs = nextTabs.map((t) =>
+              t.id === tSnap.tabId
+                ? {
+                    ...t,
+                    status: tSnap.previousStatus,
+                    customerName: tSnap.customerName,
+                    tableLabel: tSnap.tableLabel,
+                    totalAmount: Math.max(0, tSnap.previousTotal),
+                    paidAmount: Math.max(0, tSnap.previousPaid),
+                    itemCount: Math.max(0, tSnap.previousCount),
+                    updatedAt: localTs,
+                  }
+                : t
+            );
+          }
         }
+        setTabs(nextTabs);
+        setTabItems(nextTabItems);
+        await syncDirectStoreSnapshot({ tabs: nextTabs, tabItems: nextTabItems });
+      } else {
+        const batch = writeBatch(db);
+        for (const itemId of undoInfo.addedItemIds) {
+          batch.delete(doc(db, 'tabItems', itemId));
+        }
+        for (const tSnap of undoInfo.tabsAffected) {
+          const tabRef = doc(db, 'tabs', tSnap.tabId);
+          if (tSnap.createdNewTab) {
+            batch.delete(tabRef);
+          } else {
+            batch.update(tabRef, {
+              status: tSnap.previousStatus,
+              customerName: tSnap.customerName,
+              tableLabel: tSnap.tableLabel,
+              totalAmount: Math.max(0, tSnap.previousTotal),
+              paidAmount: Math.max(0, tSnap.previousPaid),
+              itemCount: Math.max(0, tSnap.previousCount),
+              updatedAt: serverTimestamp(),
+            });
+          }
+        }
+        await batch.commit();
       }
-      await batch.commit();
       setMarceloReport(null);
       setFeedbackBanner({
         type: 'success',
@@ -1399,45 +1900,83 @@ function ComandaVozWorkspace() {
       VALIDATION_LIMITS.MAX_TOTAL
     );
     const newCount = Math.min(selectedTab.itemCount + 1, 10000);
+    const waiterAttr = sanitizeString(
+      activeWaiterDisplay.name,
+      VALIDATION_LIMITS.OPERATOR_NAME_MAX_LEN,
+      'Garçom'
+    );
+    const storeAttr = sanitizeString(
+      activeWaiterDisplay.storeName,
+      VALIDATION_LIMITS.STORE_NAME_MAX_LEN,
+      'Bar Central'
+    );
 
     try {
-      const batch = writeBatch(db);
-      batch.set(doc(db, 'tabItems', itemId), {
-        ownerId: user.uid,
-        tabId: selectedTab.id,
-        customerName: selectedTab.customerName,
-        itemName: menuItem.name,
-        category: menuItem.category,
-        quantity: 1,
-        unitPrice: menuItem.price,
-        totalPrice: menuItem.price,
-        source: 'rapido',
-        voiceTranscript: `Atalho rápido (+1 ${menuItem.name})`,
-        launchedByName: sanitizeString(
-          activeWaiterDisplay.name,
-          VALIDATION_LIMITS.OPERATOR_NAME_MAX_LEN,
-          'Garçom'
-        ),
-        storeName: sanitizeString(
-          activeWaiterDisplay.storeName,
-          VALIDATION_LIMITS.STORE_NAME_MAX_LEN,
-          'Bar Central'
-        ),
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
+      if (isDirectSession) {
+        const localTs = makeLocalTimestamp();
+        const newEntry: TabItem = {
+          id: itemId,
+          ownerId: user.uid,
+          tabId: selectedTab.id,
+          customerName: selectedTab.customerName,
+          itemName: menuItem.name,
+          category: menuItem.category,
+          quantity: 1,
+          unitPrice: menuItem.price,
+          totalPrice: menuItem.price,
+          source: 'rapido',
+          voiceTranscript: `Atalho rápido (+1 ${menuItem.name})`,
+          launchedByName: waiterAttr,
+          storeName: storeAttr,
+          createdAt: localTs,
+          updatedAt: localTs,
+        };
+        const nextTabItems = [newEntry, ...tabItems];
+        const nextTabs = tabs.map((t) =>
+          t.id === selectedTab.id
+            ? {
+                ...t,
+                status: 'open' as TabStageStatus,
+                totalAmount: newTotal,
+                itemCount: newCount,
+                updatedAt: localTs,
+              }
+            : t
+        );
+        setTabs(nextTabs);
+        setTabItems(nextTabItems);
+        await syncDirectStoreSnapshot({ tabs: nextTabs, tabItems: nextTabItems });
+      } else {
+        const batch = writeBatch(db);
+        batch.set(doc(db, 'tabItems', itemId), {
+          ownerId: user.uid,
+          tabId: selectedTab.id,
+          customerName: selectedTab.customerName,
+          itemName: menuItem.name,
+          category: menuItem.category,
+          quantity: 1,
+          unitPrice: menuItem.price,
+          totalPrice: menuItem.price,
+          source: 'rapido',
+          voiceTranscript: `Atalho rápido (+1 ${menuItem.name})`,
+          launchedByName: waiterAttr,
+          storeName: storeAttr,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
 
-      batch.update(doc(db, 'tabs', selectedTab.id), {
-        status: 'open',
-        customerName: selectedTab.customerName,
-        tableLabel: selectedTab.tableLabel,
-        totalAmount: newTotal,
-        paidAmount: selectedTab.paidAmount,
-        itemCount: newCount,
-        updatedAt: serverTimestamp(),
-      });
+        batch.update(doc(db, 'tabs', selectedTab.id), {
+          status: 'open',
+          customerName: selectedTab.customerName,
+          tableLabel: selectedTab.tableLabel,
+          totalAmount: newTotal,
+          paidAmount: selectedTab.paidAmount,
+          itemCount: newCount,
+          updatedAt: serverTimestamp(),
+        });
 
-      await batch.commit();
+        await batch.commit();
+      }
       setFeedbackBanner({
         type: 'success',
         message: `+1 ${menuItem.name} marcado para ${selectedTab.customerName} por ${activeWaiterDisplay.name}`,
@@ -1459,34 +1998,68 @@ function ComandaVozWorkspace() {
     const nextTabCount = Math.max(0, parentTab.itemCount + delta);
 
     try {
-      const batch = writeBatch(db);
-      const itemRef = doc(db, 'tabItems', item.id);
-      const tabRef = doc(db, 'tabs', parentTab.id);
-
-      if (nextQty <= 0) {
-        batch.delete(itemRef);
+      if (isDirectSession) {
+        const localTs = makeLocalTimestamp();
+        const nextTabItems =
+          nextQty <= 0
+            ? tabItems.filter((i) => i.id !== item.id)
+            : tabItems.map((i) =>
+                i.id === item.id
+                  ? {
+                      ...i,
+                      quantity: Math.min(nextQty, VALIDATION_LIMITS.MAX_QTY),
+                      totalPrice: Number((nextQty * item.unitPrice).toFixed(2)),
+                      updatedAt: localTs,
+                    }
+                  : i
+              );
+        const nextTabs = tabs.map((t) =>
+          t.id === parentTab.id
+            ? {
+                ...t,
+                status:
+                  parentTab.status === 'paid' && nextTabTotal > parentTab.paidAmount
+                    ? ('open' as TabStageStatus)
+                    : parentTab.status,
+                totalAmount: nextTabTotal,
+                itemCount: nextTabCount,
+                updatedAt: localTs,
+              }
+            : t
+        );
+        setTabs(nextTabs);
+        setTabItems(nextTabItems);
+        await syncDirectStoreSnapshot({ tabs: nextTabs, tabItems: nextTabItems });
       } else {
-        batch.update(itemRef, {
-          quantity: Math.min(nextQty, VALIDATION_LIMITS.MAX_QTY),
-          totalPrice: Number((nextQty * item.unitPrice).toFixed(2)),
+        const batch = writeBatch(db);
+        const itemRef = doc(db, 'tabItems', item.id);
+        const tabRef = doc(db, 'tabs', parentTab.id);
+
+        if (nextQty <= 0) {
+          batch.delete(itemRef);
+        } else {
+          batch.update(itemRef, {
+            quantity: Math.min(nextQty, VALIDATION_LIMITS.MAX_QTY),
+            totalPrice: Number((nextQty * item.unitPrice).toFixed(2)),
+            updatedAt: serverTimestamp(),
+          });
+        }
+
+        batch.update(tabRef, {
+          status:
+            parentTab.status === 'paid' && nextTabTotal > parentTab.paidAmount
+              ? 'open'
+              : parentTab.status,
+          customerName: parentTab.customerName,
+          tableLabel: parentTab.tableLabel,
+          totalAmount: nextTabTotal,
+          paidAmount: parentTab.paidAmount,
+          itemCount: nextTabCount,
           updatedAt: serverTimestamp(),
         });
+
+        await batch.commit();
       }
-
-      batch.update(tabRef, {
-        status:
-          parentTab.status === 'paid' && nextTabTotal > parentTab.paidAmount
-            ? 'open'
-            : parentTab.status,
-        customerName: parentTab.customerName,
-        tableLabel: parentTab.tableLabel,
-        totalAmount: nextTabTotal,
-        paidAmount: parentTab.paidAmount,
-        itemCount: nextTabCount,
-        updatedAt: serverTimestamp(),
-      });
-
-      await batch.commit();
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `tabItems/${item.id}`);
     }
@@ -1512,18 +2085,38 @@ function ComandaVozWorkspace() {
 
     const tabId = `tab_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     try {
-      await setDoc(doc(db, 'tabs', tabId), {
-        ownerId: user.uid,
-        customerName: cleanName,
-        tableLabel: cleanTable,
-        status: 'open',
-        totalAmount: 0,
-        paidAmount: 0,
-        itemCount: 0,
-        paymentMethod: '',
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
+      if (isDirectSession) {
+        const localTs = makeLocalTimestamp();
+        const newTabObj: BarTab = {
+          id: tabId,
+          ownerId: user.uid,
+          customerName: cleanName,
+          tableLabel: cleanTable,
+          status: 'open',
+          totalAmount: 0,
+          paidAmount: 0,
+          itemCount: 0,
+          paymentMethod: '',
+          createdAt: localTs,
+          updatedAt: localTs,
+        };
+        const nextTabs = [newTabObj, ...tabs];
+        setTabs(nextTabs);
+        await syncDirectStoreSnapshot({ tabs: nextTabs });
+      } else {
+        await setDoc(doc(db, 'tabs', tabId), {
+          ownerId: user.uid,
+          customerName: cleanName,
+          tableLabel: cleanTable,
+          status: 'open',
+          totalAmount: 0,
+          paidAmount: 0,
+          itemCount: 0,
+          paymentMethod: '',
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      }
       setSelectedTabId(tabId);
       setNewCustomerName('');
       setNewTableLabel('');
@@ -1578,15 +2171,39 @@ function ComandaVozWorkspace() {
 
     const menuId = `menu_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     try {
-      await setDoc(doc(db, 'menuItems', menuId), {
-        ownerId: user.uid,
-        name: sanitizeString(newMenuName, VALIDATION_LIMITS.NAME_MAX_LEN),
-        category: sanitizeCategory(newMenuCategory),
-        price: Math.min(Number(priceNum.toFixed(2)), VALIDATION_LIMITS.MAX_PRICE),
-        synonyms: sanitizeString(newMenuSynonyms, VALIDATION_LIMITS.SYNONYMS_MAX_LEN),
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      });
+      const cleanName = sanitizeString(newMenuName, VALIDATION_LIMITS.NAME_MAX_LEN);
+      const cleanCat = sanitizeCategory(newMenuCategory);
+      const cleanPrice = Math.min(Number(priceNum.toFixed(2)), VALIDATION_LIMITS.MAX_PRICE);
+      const cleanSyn = sanitizeString(newMenuSynonyms, VALIDATION_LIMITS.SYNONYMS_MAX_LEN);
+
+      if (isDirectSession) {
+        const localTs = makeLocalTimestamp();
+        const nextMenu = [
+          ...menuItems,
+          {
+            id: menuId,
+            ownerId: user.uid,
+            name: cleanName,
+            category: cleanCat,
+            price: cleanPrice,
+            synonyms: cleanSyn,
+            createdAt: localTs,
+            updatedAt: localTs,
+          },
+        ].sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
+        setMenuItems(nextMenu);
+        await syncDirectStoreSnapshot({ menuItems: nextMenu });
+      } else {
+        await setDoc(doc(db, 'menuItems', menuId), {
+          ownerId: user.uid,
+          name: cleanName,
+          category: cleanCat,
+          price: cleanPrice,
+          synonyms: cleanSyn,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      }
       setNewMenuName('');
       setNewMenuPrice('');
       setNewMenuSynonyms('');
@@ -1598,7 +2215,13 @@ function ComandaVozWorkspace() {
   const handleDeleteMenuItem = async (menuId: string) => {
     if (!user) return;
     try {
-      await deleteDoc(doc(db, 'menuItems', menuId));
+      if (isDirectSession) {
+        const nextMenu = menuItems.filter((m) => m.id !== menuId);
+        setMenuItems(nextMenu);
+        await syncDirectStoreSnapshot({ menuItems: nextMenu });
+      } else {
+        await deleteDoc(doc(db, 'menuItems', menuId));
+      }
     } catch (err) {
       handleFirestoreError(err, OperationType.DELETE, `menuItems/${menuId}`);
     }
@@ -1623,8 +2246,8 @@ function ComandaVozWorkspace() {
             Comanda Voz · Marcelo
           </a>
           <nav className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-400">
-            <a href="#estagios" className="hover:text-slate-100 transition-colors whitespace-nowrap shrink-0">
-              Pedidos Sem Pausa
+            <a href="#acesso-bar" className="hover:text-slate-100 transition-colors whitespace-nowrap shrink-0">
+              Acesso Direto (Render)
             </a>
             <a href="#equipe" className="hover:text-slate-100 transition-colors whitespace-nowrap shrink-0">
               Garçons & Comércio
@@ -1635,15 +2258,24 @@ function ComandaVozWorkspace() {
           </nav>
           <div className="flex items-center gap-3 shrink-0">
             <button
-              onClick={loginWithGoogle}
+              type="button"
+              onClick={() => handleDirectBarLogin()}
+              className="px-3.5 py-2 text-xs font-semibold bg-slate-800 text-amber-400 border border-slate-700 rounded-lg hover:bg-slate-700 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              Entrar Direto no Bar
+            </button>
+            <button
+              type="button"
+              onClick={handleGoogleSignIn}
+              disabled={googleLoginBusy}
               className="px-4 py-2 text-xs font-semibold bg-amber-500 text-slate-950 rounded-lg hover:bg-amber-400 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
-              Entrar com Google
+              {googleLoginBusy ? 'Abrindo...' : 'Entrar com Google'}
             </button>
           </div>
         </header>
 
-        <main className="max-w-[1200px] w-full mx-auto px-6 py-16 grid grid-cols-1 lg:grid-cols-12 gap-12 items-center">
+        <main className="max-w-[1200px] w-full mx-auto px-6 py-12 grid grid-cols-1 lg:grid-cols-12 gap-10 items-start">
           <div className="lg:col-span-7 space-y-6">
             <p className="text-xs font-medium text-amber-400 tracking-wide">
               Assistente Virtual Marcelo · Controle por Garçom e Comércio
@@ -1659,47 +2291,178 @@ function ComandaVozWorkspace() {
               comanda certa, registrando qual garçom lançou e a qual comércio pertence. E se o
               Marcelo não entender com 100% de certeza, ele não altera nada na conta.
             </p>
-            <div className="pt-2 flex flex-wrap items-center gap-4">
+
+            <div className="pt-2 flex flex-wrap items-center gap-3">
               <button
-                onClick={loginWithGoogle}
+                type="button"
+                onClick={handleGoogleSignIn}
+                disabled={googleLoginBusy}
                 className="px-6 py-3 text-sm font-semibold bg-amber-500 text-slate-950 rounded-lg hover:bg-amber-400 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
               >
-                Acessar Comanda Voz
+                {googleLoginBusy ? 'Conectando ao Google...' : 'Entrar com Google'}
+              </button>
+              <button
+                type="button"
+                onClick={() => handleDirectBarLogin()}
+                className="px-5 py-3 text-sm font-semibold bg-slate-800 text-slate-100 border border-slate-700 rounded-lg hover:bg-slate-700 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              >
+                Entrar Agora (Acesso Direto Render)
               </button>
             </div>
+
+            {/* Diagnostic Panel when Google Login is blocked on onrender.com (auth/unauthorized-domain) */}
+            {googleAuthError && (
+              <div className="p-4 bg-slate-900 border border-amber-500/60 rounded-xl space-y-3 text-xs">
+                <div className="flex items-start gap-2.5">
+                  <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                  <div className="space-y-1">
+                    <p className="font-bold text-amber-300">
+                      Por que o botão Google não abriu em {googleAuthError.domain}?
+                    </p>
+                    <p className="text-slate-300 leading-relaxed">
+                      {googleAuthError.message}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="flex flex-wrap items-center gap-2 pt-1">
+                  <button
+                    type="button"
+                    onClick={() => handleDirectBarLogin()}
+                    className="px-4 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold rounded-lg transition-colors cursor-pointer"
+                  >
+                    Entrar Imediatamente no Bar (Sem Pop-up Google)
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigator.clipboard.writeText(googleAuthError.domain);
+                      setCopiedDomain(true);
+                      setTimeout(() => setCopiedDomain(false), 2500);
+                    }}
+                    className="inline-flex items-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg transition-colors cursor-pointer"
+                  >
+                    {copiedDomain ? (
+                      <>
+                        <Check className="w-3.5 h-3.5 text-emerald-400" />
+                        Domínio copiado!
+                      </>
+                    ) : (
+                      <>
+                        <Copy className="w-3.5 h-3.5" />
+                        Copiar domínio ({googleAuthError.domain})
+                      </>
+                    )}
+                  </button>
+                </div>
+
+                <div className="p-3 bg-slate-950 border border-slate-800 rounded-lg text-[11px] text-slate-400 space-y-1">
+                  <p className="font-semibold text-slate-300">
+                    Opcional — Como liberar o login Google no domínio do Render:
+                  </p>
+                  <p>
+                    1. No Firebase Console do projeto (<code className="text-amber-300">{firebaseProjectId}</code>), acesse <strong>Authentication &gt; Settings &gt; Domínios autorizados</strong>.
+                  </p>
+                  <p>
+                    2. Clique em <strong>Adicionar domínio</strong> e cole <code className="text-amber-300">{googleAuthError.domain}</code>.
+                  </p>
+                </div>
+              </div>
+            )}
           </div>
 
-          <div className="lg:col-span-5 bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-4 text-xs">
-            <h2 className="text-sm font-bold text-slate-100 border-b border-slate-800 pb-3">
-              Segurança Total no Balcão
-            </h2>
-            <div className="p-3 bg-slate-950 border border-slate-800 rounded-lg space-y-1">
-              <span className="text-amber-400 font-semibold">
-                Pedidos Múltiplos Sem Pausa
+          {/* Right Column: Direct Bar & Waiter Login Card (Works 100% on Render without OAuth domain blocks) */}
+          <div
+            id="acesso-bar"
+            className="lg:col-span-5 bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-4 text-xs"
+          >
+            <div className="space-y-1 border-b border-slate-800 pb-3">
+              <span className="text-amber-400 font-semibold block">
+                Funciona Direto no Render (onrender.com) e Celulares do Bar
               </span>
-              <p className="text-slate-200 font-mono">
-                &ldquo;Marcelo, marca 1 litrão para Thiago, marca 1 litrão para Jonas&rdquo;
-              </p>
+              <h2 className="text-base font-bold text-slate-100">
+                Acesso Direto por Usuário / Garçom e Comércio
+              </h2>
               <p className="text-slate-400">
-                Cria ou soma na comanda de Thiago e na de Jonas separadamente na mesma hora.
-              </p>
-            </div>
-            <div className="p-3 bg-slate-950 border border-slate-800 rounded-lg space-y-1">
-              <span className="text-sky-400 font-semibold">
-                Se Não Entender, Não Faz Nada
-              </span>
-              <p className="text-slate-400">
-                Zero chute: se faltar o nome do cliente ou o produto não existir no cardápio, o
-                Marcelo avisa e não suja nenhuma comanda.
+                Entre com seu nome e código do comércio para lançar pedidos com o Marcelo em tempo real, mesmo sem pop-up do Google.
               </p>
             </div>
-            <div className="p-3 bg-slate-950 border border-slate-800 rounded-lg space-y-1">
-              <span className="text-emerald-400 font-semibold">
-                Rastreamento por Garçom e Comércio
-              </span>
-              <p className="text-slate-400">
-                Cada usuário/garçom tem seu cadastro vinculado ao comércio, gravando quem lançou
-                cada item.
+
+            <form onSubmit={handleDirectBarLogin} className="space-y-3">
+              <div className="space-y-1">
+                <label className="text-slate-300 block font-medium">
+                  Seu Nome (Usuário / Garçom)
+                </label>
+                <input
+                  type="text"
+                  value={directNameInput}
+                  onChange={(e) => setDirectNameInput(e.target.value)}
+                  placeholder="Ex: Carlos ou Garçom Rodrigo"
+                  required
+                  maxLength={60}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-amber-500"
+                />
+              </div>
+
+              <div className="grid grid-cols-2 gap-3">
+                <div className="space-y-1">
+                  <label className="text-slate-300 block font-medium">Função</label>
+                  <select
+                    value={directRoleInput}
+                    onChange={(e) => setDirectRoleInput(e.target.value as UserRoleType)}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-slate-100"
+                  >
+                    <option value="Proprietário">Proprietário</option>
+                    <option value="Garçom">Garçom</option>
+                    <option value="Caixa">Caixa</option>
+                    <option value="Gerente">Gerente</option>
+                  </select>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-slate-300 block font-medium">Código do Comércio</label>
+                  <input
+                    type="text"
+                    value={directStoreCodeInput}
+                    onChange={(e) => setDirectStoreCodeInput(e.target.value)}
+                    placeholder="Ex: BAR-01"
+                    required
+                    maxLength={30}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-slate-100 font-mono"
+                  />
+                </div>
+              </div>
+
+              <div className="space-y-1">
+                <label className="text-slate-300 block font-medium">
+                  Nome do Bar / Comércio
+                </label>
+                <input
+                  type="text"
+                  value={directStoreNameInput}
+                  onChange={(e) => setDirectStoreNameInput(e.target.value)}
+                  placeholder="Ex: Bar do Zé"
+                  required
+                  maxLength={80}
+                  className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-amber-500"
+                />
+              </div>
+
+              <button
+                type="submit"
+                className="w-full py-3 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-sm rounded-lg transition-colors cursor-pointer"
+              >
+                Entrar no Sistema do Bar ({sanitizeStoreCode(directStoreCodeInput, 'BAR-01')})
+              </button>
+            </form>
+
+            <div className="pt-2 border-t border-slate-800 space-y-2 text-[11px] text-slate-400">
+              <p>
+                • <strong className="text-slate-200">Sincronização em Tempo Real no Render:</strong> todos os garçons que entrarem com o mesmo Código do Comércio (<code className="text-amber-300">{sanitizeStoreCode(directStoreCodeInput, 'BAR-01')}</code>) compartilham as comandas ao vivo.
+              </p>
+              <p>
+                • <strong className="text-slate-200">Zero Erro:</strong> se o Marcelo não entender o produto ou o nome do cliente, nada é lançado.
               </p>
             </div>
           </div>
@@ -1775,7 +2538,7 @@ function ComandaVozWorkspace() {
         {/* Zone 3: 1 Primary Action */}
         <div className="flex items-center gap-3 shrink-0">
           <button
-            onClick={logoutUser}
+            onClick={handleSignOutAll}
             className="inline-flex items-center gap-2 px-3.5 py-1.5 text-xs font-medium text-slate-300 bg-slate-800 rounded-lg hover:bg-slate-700 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
             <LogOut className="w-3.5 h-3.5" />
@@ -2341,15 +3104,26 @@ function ComandaVozWorkspace() {
                     <button
                       type="button"
                       onClick={async () => {
-                        await updateDoc(doc(db, 'tabs', selectedTab.id), {
-                          status: 'open',
-                          customerName: selectedTab.customerName,
-                          tableLabel: selectedTab.tableLabel,
-                          totalAmount: selectedTab.totalAmount,
-                          paidAmount: selectedTab.paidAmount,
-                          itemCount: selectedTab.itemCount,
-                          updatedAt: serverTimestamp(),
-                        });
+                        if (isDirectSession) {
+                          const localTs = makeLocalTimestamp();
+                          const nextTabs = tabs.map((t) =>
+                            t.id === selectedTab.id
+                              ? { ...t, status: 'open' as TabStageStatus, updatedAt: localTs }
+                              : t
+                          );
+                          setTabs(nextTabs);
+                          await syncDirectStoreSnapshot({ tabs: nextTabs });
+                        } else {
+                          await updateDoc(doc(db, 'tabs', selectedTab.id), {
+                            status: 'open',
+                            customerName: selectedTab.customerName,
+                            tableLabel: selectedTab.tableLabel,
+                            totalAmount: selectedTab.totalAmount,
+                            paidAmount: selectedTab.paidAmount,
+                            itemCount: selectedTab.itemCount,
+                            updatedAt: serverTimestamp(),
+                          });
+                        }
                       }}
                       className={`py-2 px-3 rounded-md font-semibold text-left transition-colors cursor-pointer ${
                         selectedTab.status === 'open'

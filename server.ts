@@ -1,8 +1,8 @@
 import dotenv from 'dotenv';
 import express from 'express';
+import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
-import { createServer as createViteServer } from 'vite';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 
 dotenv.config();
@@ -27,14 +27,107 @@ interface CatalogItemInput {
   synonyms: string;
 }
 
+interface ServerStoreSnapshot {
+  storeCode: string;
+  storeName: string;
+  menuItems: unknown[];
+  tabs: unknown[];
+  tabItems: unknown[];
+  voiceOperators: unknown[];
+  updatedAtMs: number;
+}
+
+const STORE_DATA_FILE = path.join(__dirname, '.render-bar-store.json');
+const storeMemoryMap = new Map<string, ServerStoreSnapshot>();
+
+function loadStoresFromDisk(): void {
+  try {
+    if (fs.existsSync(STORE_DATA_FILE)) {
+      const raw = fs.readFileSync(STORE_DATA_FILE, 'utf-8');
+      const parsed = JSON.parse(raw) as Record<string, ServerStoreSnapshot>;
+      for (const [key, val] of Object.entries(parsed)) {
+        if (val && typeof val === 'object') {
+          storeMemoryMap.set(key, val);
+        }
+      }
+    }
+  } catch (err) {
+    console.warn('Aviso ao carregar cache local do bar:', err);
+  }
+}
+
+function saveStoresToDisk(): void {
+  try {
+    const obj: Record<string, ServerStoreSnapshot> = {};
+    for (const [k, v] of storeMemoryMap.entries()) {
+      obj[k] = v;
+    }
+    fs.writeFileSync(STORE_DATA_FILE, JSON.stringify(obj), 'utf-8');
+  } catch (err) {
+    console.warn('Aviso ao salvar cache local do bar:', err);
+  }
+}
+
+loadStoresFromDisk();
+
 async function startServer() {
   const app = express();
   const PORT = Number(process.env.PORT) || 3000;
 
-  app.use(express.json({ limit: '1mb' }));
+  app.use(express.json({ limit: '2mb' }));
 
   app.get('/api/health', (_req, res) => {
     res.json({ ok: true });
+  });
+
+  // Real-time store sync for Render / Direct Bar Login mode
+  app.get('/api/store/:storeCode', (req, res) => {
+    const code = String(req.params.storeCode || 'BAR-01')
+      .trim()
+      .toUpperCase()
+      .replace(/[^A-Z0-9_-]/g, '')
+      .slice(0, 30) || 'BAR-01';
+
+    const existing = storeMemoryMap.get(code);
+    if (!existing) {
+      res.json({ exists: false, storeCode: code });
+      return;
+    }
+    res.json({ exists: true, ...existing });
+  });
+
+  app.post('/api/store/:storeCode', (req, res) => {
+    const code = String(req.params.storeCode || 'BAR-01')
+      .trim()
+      .toUpperCase()
+      .replace(/[^A-Z0-9_-]/g, '')
+      .slice(0, 30) || 'BAR-01';
+
+    const body = req.body as Partial<ServerStoreSnapshot>;
+    const current = storeMemoryMap.get(code);
+
+    const nextSnapshot: ServerStoreSnapshot = {
+      storeCode: code,
+      storeName:
+        typeof body.storeName === 'string' && body.storeName.trim()
+          ? body.storeName.trim().slice(0, 80)
+          : current?.storeName || 'Bar & Comércio Central',
+      menuItems: Array.isArray(body.menuItems)
+        ? body.menuItems
+        : current?.menuItems || [],
+      tabs: Array.isArray(body.tabs) ? body.tabs : current?.tabs || [],
+      tabItems: Array.isArray(body.tabItems)
+        ? body.tabItems
+        : current?.tabItems || [],
+      voiceOperators: Array.isArray(body.voiceOperators)
+        ? body.voiceOperators
+        : current?.voiceOperators || [],
+      updatedAtMs: Date.now(),
+    };
+
+    storeMemoryMap.set(code, nextSnapshot);
+    saveStoresToDisk();
+    res.json({ ok: true, updatedAtMs: nextSnapshot.updatedAtMs });
   });
 
   // Natural Language Bar Assistant "MARCELO" Multi-Customer & Strict Parser using Gemini
@@ -206,6 +299,7 @@ ${customersSummary}`;
   });
 
   if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
