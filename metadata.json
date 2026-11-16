@@ -1,0 +1,6 @@
+{
+  "name": "Comanda Voz - Gestão de Bar em Tempo Real",
+  "description": "Sistema de comando de voz e rastreamento em tempo real de comandas para bares e botecos, evitando perdas de itens no fechamento da conta.",
+  "requestFramePermissions": ["microphone"],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

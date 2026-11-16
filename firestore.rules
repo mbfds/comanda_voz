@@ -1,0 +1,288 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Safety Net (Default Deny)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Hardened Global Primitives
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function isVerified() {
+      return isSignedIn() && request.auth.token.email_verified == true;
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isValidCategory(cat) {
+      return cat is string && cat.size() <= 20 && (
+        cat == 'cervejas' ||
+        cat == 'doses' ||
+        cat == 'porcoes' ||
+        cat == 'sem_alcool' ||
+        cat == 'outros'
+      );
+    }
+
+    function isValidTabStatus(st) {
+      return st is string && st.size() <= 12 && (
+        st == 'open' ||
+        st == 'closing' ||
+        st == 'paid' ||
+        st == 'archived'
+      );
+    }
+
+    function isValidUserRole(role) {
+      return role is string && role.size() <= 20 && (
+        role == 'Proprietário' ||
+        role == 'Garçom' ||
+        role == 'Caixa' ||
+        role == 'Gerente'
+      );
+    }
+
+    // Entity Validation Blueprints
+    function isValidUserProfile(data) {
+      return data.keys().hasAll(['ownerId', 'userName', 'userRole', 'storeName', 'storeCode', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['ownerId', 'userName', 'userRole', 'storeName', 'storeCode', 'createdAt', 'updatedAt']) &&
+        data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.ownerId == request.auth.uid &&
+        data.userName is string && data.userName.size() >= 1 && data.userName.size() <= 60 &&
+        isValidUserRole(data.userRole) &&
+        data.storeName is string && data.storeName.size() >= 1 && data.storeName.size() <= 80 &&
+        data.storeCode is string && data.storeCode.size() >= 1 && data.storeCode.size() <= 30 && data.storeCode.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidMenuItem(data) {
+      return data.keys().hasAll(['ownerId', 'name', 'category', 'price', 'synonyms', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['ownerId', 'name', 'category', 'price', 'synonyms', 'createdAt', 'updatedAt']) &&
+        data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.ownerId == request.auth.uid &&
+        data.name is string && data.name.size() >= 1 && data.name.size() <= 80 &&
+        isValidCategory(data.category) &&
+        data.price is number && data.price >= 0 && data.price <= 100000 &&
+        data.synonyms is string && data.synonyms.size() >= 0 && data.synonyms.size() <= 200 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidBarTab(data) {
+      return data.keys().hasAll(['ownerId', 'customerName', 'tableLabel', 'status', 'totalAmount', 'paidAmount', 'itemCount', 'paymentMethod', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['ownerId', 'customerName', 'tableLabel', 'status', 'totalAmount', 'paidAmount', 'itemCount', 'paymentMethod', 'createdAt', 'updatedAt']) &&
+        data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.ownerId == request.auth.uid &&
+        data.customerName is string && data.customerName.size() >= 1 && data.customerName.size() <= 80 &&
+        data.tableLabel is string && data.tableLabel.size() >= 0 && data.tableLabel.size() <= 40 &&
+        isValidTabStatus(data.status) &&
+        data.totalAmount is number && data.totalAmount >= 0 && data.totalAmount <= 1000000 &&
+        data.paidAmount is number && data.paidAmount >= 0 && data.paidAmount <= 1000000 &&
+        data.itemCount is number && data.itemCount >= 0 && data.itemCount <= 10000 &&
+        data.paymentMethod is string && data.paymentMethod.size() >= 0 && data.paymentMethod.size() <= 40 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidTabItem(data) {
+      return data.keys().hasAll(['ownerId', 'tabId', 'customerName', 'itemName', 'category', 'quantity', 'unitPrice', 'totalPrice', 'source', 'voiceTranscript', 'launchedByName', 'storeName', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['ownerId', 'tabId', 'customerName', 'itemName', 'category', 'quantity', 'unitPrice', 'totalPrice', 'source', 'voiceTranscript', 'launchedByName', 'storeName', 'createdAt', 'updatedAt']) &&
+        data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.ownerId == request.auth.uid &&
+        data.tabId is string && isValidId(data.tabId) &&
+        data.customerName is string && data.customerName.size() >= 1 && data.customerName.size() <= 80 &&
+        data.itemName is string && data.itemName.size() >= 1 && data.itemName.size() <= 80 &&
+        isValidCategory(data.category) &&
+        data.quantity is number && data.quantity >= 1 && data.quantity <= 500 &&
+        data.unitPrice is number && data.unitPrice >= 0 && data.unitPrice <= 100000 &&
+        data.totalPrice is number && data.totalPrice >= 0 && data.totalPrice <= 1000000 &&
+        data.source is string && data.source.size() <= 10 && (data.source == 'voz' || data.source == 'manual' || data.source == 'rapido') &&
+        data.voiceTranscript is string && data.voiceTranscript.size() >= 0 && data.voiceTranscript.size() <= 250 &&
+        data.launchedByName is string && data.launchedByName.size() >= 1 && data.launchedByName.size() <= 60 &&
+        data.storeName is string && data.storeName.size() >= 1 && data.storeName.size() <= 80 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    function isValidVoiceOperator(data) {
+      return data.keys().hasAll(['ownerId', 'operatorName', 'roleLabel', 'storeName', 'storeCode', 'pitchHz', 'spectralCentroid', 'voicePin', 'samplesCount', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['ownerId', 'operatorName', 'roleLabel', 'storeName', 'storeCode', 'pitchHz', 'spectralCentroid', 'voicePin', 'samplesCount', 'createdAt', 'updatedAt']) &&
+        data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId.matches('^[a-zA-Z0-9_\\-]+$') &&
+        data.ownerId == request.auth.uid &&
+        data.operatorName is string && data.operatorName.size() >= 1 && data.operatorName.size() <= 60 &&
+        data.roleLabel is string && data.roleLabel.size() >= 1 && data.roleLabel.size() <= 40 &&
+        data.storeName is string && data.storeName.size() >= 1 && data.storeName.size() <= 80 &&
+        data.storeCode is string && data.storeCode.size() >= 1 && data.storeCode.size() <= 30 &&
+        data.pitchHz is number && data.pitchHz >= 40 && data.pitchHz <= 600 &&
+        data.spectralCentroid is number && data.spectralCentroid >= 0 && data.spectralCentroid <= 10000 &&
+        data.voicePin is string && data.voicePin.size() >= 0 && data.voicePin.size() <= 30 &&
+        data.samplesCount is number && data.samplesCount >= 1 && data.samplesCount <= 50 &&
+        data.createdAt is timestamp &&
+        data.updatedAt is timestamp;
+    }
+
+    // Connection validation probe
+    match /test/connection {
+      allow get: if isSignedIn();
+      allow list, write: if false;
+    }
+
+    // 0. User Profiles (/userProfiles/{userId})
+    match /userProfiles/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && userId == request.auth.uid;
+      allow list: if isSignedIn() && existing().ownerId == request.auth.uid;
+      allow create: if isVerified() &&
+        isValidId(userId) &&
+        userId == request.auth.uid &&
+        isValidUserProfile(incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isVerified() &&
+        isValidId(userId) &&
+        userId == request.auth.uid &&
+        isValidUserProfile(incoming()) &&
+        existing().ownerId == request.auth.uid &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['userName', 'userRole', 'storeName', 'storeCode', 'updatedAt']);
+      allow delete: if false;
+    }
+
+    // 1. Menu Items (/menuItems/{menuItemId})
+    match /menuItems/{menuItemId} {
+      allow get: if isSignedIn() && isValidId(menuItemId) && existing().ownerId == request.auth.uid;
+      allow list: if isSignedIn() && existing().ownerId == request.auth.uid;
+      allow create: if isVerified() &&
+        isValidId(menuItemId) &&
+        isValidMenuItem(incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isVerified() &&
+        isValidId(menuItemId) &&
+        isValidMenuItem(incoming()) &&
+        existing().ownerId == request.auth.uid &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['name', 'category', 'price', 'synonyms', 'updatedAt']);
+      allow delete: if isVerified() &&
+        isValidId(menuItemId) &&
+        existing().ownerId == request.auth.uid;
+    }
+
+    // 2. Bar Tabs (/tabs/{tabId})
+    match /tabs/{tabId} {
+      allow get: if isSignedIn() && isValidId(tabId) && existing().ownerId == request.auth.uid;
+      allow list: if isSignedIn() && existing().ownerId == request.auth.uid;
+      allow create: if isVerified() &&
+        isValidId(tabId) &&
+        isValidBarTab(incoming()) &&
+        incoming().status == 'open' &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isVerified() &&
+        isValidId(tabId) &&
+        isValidBarTab(incoming()) &&
+        existing().ownerId == request.auth.uid &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        existing().status != 'archived' && (
+          // Action 1: Add/Adjust consumption or reopen tab when customer continues consuming
+          (incoming().status == 'open' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'customerName', 'tableLabel', 'totalAmount', 'paidAmount', 'itemCount', 'updatedAt'])) ||
+          // Action 2: Stage 2 - Fechando (Request bill & review total/items)
+          (incoming().status == 'closing' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'totalAmount', 'paidAmount', 'itemCount', 'updatedAt'])) ||
+          // Action 3: Stage 3 - Baixa (Record full or partial payment)
+          ((incoming().status == 'paid' || incoming().status == 'open') &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'paidAmount', 'paymentMethod', 'totalAmount', 'itemCount', 'updatedAt'])) ||
+          // Action 4: Archive settled tab (Terminal State Lock)
+          (incoming().status == 'archived' &&
+            incoming().diff(existing()).affectedKeys().hasOnly(['status', 'updatedAt']))
+        );
+      allow delete: if isVerified() &&
+        isValidId(tabId) &&
+        existing().ownerId == request.auth.uid &&
+        existing().status != 'archived';
+    }
+
+    // 3. Tab Items (/tabItems/{itemId})
+    match /tabItems/{itemId} {
+      allow get: if isSignedIn() && isValidId(itemId) && existing().ownerId == request.auth.uid;
+      allow list: if isSignedIn() && existing().ownerId == request.auth.uid;
+      allow create: if isVerified() &&
+        isValidId(itemId) &&
+        isValidTabItem(incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time &&
+        existsAfter(/databases/$(database)/documents/tabs/$(incoming().tabId)) &&
+        getAfter(/databases/$(database)/documents/tabs/$(incoming().tabId)).data.ownerId == request.auth.uid &&
+        getAfter(/databases/$(database)/documents/tabs/$(incoming().tabId)).data.status != 'archived';
+      allow update: if isVerified() &&
+        isValidId(itemId) &&
+        isValidTabItem(incoming()) &&
+        existing().ownerId == request.auth.uid &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().tabId == existing().tabId &&
+        incoming().customerName == existing().customerName &&
+        incoming().itemName == existing().itemName &&
+        incoming().category == existing().category &&
+        incoming().unitPrice == existing().unitPrice &&
+        incoming().source == existing().source &&
+        incoming().voiceTranscript == existing().voiceTranscript &&
+        incoming().launchedByName == existing().launchedByName &&
+        incoming().storeName == existing().storeName &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['quantity', 'totalPrice', 'updatedAt']) &&
+        existsAfter(/databases/$(database)/documents/tabs/$(existing().tabId)) &&
+        getAfter(/databases/$(database)/documents/tabs/$(existing().tabId)).data.ownerId == request.auth.uid &&
+        getAfter(/databases/$(database)/documents/tabs/$(existing().tabId)).data.status != 'archived';
+      allow delete: if isVerified() &&
+        isValidId(itemId) &&
+        existing().ownerId == request.auth.uid &&
+        exists(/databases/$(database)/documents/tabs/$(existing().tabId)) &&
+        get(/databases/$(database)/documents/tabs/$(existing().tabId)).data.ownerId == request.auth.uid &&
+        get(/databases/$(database)/documents/tabs/$(existing().tabId)).data.status != 'archived';
+    }
+
+    // 4. Voice Operators (/voiceOperators/{operatorId})
+    match /voiceOperators/{operatorId} {
+      allow get: if isSignedIn() && isValidId(operatorId) && existing().ownerId == request.auth.uid;
+      allow list: if isSignedIn() && existing().ownerId == request.auth.uid;
+      allow create: if isVerified() &&
+        isValidId(operatorId) &&
+        isValidVoiceOperator(incoming()) &&
+        incoming().createdAt == request.time &&
+        incoming().updatedAt == request.time;
+      allow update: if isVerified() &&
+        isValidId(operatorId) &&
+        isValidVoiceOperator(incoming()) &&
+        existing().ownerId == request.auth.uid &&
+        incoming().ownerId == existing().ownerId &&
+        incoming().createdAt == existing().createdAt &&
+        incoming().updatedAt == request.time &&
+        incoming().diff(existing()).affectedKeys().hasOnly(['operatorName', 'roleLabel', 'storeName', 'storeCode', 'pitchHz', 'spectralCentroid', 'voicePin', 'samplesCount', 'updatedAt']);
+      allow delete: if isVerified() &&
+        isValidId(operatorId) &&
+        existing().ownerId == request.auth.uid;
+    }
+  }
+}

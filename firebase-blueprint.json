@@ -1,0 +1,378 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Perfil do usuário logado indicando seu nome, cargo (Garçom, Proprietário, Caixa) e a qual Comércio/Bar pertence.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "UID do usuário autenticado.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "userName": {
+          "type": "string",
+          "description": "Nome do usuário ou garçom.",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "userRole": {
+          "type": "string",
+          "description": "Função no estabelecimento.",
+          "enum": ["Proprietário", "Garçom", "Caixa", "Gerente"]
+        },
+        "storeName": {
+          "type": "string",
+          "description": "Nome do Comércio / Bar ao qual pertence.",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "storeCode": {
+          "type": "string",
+          "description": "Código identificador do Comércio.",
+          "minLength": 1,
+          "maxLength": 30,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp de criação do perfil."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp da última atualização."
+        }
+      },
+      "required": [
+        "ownerId",
+        "userName",
+        "userRole",
+        "storeName",
+        "storeCode",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "MenuItem": {
+      "title": "MenuItem",
+      "description": "Item do cardápio do bar com preço padrão e sinônimos para reconhecimento de voz.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "UID do proprietário do bar.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "name": {
+          "type": "string",
+          "description": "Nome do produto no cardápio.",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "category": {
+          "type": "string",
+          "description": "Categoria do item.",
+          "enum": ["cervejas", "doses", "porcoes", "sem_alcool", "outros"]
+        },
+        "price": {
+          "type": "number",
+          "description": "Preço unitário em reais."
+        },
+        "synonyms": {
+          "type": "string",
+          "description": "Palavras-chave ou apelidos separados por vírgula para comando de voz.",
+          "minLength": 0,
+          "maxLength": 200
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp de criação no servidor."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp da última atualização no servidor."
+        }
+      },
+      "required": ["ownerId", "name", "category", "price", "synonyms", "createdAt", "updatedAt"]
+    },
+    "BarTab": {
+      "title": "BarTab",
+      "description": "Comanda de cliente com 3 estágios operacionais (open = Abertura/Consumo, closing = Fechando/Conferência, paid = Baixa/Pago) e archived.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "UID do proprietário do bar.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "customerName": {
+          "type": "string",
+          "description": "Nome do cliente ou identificador principal da comanda.",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "tableLabel": {
+          "type": "string",
+          "description": "Identificação opcional de mesa ou local no bar.",
+          "minLength": 0,
+          "maxLength": 40
+        },
+        "status": {
+          "type": "string",
+          "description": "Estágio atual da comanda: open (Abertura), closing (Fechando), paid (Baixa/Pago), archived (Arquivada).",
+          "enum": ["open", "closing", "paid", "archived"]
+        },
+        "totalAmount": {
+          "type": "number",
+          "description": "Valor total consumido acumulado na comanda."
+        },
+        "paidAmount": {
+          "type": "number",
+          "description": "Valor total já pago (baixas realizadas) nesta comanda."
+        },
+        "itemCount": {
+          "type": "number",
+          "description": "Quantidade total de unidades lançadas na comanda."
+        },
+        "paymentMethod": {
+          "type": "string",
+          "description": "Forma de pagamento utilizada na última baixa.",
+          "minLength": 0,
+          "maxLength": 40
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp de abertura da comanda."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp da última movimentação da comanda."
+        }
+      },
+      "required": [
+        "ownerId",
+        "customerName",
+        "tableLabel",
+        "status",
+        "totalAmount",
+        "paidAmount",
+        "itemCount",
+        "paymentMethod",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "TabItem": {
+      "title": "TabItem",
+      "description": "Item individual lançado em uma comanda com identificação do garçom/usuário e do comércio.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "UID do proprietário do bar.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "tabId": {
+          "type": "string",
+          "description": "ID da comanda à qual o item pertence.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "customerName": {
+          "type": "string",
+          "description": "Nome do cliente titular da comanda no momento do lançamento.",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "itemName": {
+          "type": "string",
+          "description": "Nome do item lançado.",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "category": {
+          "type": "string",
+          "description": "Categoria do item lançado.",
+          "enum": ["cervejas", "doses", "porcoes", "sem_alcool", "outros"]
+        },
+        "quantity": {
+          "type": "number",
+          "description": "Quantidade de unidades lançadas."
+        },
+        "unitPrice": {
+          "type": "number",
+          "description": "Preço unitário praticado."
+        },
+        "totalPrice": {
+          "type": "number",
+          "description": "Subtotal do lançamento (quantity * unitPrice)."
+        },
+        "source": {
+          "type": "string",
+          "description": "Origem do lançamento (voz, manual ou rapido).",
+          "enum": ["voz", "manual", "rapido"]
+        },
+        "voiceTranscript": {
+          "type": "string",
+          "description": "Transcrição original do comando de voz para auditoria no fechamento.",
+          "minLength": 0,
+          "maxLength": 250
+        },
+        "launchedByName": {
+          "type": "string",
+          "description": "Nome do garçom ou usuário que realizou o lançamento.",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "storeName": {
+          "type": "string",
+          "description": "Nome do comércio/bar ao qual o lançamento e o garçom pertencem.",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp exato do lançamento."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp da última alteração de quantidade."
+        }
+      },
+      "required": [
+        "ownerId",
+        "tabId",
+        "customerName",
+        "itemName",
+        "category",
+        "quantity",
+        "unitPrice",
+        "totalPrice",
+        "source",
+        "voiceTranscript",
+        "launchedByName",
+        "storeName",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "VoiceOperator": {
+      "title": "VoiceOperator",
+      "description": "Usuário/Garçom vinculado ao comércio com voz treinada para dar comandos ao assistente Marcelo.",
+      "type": "object",
+      "properties": {
+        "ownerId": {
+          "type": "string",
+          "description": "UID do proprietário do bar.",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "operatorName": {
+          "type": "string",
+          "description": "Nome do garçom ou operador cadastrado.",
+          "minLength": 1,
+          "maxLength": 60
+        },
+        "roleLabel": {
+          "type": "string",
+          "description": "Função no bar (ex: Garçom, Proprietário, Caixa).",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "storeName": {
+          "type": "string",
+          "description": "Nome do comércio ao qual este garçom pertence.",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "storeCode": {
+          "type": "string",
+          "description": "Código do comércio ao qual este garçom pertence.",
+          "minLength": 1,
+          "maxLength": 30
+        },
+        "pitchHz": {
+          "type": "number",
+          "description": "Frequência fundamental média da voz treinada (Hz)."
+        },
+        "spectralCentroid": {
+          "type": "number",
+          "description": "Centroide espectral médio de timbre vocal."
+        },
+        "voicePin": {
+          "type": "string",
+          "description": "Palavra-código ou PIN falado individual do garçom.",
+          "minLength": 0,
+          "maxLength": 30
+        },
+        "samplesCount": {
+          "type": "number",
+          "description": "Quantidade de amostras de voz gravadas no treinamento."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp de cadastro do perfil de voz."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "Timestamp da última calibragem de voz."
+        }
+      },
+      "required": [
+        "ownerId",
+        "operatorName",
+        "roleLabel",
+        "storeName",
+        "storeCode",
+        "pitchHz",
+        "spectralCentroid",
+        "voicePin",
+        "samplesCount",
+        "createdAt",
+        "updatedAt"
+      ]
+    }
+  },
+  "firestore": {
+    "/userProfiles/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "Perfil do usuário/garçom logado e vínculo com o Comércio."
+    },
+    "/menuItems/{menuItemId}": {
+      "schema": { "$ref": "#/entities/MenuItem" },
+      "description": "Catálogo de produtos e preços do bar por proprietário."
+    },
+    "/tabs/{tabId}": {
+      "schema": { "$ref": "#/entities/BarTab" },
+      "description": "Comandas nos 3 estágios (open, closing, paid) e arquivadas por proprietário."
+    },
+    "/tabItems/{itemId}": {
+      "schema": { "$ref": "#/entities/TabItem" },
+      "description": "Itens lançados nas comandas com rastreamento de garçom, comércio, voz e horário."
+    },
+    "/voiceOperators/{operatorId}": {
+      "schema": { "$ref": "#/entities/VoiceOperator" },
+      "description": "Usuários e garçons cadastrados no comércio com perfil biométrico de voz."
+    }
+  }
+}
