@@ -82,6 +82,7 @@ import {
 } from './utils/barCatalog';
 import { speakAsMarcelo } from './utils/voiceBiometrics';
 import { ErrorBoundary } from './components/ErrorBoundary';
+import { SalesDashboard } from './components/SalesDashboard';
 
 // Web Speech API Type Declarations
 interface SpeechRecognitionEvent extends Event {
@@ -111,7 +112,7 @@ interface SpeechRecognitionInstance extends EventTarget {
   onend: (() => void) | null;
 }
 
-type ActiveSection = 'comandas' | 'cardapio' | 'equipe_comercio' | 'superadmin';
+type ActiveSection = 'comandas' | 'cardapio' | 'vendas' | 'equipe_comercio' | 'superadmin';
 
 interface DirectBarSession {
   uid: string;
@@ -203,6 +204,10 @@ const SIMPLE_VOICE_EXAMPLES = [
 function getTimestampMillis(ts: unknown): number {
   if (!ts) return Date.now();
   if (typeof ts === 'number') return ts;
+  if (typeof ts === 'string') {
+    const parsed = Date.parse(ts);
+    return Number.isNaN(parsed) ? Date.now() : parsed;
+  }
   if (typeof ts === 'object') {
     const obj = ts as {
       toMillis?: () => number;
@@ -3446,17 +3451,30 @@ function ComandaVozWorkspace() {
             Cardápio ({menuItems.length})
           </button>
           {isAdmin && (
-            <button
-              type="button"
-              onClick={() => setActiveSection('equipe_comercio')}
-              className={`py-1 transition-colors whitespace-nowrap cursor-pointer ${
-                activeSection === 'equipe_comercio'
-                  ? 'text-amber-400 font-bold underline underline-offset-8 decoration-2'
-                  : 'hover:text-slate-100'
-              }`}
-            >
-              Garçons ({voiceOperators.length})
-            </button>
+            <>
+              <button
+                type="button"
+                onClick={() => setActiveSection('vendas')}
+                className={`py-1 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                  activeSection === 'vendas'
+                    ? 'text-amber-400 font-bold underline underline-offset-8 decoration-2'
+                    : 'hover:text-slate-100'
+                }`}
+              >
+                Vendas
+              </button>
+              <button
+                type="button"
+                onClick={() => setActiveSection('equipe_comercio')}
+                className={`py-1 transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                  activeSection === 'equipe_comercio'
+                    ? 'text-amber-400 font-bold underline underline-offset-8 decoration-2'
+                    : 'hover:text-slate-100'
+                }`}
+              >
+                Garçons ({voiceOperators.length})
+              </button>
+            </>
           )}
           {isSuperAdmin && (
             <button
@@ -4381,7 +4399,18 @@ function ComandaVozWorkspace() {
           </div>
         )}
 
-        {/* SECTION 3: GARÇONS & BAR (ADM ONLY) */}
+        {/* SECTION 3: DASHBOARD DE VENDAS (7 DIAS - ADM ONLY) */}
+        {activeSection === 'vendas' && isAdmin && (
+          <SalesDashboard
+            storeName={currentStoreName}
+            tabs={tabs}
+            tabItems={tabItems}
+            getTimestampMillis={getTimestampMillis}
+            onGoToComandas={() => setActiveSection('comandas')}
+          />
+        )}
+
+        {/* SECTION 4: GARÇONS & BAR (ADM ONLY) */}
         {activeSection === 'equipe_comercio' && isAdmin && (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
             <div className="lg:col-span-5 space-y-5">
