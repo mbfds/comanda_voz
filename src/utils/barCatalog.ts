@@ -189,12 +189,67 @@ export function formatBRL(value: number): string {
   }).format(Number.isFinite(value) ? value : 0);
 }
 
+/**
+ * Normalizes general text: decomposes accents, removes zero-width/apostrophe/special
+ * characters (keeping numeric decimal separators), and collapses whitespace.
+ */
 export function normalizeText(str: string): string {
   return (str ?? '')
-    .toLowerCase()
     .normalize('NFD')
     .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[\u200B-\u200D\uFEFF'’`´]/g, '')
+    .replace(/[^a-z0-9\s.,/-]/g, ' ')
+    .replace(/(?<!\d)[.,/-]+|[.,/-]+(?!\d)/g, ' ')
+    .replace(/\s+/g, ' ')
     .trim();
+}
+
+/**
+ * Aggressively sanitizes raw STT or typed transcripts before command & name parsing:
+ * converts currency symbols (R$) into "reais", strips emojis/special characters,
+ * normalizes decimal numbers, and removes stray punctuation while preserving
+ * clause separators (commas) and numbers.
+ */
+export function sanitizeVoiceTranscriptForParsing(str: string): string {
+  return (str ?? '')
+    .replace(/[\u200B-\u200D\uFEFF]/g, '')
+    .replace(/\br\s*\$\s*/gi, ' reais ')
+    .replace(/['’`´"“”«»*()[\]{}<>@#%&_+=~^|\\!?]/g, ' ')
+    .replace(/(?<!\d)[.,;:/-]+|[.,;:/-]+(?!\d)/g, (m) => (m.includes(',') ? ', ' : ' '))
+    .replace(/(?<!\d)\s*,\s*|\s*,\s*(?!\d)/g, ', ')
+    .replace(/,\s*,+/g, ',')
+    .replace(/^[,\s]+|[,\s]+$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+/**
+ * Aggressively cleans a customer name for search/matching:
+ * removes accents, special characters, punctuation, honorifics, and extra spaces.
+ */
+export function normalizeCustomerNameForSearch(str: string): string {
+  let cleaned = (str ?? '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/[\u200B-\u200D\uFEFF'’`´]/g, '')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  for (let i = 0; i < 4; i++) {
+    const next = cleaned
+      .replace(
+        /^(?:o|a|os|as|do|da|dos|das|de|no|na|nos|nas|pro|pra|para|conta|comanda|cliente|senhor|sr|seu|dona)\b\s*/i,
+        ''
+      )
+      .trim();
+    if (next === cleaned) break;
+    cleaned = next;
+  }
+
+  return cleaned;
 }
 
 /**
@@ -204,7 +259,26 @@ export function normalizeText(str: string): string {
  * Matheus/Mateus, Felipe/Filipe/Phelipe, Victor/Vitor, Luiz/Luis, etc.).
  */
 export const COMMON_CUSTOMER_NAME_SYNONYMS: Record<string, string[]> = {
-  thiago: ['thiago', 'tiago', 'thyago', 'tiaguinho', 'thiaguinho', 'hiago', 'iago', 'yago'],
+  thiago: [
+    'thiago',
+    'tiago',
+    'thyago',
+    'tyago',
+    'tiagu',
+    'thiagu',
+    'tiagho',
+    'thiagho',
+    'tihago',
+    'teago',
+    'theago',
+    'tiaguinho',
+    'thiaguinho',
+    'tiaguim',
+    'thiaguim',
+    'hiago',
+    'iago',
+    'yago',
+  ],
   marcelo: [
     'marcelo',
     'marcello',
@@ -286,22 +360,40 @@ export const COMMON_CUSTOMER_NAME_SYNONYMS: Record<string, string[]> = {
  * "Marcelle" and "Marcele" normalize consistently.
  */
 export function normalizePhoneticPt(str: string): string {
-  return normalizeText(str)
+  const preCleaned = (str ?? '')
+    .toLowerCase()
+    // Preserve cedilla s-sound before stripping diacritics (e.g. Gonçalo -> Gonsalo)
+    .replace(/ç/g, 's')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[\u200B-\u200D\uFEFF'’`´]/g, '')
+    .replace(/[^a-z0-9\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!preCleaned) return '';
+
+  return preCleaned
+    // Collapse consecutive duplicate letters first so "tthiago" / "thh" simplify cleanly
+    .replace(/([a-z])\1+/g, '$1')
     .replace(/ph/g, 'f')
-    .replace(/th/g, 't')
+    .replace(/th/g, 't') // Thiago -> tiago, Matheus -> mateus, Thais -> tais, Nathan -> natan
     .replace(/chr/g, 'cr')
+    .replace(/sc([ei])/g, 's$1')
     .replace(/\bh/g, '') // leading silent h (e.g. Henrique -> enrique, Hiago -> iago)
-    .replace(/([^clns])h/g, '$1') // silent h anywhere except ch, lh, nh, sh (e.g. Arthur -> artur, Nathan -> natan)
+    .replace(/([^clns])h/g, '$1') // silent h anywhere except ch, lh, nh, sh (e.g. Arthur -> artur, Tiagho -> tiago)
     .replace(/y/g, 'i')
     .replace(/w/g, 'v')
     .replace(/k/g, 'c')
     .replace(/qu([ei])/g, 'c$1') // Henrique/Enrike -> enrice, Caique/Kaique -> caice
     .replace(/g([ei])/g, 'j$1') // Giovana/Jiovana, Geovana/Jeovana
     .replace(/c([ei])/g, 's$1') // Marcelo/Marselo, Marcele/Marsele, Cesar/Sesar
+    .replace(/([aeiou])z([aeiou])/g, '$1s$2') // Luiza -> luisa, Eliza -> elisa
     .replace(/ct/g, 't') // Victor -> Vitor
+    .replace(/pt/g, 't') // Baptista -> Batista
     .replace(/z\b/g, 's') // Luiz -> Luis, Beatriz -> Beatris
-    .replace(/ss/g, 's')
-    .replace(/([a-z])\1+/g, '$1') // collapse double letters (Marcello -> Marcelo, Marcelle -> Marcele)
+    .replace(/\b([a-z]{4,})u\b/g, '$1o') // tiagu -> tiago, marcelu -> marcelo, danilu -> danilo
+    .replace(/([a-z])\1+/g, '$1') // second collapse after phonetic substitutions
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -403,21 +495,33 @@ function getSingleNameTokenSimilarity(tokA: string, tokB: string): number {
  * Portuguese synonym groups, bounded Levenshtein, and character n-gram Dice matching.
  */
 export function computeCustomerNameSimilarity(nameA: string, nameB: string): number {
-  const normA = normalizeText(nameA);
-  const normB = normalizeText(nameB);
+  const normA = normalizeCustomerNameForSearch(nameA);
+  const normB = normalizeCustomerNameForSearch(nameB);
   if (!normA || !normB) return 0;
   if (normA === normB) return 1.0;
 
-  const phonA = normalizePhoneticPt(nameA);
-  const phonB = normalizePhoneticPt(nameB);
+  const phonA = normalizePhoneticPt(normA);
+  const phonB = normalizePhoneticPt(normB);
   if (!phonA || !phonB) return 0;
-  if (phonA === phonB) return 0.98;
+  if (phonA === phonB) return 0.99;
 
   const tokensA = normA.split(/\s+/).filter(Boolean);
   const tokensB = normB.split(/\s+/).filter(Boolean);
 
   if (tokensA.length === 1 && tokensB.length === 1) {
     return getSingleNameTokenSimilarity(tokensA[0], tokensB[0]);
+  }
+
+  // Handle names split by special characters (e.g., "Thi@go" -> "thi go" vs "Tiago")
+  if (
+    (tokensA.length === 1 && tokensB.length > 1) ||
+    (tokensB.length === 1 && tokensA.length > 1)
+  ) {
+    const condensedA = phonA.replace(/\s+/g, '');
+    const condensedB = phonB.replace(/\s+/g, '');
+    if (condensedA === condensedB) return 0.96;
+    const condSim = getSingleNameTokenSimilarity(condensedA, condensedB);
+    if (condSim >= 0.85) return condSim * 0.96;
   }
 
   if (tokensA.length === tokensB.length) {
@@ -474,7 +578,9 @@ export function areCustomerNamesEquivalent(nameA: string, nameB: string): boolea
 }
 
 function cleanCustomerCandidateText(raw: string): string {
-  let cleaned = (raw ?? '').trim().replace(/[.!,?;:]+$/g, '').trim();
+  let cleaned = sanitizeVoiceTranscriptForParsing(raw)
+    .replace(/[.!,?;:]+$/g, '')
+    .trim();
   for (let i = 0; i < 5; i++) {
     const next = cleaned
       .replace(
@@ -499,23 +605,38 @@ export function resolveCustomerNameFromExisting(
   const cleaned = cleanCustomerCandidateText(spokenCandidate);
   if (!cleaned) return '';
 
-  // Score all existing customer names and select the strongest confident match
+  const cleanedSearch = normalizeCustomerNameForSearch(cleaned);
+  const cleanedPhon = normalizePhoneticPt(cleanedSearch);
+
+  // Score all existing customer names (normalized & phonetically pre-cleaned) and select the strongest confident match
   let bestExisting = '';
   let bestScore = 0;
 
   for (const existing of existingCustomerNames) {
-    const score = computeCustomerNameSimilarity(existing, cleaned);
+    const existingClean = cleanCustomerCandidateText(existing);
+    if (!existingClean) continue;
+
+    const existingSearch = normalizeCustomerNameForSearch(existingClean);
+    const existingPhon = normalizePhoneticPt(existingSearch);
+
+    // Fast-path exact phonetic equivalence (e.g. "Thiago" === "Tiago")
+    if (cleanedPhon && existingPhon && cleanedPhon === existingPhon) {
+      return existing.trim();
+    }
+
+    const score = computeCustomerNameSimilarity(existingClean, cleaned);
     if (score >= 0.78 && score > bestScore) {
       bestScore = score;
-      bestExisting = existing;
+      bestExisting = existing.trim();
     }
   }
 
   if (bestExisting) return bestExisting;
 
-  // Title-case the new customer name
+  // Title-case the new customer name (using cleaned text free of special characters)
   return cleaned
     .split(/\s+/)
+    .filter(Boolean)
     .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
     .join(' ');
 }
@@ -575,12 +696,20 @@ function extractCustomerForAccountAction(
 ): string {
   const clauseNoPolite = stripPolitePrefixes(cleanedClause);
 
-  // 1. Repeatedly strip trailing payment/continuation phrases so chained modifiers don't linger
-  let stripped = clauseNoPolite.replace(/[.!,?;:]+$/g, '').trim();
+  // 1. Strip payment-method modifiers anywhere and trailing continuation phrases cleanly
+  let stripped = clauseNoPolite
+    .replace(/[.!,?;:]+$/g, '')
+    .replace(/\b(?:no|via)\s+pix\b/gi, ' ')
+    .replace(/\b(?:no|via)\s+cart[aã]o(?:\s+de\s+(?:cr[eé]dito|d[eé]bito))?\b/gi, ' ')
+    .replace(/\b(?:em|no)\s+(?:dinheiro|esp[eé]cie)\b/gi, ' ')
+    .replace(/\bno\s+valor(?:\s+de)?\b/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
   for (let i = 0; i < 4; i++) {
     const next = stripped
       .replace(
-        /(?:\s+e\s+continua.*|\s+no\s+pix.*|\s+via\s+pix.*|\s+no\s+cart[aã]o.*|\s+em\s+dinheiro.*|\s+no\s+valor.*|\s+por\s+favor.*|\s+por\s+gentileza.*|\s+agora.*|\s+hoje|\s+ai|\s+aí|\s+pf)$/i,
+        /(?:\s+e\s+continua.*|\s+por\s+favor.*|\s+por\s+gentileza.*|\s+agora.*|\s+hoje|\s+ai|\s+aí|\s+pf)$/i,
         ''
       )
       .trim();
@@ -588,7 +717,8 @@ function extractCustomerForAccountAction(
     stripped = next;
   }
   stripped = stripped
-    .replace(/\bde\s+\d+(?:[.,]\d+)?\s*(?:reais|real|conto|pila)?\b/gi, ' ')
+    .replace(/\b(?:de\s+(?:reais|valor)\s+|(?:de|valor|reais|rs)\s+)\d+(?:[.,]\d+)?\s*(?:reais|real|conto|pila)?\b/gi, ' ')
+    .replace(/\b\d+(?:[.,]\d+)?\s*(?:reais|real|conto|pila)\b/gi, ' ')
     .replace(/[.!,?;:]+$/g, '')
     .trim();
 
@@ -1125,7 +1255,7 @@ function parseSingleClauseStrictly(
     // Match explicit currency/amount (e.g., "baixa de 20 reais", "20 reais", "R$ 20") without matching "mesa 2"
     const amountMatch =
       norm.match(
-        /(?:de\s+|valor\s+|r\$\s*)(\d+(?:[.,]\d+)?)\s*(?:reais|real|conto|pila)?/i
+        /(?:de\s+(?:reais\s+|valor\s+)?|valor\s+|reais\s+|rs\s+|r\$\s*)(\d+(?:[.,]\d+)?)\s*(?:reais|real|conto|pila)?/i
       ) || norm.match(/(\d+(?:[.,]\d+)?)\s*(?:reais|real|conto|pila)\b/i);
 
     if (amountMatch && amountMatch[1]) {
@@ -1169,15 +1299,19 @@ function parseSingleClauseStrictly(
   // Handle MARCAR (Stage 1: Add items to customer tab)
   let customerName = '';
   let tableLabel = '';
-  let orderPart = cleaned;
+  // Strip trailing polite phrases/punctuation before isolating the target customer name
+  const cleanedForMarcar = sanitizeVoiceTranscriptForParsing(cleaned)
+    .replace(/\s+(?:por\s+favor|por\s+gentileza|pf|obrigado|obrigada|valeu)\s*$/i, '')
+    .trim();
+  let orderPart = cleanedForMarcar;
 
   const targetRegex =
-    /\b(?:na\s+comanda\s+d[oa]\s+|na\s+conta\s+d[oa]\s+|comanda\s+d[oa]\s+|conta\s+d[oa]\s+|na\s+para\s+o?\s*|para\s+o\s+|para\s+a\s+|para\s+|pro\s+|pra\s+|no\s+|na\s+)([a-zA-ZÀ-ÿ0-9\s]{2,40})$/i;
-  const matchTarget = cleaned.match(targetRegex);
+    /\b(?:na\s+comanda\s+d[oa]\s+|na\s+conta\s+d[oa]\s+|comanda\s+d[oa]\s+|conta\s+d[oa]\s+|na\s+para\s+o?\s*|para\s+o\s+|para\s+a\s+|para\s+|pro\s+|pra\s+|no\s+|na\s+)([a-zA-ZÀ-ÿ0-9\s]{2,45})$/i;
+  const matchTarget = cleanedForMarcar.match(targetRegex);
 
   if (matchTarget && matchTarget[1]) {
-    const rawTarget = matchTarget[1].trim().replace(/[.!,?]+$/, '');
-    orderPart = cleaned.slice(0, matchTarget.index).trim();
+    const rawTarget = cleanCustomerCandidateText(matchTarget[1]);
+    orderPart = cleanedForMarcar.slice(0, matchTarget.index).trim();
     customerName = resolveCustomerNameFromExisting(rawTarget, existingCustomerNames);
 
     if (/^mesa\s+\d+/i.test(customerName)) {
@@ -1346,8 +1480,24 @@ export function parseVoiceOrderLocally(
   existingCustomerNames: string[],
   fallbackSelectedCustomerName?: string
 ): ParsedVoiceOrder {
-  const rawCleaned = transcript.trim();
+  // 1. Aggressive pre-normalization: strip special characters, emojis, currency symbols, and stray punctuation
+  const rawCleaned = sanitizeVoiceTranscriptForParsing(transcript);
   const normFull = normalizeText(rawCleaned);
+
+  // 2. Pre-normalize existing customer names and fallback customer name before searching
+  const normalizedExistingCustomers = Array.from(
+    new Set(
+      (existingCustomerNames || [])
+        .map((name) => sanitizeVoiceTranscriptForParsing(name))
+        .filter((name) => normalizeCustomerNameForSearch(name).length >= 2)
+    )
+  );
+  const cleanFallbackCustomer = fallbackSelectedCustomerName
+    ? resolveCustomerNameFromExisting(
+        sanitizeVoiceTranscriptForParsing(fallbackSelectedCustomerName),
+        normalizedExistingCustomers
+      )
+    : undefined;
 
   const wakeExtraction = extractCommandAfterMarceloWakeWord(rawCleaned);
   const addressedToMarcelo = wakeExtraction.hasWakeWord || /\bmarcelo\b/i.test(normFull);
@@ -1363,7 +1513,7 @@ export function parseVoiceOrderLocally(
     : rawCleaned;
 
   const withoutWake = stripPolitePrefixes(
-    effectiveRaw
+    sanitizeVoiceTranscriptForParsing(effectiveRaw)
       .replace(
         /^(?:oi\s+|ola\s+|olá\s+|ei\s+|fala\s+)?(?:marcelo[\s,.:;-]+)(?!pagou\b|quitou\b|pediu\b)/i,
         ''
@@ -1427,13 +1577,15 @@ export function parseVoiceOrderLocally(
 
   const finalClauses = mergedClauses.length > 0 ? mergedClauses : [withoutWake];
   const commands: ParsedSingleCommand[] = [];
+  // Keep customer name identity consistent across chained clauses (e.g. "Thiago" and "Tiago" in same breath)
+  const runningCustomers = [...normalizedExistingCustomers];
 
   for (const clause of finalClauses) {
     const { command, errorReason } = parseSingleClauseStrictly(
       clause,
       catalog,
-      existingCustomerNames,
-      fallbackSelectedCustomerName
+      runningCustomers,
+      cleanFallbackCustomer
     );
     if (!command) {
       return {
@@ -1445,6 +1597,12 @@ export function parseVoiceOrderLocally(
         spokenPin,
         commands: [],
       };
+    }
+    if (
+      command.customerName &&
+      !runningCustomers.some((c) => areCustomerNamesEquivalent(c, command.customerName))
+    ) {
+      runningCustomers.push(command.customerName);
     }
     commands.push(command);
   }
