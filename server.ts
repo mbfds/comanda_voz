@@ -206,16 +206,19 @@ async function startServer() {
 
     saveDatabaseToDisk();
 
+    const sessionPayload = {
+      uid: newAdmin.uid,
+      email: newAdmin.email,
+      userName: newAdmin.userName,
+      userRole: newAdmin.userRole,
+      storeName: newAdmin.storeName,
+      storeCode: newAdmin.storeCode,
+    };
+
     res.json({
       ok: true,
-      session: {
-        uid: newAdmin.uid,
-        email: newAdmin.email,
-        userName: newAdmin.userName,
-        userRole: newAdmin.userRole,
-        storeName: newAdmin.storeName,
-        storeCode: newAdmin.storeCode,
-      },
+      account: sessionPayload,
+      session: sessionPayload,
     });
   });
 
@@ -242,16 +245,19 @@ async function startServer() {
       return;
     }
 
+    const sessionPayload = {
+      uid: acc.uid,
+      email: acc.email,
+      userName: acc.userName,
+      userRole: acc.userRole,
+      storeName: acc.storeName,
+      storeCode: acc.storeCode,
+    };
+
     res.json({
       ok: true,
-      session: {
-        uid: acc.uid,
-        email: acc.email,
-        userName: acc.userName,
-        userRole: acc.userRole,
-        storeName: acc.storeName,
-        storeCode: acc.storeCode,
-      },
+      account: sessionPayload,
+      session: sessionPayload,
     });
   });
 
@@ -320,21 +326,24 @@ async function startServer() {
     accountMemoryMap.set(normEmail, waiterAccount);
     saveDatabaseToDisk();
 
+    const opPayload = {
+      id: opId,
+      email: normEmail,
+      passwordHash: passHash,
+      operatorName: cleanOpName,
+      roleLabel: 'Garçom',
+      storeName: cleanStore,
+      storeCode: code,
+      pitchHz: Number(pitchHz) || 140,
+      spectralCentroid: Number(spectralCentroid) || 1600,
+      voicePin: String(voicePin || '').slice(0, 20),
+      samplesCount: Number(samplesCount) || 1,
+    };
+
     res.json({
       ok: true,
-      waiterAccount: {
-        id: opId,
-        email: normEmail,
-        passwordHash: passHash,
-        operatorName: cleanOpName,
-        roleLabel: 'Garçom',
-        storeName: cleanStore,
-        storeCode: code,
-        pitchHz: Number(pitchHz) || 140,
-        spectralCentroid: Number(spectralCentroid) || 1600,
-        voicePin: String(voicePin || '').slice(0, 20),
-        samplesCount: Number(samplesCount) || 1,
-      },
+      operator: opPayload,
+      waiterAccount: opPayload,
     });
   });
 
@@ -389,7 +398,7 @@ async function startServer() {
     const code = cleanStoreCode(req.params.storeCode);
     const body = req.body as Partial<ServerStoreSnapshot> & {
       callerRole?: string;
-      actionType?: 'add' | 'remove' | 'sync';
+      actionType?: 'add' | 'remove' | 'sync' | 'catalog';
     };
 
     // Enforce RBAC on the server: Garçom can NEVER perform a 'remove' action
@@ -486,20 +495,23 @@ async function startServer() {
 
       const customersSummary =
         safeCustomers.length > 0
-          ? `Comandas abertas/ativas atualmente no bar: ${safeCustomers.map((c) => `"${c}"`).join(', ')}. Se o nome falado for parecido com uma comanda ativa, use exatamente o nome da comanda ativa.`
+          ? `Comandas abertas/ativas atualmente no bar: ${safeCustomers.map((c) => `"${c}"`).join(', ')}. ATENÇÃO FONÉTICA: Nomes como "Thiago" e "Tiago" (com ou sem H), "Matheus" e "Mateus", "Felipe" e "Phelipe", "Victor" e "Vitor", "Luiz" e "Luis" são a MESMA pessoa! Se houver uma comanda ativa com grafia fonética equivalente, retorne EXATAMENTE o nome da comanda ativa.`
           : 'Nenhuma comanda ativa ainda.';
 
       const systemInstruction = `Você é o MARCELO, o assistente virtual inteligente de voz de um bar brasileiro (Comanda Voz).
 O garçom ou dono do bar fala comandos direcionados a você, muitas vezes na correria SEM PAUSA para vários clientes seguidos!
-Exemplo sem pausa: "Marcelo, marca um litrão para Thiago, marca um litrão para Jonas, marca 2 espetinhos para o Carlos".
+
+AS 3 AÇÕES PRINCIPAIS QUE VOCÊ DEVE COMPREENDER PERFEITAMENTE:
+1. "MARCAR": Adicionar produtos do cardápio na comanda do cliente.
+   Exemplos: "marca 1 litrão para Thiago", "marque 2 espetinhos pro Tiago", "coloca 1 original na conta do Jonas".
+2. "FECHAR": Fechar a conta OU responder quanto ficou / quanto deu a conta do cliente.
+   Exemplos: "feche a conta do Thiago", "fechar conta do Tiago", "quanto ficou a conta do Thiago?", "quando ficou a conta do Tiago?" (o microfone muitas vezes transcreve "quanto ficou" como "quando ficou" — entenda ambos como FECHAR!), "quanto deu a conta do Tiago?", "qual o valor da conta do Tiago?".
+3. "BAIXA": Dar baixa total ou parcial no pagamento da conta do cliente.
+   Exemplos: "dar baixa na conta do Thiago", "dê baixa na conta do Tiago", "baixa de 20 reais na conta do Tiago e continua consumindo", "Tiago pagou a conta".
 
 REGRA DE OURO DE SEGURANÇA ("SE NÃO ENTENDEU, NÃO FAÇA NADA"):
-1. Se a frase for confusa, incompleta, sem nome de cliente claro, ou se o produto pedido NÃO existir no Cardápio do Bar listado abaixo, você DEVE retornar "understood": false, preencher "unrecognizedReason" explicando o que não ficou claro (ex: "Produto X não está no cardápio" ou "Faltou dizer o nome do cliente") e retornar "commands": []. NUNCA invente produtos fora do cardápio nem marque em cliente genérico se não tiver certeza!
-2. Se o operador falar vários pedidos seguidos sem pausa para clientes diferentes (ex: "marca 1 litrão para Thiago, marca 1 litrão para Jonas"), separe cada cliente como um item distinto dentro do array "commands", para que cada cliente receba seus itens na sua própria comanda separada!
-3. Existem 3 intents possíveis para cada comando em "commands":
-   - "MARCAR": Adicionar produtos do cardápio na comanda do cliente.
-   - "FECHAR": Fechar/conferir a conta do cliente e ler os produtos e valor total.
-   - "BAIXA": Dar baixa total ou parcial no pagamento da conta do cliente.
+- Se for um comando de MARCAR e o produto pedido NÃO existir no Cardápio do Bar listado abaixo, ou não tiver nome de cliente, retorne "understood": false.
+- Nomes com grafia fonética igual (ex: "Thiago" e "Tiago" sem H, "Matheus" e "Mateus") DEVEM ser reconhecidos normalmente e unificados com o nome da comanda ativa se já existir!
 
 Cardápio do Bar (ÚNICOS PRODUTOS VÁLIDOS):
 ${catalogSummary}
