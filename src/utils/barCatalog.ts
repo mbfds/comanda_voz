@@ -289,11 +289,15 @@ export function normalizePhoneticPt(str: string): string {
   return normalizeText(str)
     .replace(/ph/g, 'f')
     .replace(/th/g, 't')
+    .replace(/chr/g, 'cr')
     .replace(/\bh/g, '') // leading silent h (e.g. Henrique -> enrique, Hiago -> iago)
-    .replace(/([^cln])h/g, '$1') // silent h anywhere except ch, lh, nh (e.g. Arthur -> artur)
+    .replace(/([^clns])h/g, '$1') // silent h anywhere except ch, lh, nh, sh (e.g. Arthur -> artur, Nathan -> natan)
     .replace(/y/g, 'i')
     .replace(/w/g, 'v')
     .replace(/k/g, 'c')
+    .replace(/qu([ei])/g, 'c$1') // Henrique/Enrike -> enrice, Caique/Kaique -> caice
+    .replace(/g([ei])/g, 'j$1') // Giovana/Jiovana, Geovana/Jeovana
+    .replace(/c([ei])/g, 's$1') // Marcelo/Marselo, Marcele/Marsele, Cesar/Sesar
     .replace(/ct/g, 't') // Victor -> Vitor
     .replace(/z\b/g, 's') // Luiz -> Luis, Beatriz -> Beatris
     .replace(/ss/g, 's')
@@ -330,8 +334,8 @@ export function getCanonicalCustomerNameGroup(token: string): string | undefined
 }
 
 /**
- * Bounded Levenshtein edit distance for catching 1-letter phonetic STT slips
- * (e.g. "marcelo" vs "marcele", "tiago" vs "hiago").
+ * Bounded Levenshtein edit distance for catching 1-2 letter phonetic STT slips
+ * (e.g. "marcelo" vs "marcele", "tiago" vs "hiago" vs "diago" vs "tigo").
  */
 function phoneticEditDistance(a: string, b: string): number {
   if (a === b) return 0;
@@ -348,97 +352,168 @@ function phoneticEditDistance(a: string, b: string): number {
   return dp[a.length][b.length];
 }
 
-function areSingleNameTokensEquivalent(tokA: string, tokB: string): boolean {
+function getSingleNameTokenSimilarity(tokA: string, tokB: string): number {
   const normA = normalizeText(tokA);
   const normB = normalizeText(tokB);
-  if (!normA || !normB) return false;
-  if (normA === normB) return true;
+  if (!normA || !normB) return 0;
+  if (normA === normB) return 1.0;
 
   const phonA = normalizePhoneticPt(tokA);
   const phonB = normalizePhoneticPt(tokB);
-  if (!phonA || !phonB) return false;
-  if (phonA === phonB) return true;
+  if (!phonA || !phonB) return 0;
+  if (phonA === phonB) return 0.98;
 
   const groupA = getCanonicalCustomerNameGroup(tokA);
   const groupB = getCanonicalCustomerNameGroup(tokB);
-  if (groupA && groupB && groupA === groupB) return true;
+  if (groupA && groupB && groupA === groupB) return 0.96;
 
-  // Allow 1-character phonetic edit distance for names with >= 5 chars (e.g., marcelo <-> marcele)
-  if (phonA.length >= 5 && phonB.length >= 5 && phoneticEditDistance(phonA, phonB) <= 1) {
-    return true;
+  // Aggressive prefix/shortening equivalence for spoken names (>= 4 chars, e.g. "tiag" <-> "thiago")
+  const shorter = phonA.length <= phonB.length ? phonA : phonB;
+  const longer = phonA.length <= phonB.length ? phonB : phonA;
+  if (shorter.length >= 4 && longer.startsWith(shorter)) {
+    return 0.85 + 0.1 * (shorter.length / longer.length);
   }
 
-  return false;
+  // Bounded Levenshtein distance for phonetic STT recognition slips
+  const minLen = Math.min(phonA.length, phonB.length);
+  const maxLen = Math.max(phonA.length, phonB.length);
+  const dist = phoneticEditDistance(phonA, phonB);
+  if (minLen >= 3 && maxLen >= 4 && dist <= 1) {
+    return 0.90;
+  }
+  if (minLen >= 5 && maxLen >= 6 && dist <= 2) {
+    return 0.82;
+  }
+
+  // Aggressive character bigram/trigram Dice similarity for noisy speech-to-text transcripts
+  if (phonA.length >= 4 && phonB.length >= 4) {
+    const bi = computeCharNGramDice(phonA, phonB, 2);
+    const tri = computeCharNGramDice(phonA, phonB, 3);
+    const combinedDice = bi * 0.6 + tri * 0.4;
+    if (combinedDice >= 0.70) {
+      return combinedDice * 0.92;
+    }
+  }
+
+  return 0;
 }
 
 /**
- * Checks if two customer names refer to the same person (including Thiago/Tiago,
- * Marcelo/Marcelle/Marcele, and synonym/phonetic matches).
+ * Computes aggressive customer name similarity [0..1] combining exact, phonetic,
+ * Portuguese synonym groups, bounded Levenshtein, and character n-gram Dice matching.
  */
-export function areCustomerNamesEquivalent(nameA: string, nameB: string): boolean {
+export function computeCustomerNameSimilarity(nameA: string, nameB: string): number {
   const normA = normalizeText(nameA);
   const normB = normalizeText(nameB);
-  if (!normA || !normB) return false;
-  if (normA === normB) return true;
+  if (!normA || !normB) return 0;
+  if (normA === normB) return 1.0;
 
   const phonA = normalizePhoneticPt(nameA);
   const phonB = normalizePhoneticPt(nameB);
-  if (!phonA || !phonB) return false;
-  if (phonA === phonB) return true;
+  if (!phonA || !phonB) return 0;
+  if (phonA === phonB) return 0.98;
 
   const tokensA = normA.split(/\s+/).filter(Boolean);
   const tokensB = normB.split(/\s+/).filter(Boolean);
 
+  if (tokensA.length === 1 && tokensB.length === 1) {
+    return getSingleNameTokenSimilarity(tokensA[0], tokensB[0]);
+  }
+
   if (tokensA.length === tokensB.length) {
-    if (tokensA.every((t, idx) => areSingleNameTokensEquivalent(t, tokensB[idx]))) {
-      return true;
+    const sims = tokensA.map((t, idx) => getSingleNameTokenSimilarity(t, tokensB[idx]));
+    if (sims.every((s) => s >= 0.78)) {
+      return sims.reduce((acc, s) => acc + s, 0) / sims.length;
     }
   }
 
-  // First-name equivalence when one is a single first name (e.g. "Tiago" vs "Thiago Silva" or "Marcelle" vs "Marcelo")
+  // First-name equivalence when one is a single first name (e.g. "Tiago" vs "Thiago Silva")
   if (
     tokensA[0] &&
     tokensB[0] &&
     tokensA[0].length >= 2 &&
     tokensB[0].length >= 2 &&
-    areSingleNameTokensEquivalent(tokensA[0], tokensB[0])
+    (tokensA.length === 1 || tokensB.length === 1)
   ) {
-    if (tokensA.length === 1 || tokensB.length === 1) return true;
+    const firstSim = getSingleNameTokenSimilarity(tokensA[0], tokensB[0]);
+    if (firstSim >= 0.78) {
+      return firstSim * 0.95;
+    }
   }
 
-  return false;
+  // Fallback token-coverage + full-phrase n-gram similarity for partial multi-word names
+  const smaller = tokensA.length <= tokensB.length ? tokensA : tokensB;
+  const larger = tokensA.length <= tokensB.length ? tokensB : tokensA;
+  let matchedSimSum = 0;
+  let matchedTokens = 0;
+  for (const sTok of smaller) {
+    let bestTok = 0;
+    for (const lTok of larger) {
+      const sim = getSingleNameTokenSimilarity(sTok, lTok);
+      if (sim > bestTok) bestTok = sim;
+    }
+    if (bestTok >= 0.80) {
+      matchedTokens++;
+      matchedSimSum += bestTok;
+    }
+  }
+  if (matchedTokens === smaller.length && smaller.length > 0) {
+    return (matchedSimSum / smaller.length) * 0.92;
+  }
+
+  const fullDice = computeCharNGramDice(phonA, phonB, 2) * 0.6 + computeCharNGramDice(phonA, phonB, 3) * 0.4;
+  return fullDice >= 0.72 ? fullDice * 0.90 : 0;
 }
 
 /**
- * Finds an existing customer name from active tabs using synonym and phonetic matching
- * (e.g. "Tiago" matches "Thiago", "Marcelle" matches "Marcelo").
+ * Checks if two customer names refer to the same person (including Thiago/Tiago,
+ * Marcelo/Marcelle/Marcele, synonym groups, and aggressive fuzzy/phonetic matches).
+ */
+export function areCustomerNamesEquivalent(nameA: string, nameB: string): boolean {
+  return computeCustomerNameSimilarity(nameA, nameB) >= 0.78;
+}
+
+function cleanCustomerCandidateText(raw: string): string {
+  let cleaned = (raw ?? '').trim().replace(/[.!,?;:]+$/g, '').trim();
+  for (let i = 0; i < 5; i++) {
+    const next = cleaned
+      .replace(
+        /^(?:o|a|os|as|do|da|dos|das|de|no|na|nos|nas|pro|pra|para|conta|comanda|cliente|senhor|sr|seu|dona)\b\s*/i,
+        ''
+      )
+      .trim();
+    if (next === cleaned) break;
+    cleaned = next;
+  }
+  return cleaned;
+}
+
+/**
+ * Finds an existing customer name from active tabs using aggressive phonetic,
+ * synonym, and fuzzy n-gram matching (e.g. "Tiago" / "Tiagu" / "Diago" matches "Thiago").
  */
 export function resolveCustomerNameFromExisting(
   spokenCandidate: string,
   existingCustomerNames: string[]
 ): string {
-  const cleaned = spokenCandidate
-    .trim()
-    .replace(/^[oOaA]\s+/i, '')
-    .replace(/[.!,?;:]+$/g, '')
-    .trim();
+  const cleaned = cleanCustomerCandidateText(spokenCandidate);
   if (!cleaned) return '';
 
-  // 1. First pass: exact or strict phonetic match against existing tabs
-  const exactOrPhoneticMatch = existingCustomerNames.find(
-    (existing) =>
-      normalizeText(existing) === normalizeText(cleaned) ||
-      normalizePhoneticPt(existing) === normalizePhoneticPt(cleaned)
-  );
-  if (exactOrPhoneticMatch) return exactOrPhoneticMatch;
+  // Score all existing customer names and select the strongest confident match
+  let bestExisting = '';
+  let bestScore = 0;
 
-  // 2. Second pass: synonym group or fuzzy phonetic equivalence against existing tabs
-  const matchedExisting = existingCustomerNames.find((existing) =>
-    areCustomerNamesEquivalent(existing, cleaned)
-  );
-  if (matchedExisting) return matchedExisting;
+  for (const existing of existingCustomerNames) {
+    const score = computeCustomerNameSimilarity(existing, cleaned);
+    if (score >= 0.78 && score > bestScore) {
+      bestScore = score;
+      bestExisting = existing;
+    }
+  }
 
-  // 3. Title-case the new customer name
+  if (bestExisting) return bestExisting;
+
+  // Title-case the new customer name
   return cleaned
     .split(/\s+/)
     .map((w) => w.charAt(0).toUpperCase() + w.slice(1).toLowerCase())
@@ -500,12 +575,19 @@ function extractCustomerForAccountAction(
 ): string {
   const clauseNoPolite = stripPolitePrefixes(cleanedClause);
 
-  // 1. Strip trailing payment/continuation phrases and leading action verbs + prepositions + "conta/comanda"
-  let stripped = clauseNoPolite
-    .replace(
-      /(?:\s+e\s+continua.*|\s+no\s+pix.*|\s+via\s+pix.*|\s+no\s+cart[aã]o.*|\s+em\s+dinheiro.*|\s+no\s+valor.*|\s+por\s+favor.*|\s+agora.*|\s+ai|\s+aí|\s+pf)$/i,
-      ''
-    )
+  // 1. Repeatedly strip trailing payment/continuation phrases so chained modifiers don't linger
+  let stripped = clauseNoPolite.replace(/[.!,?;:]+$/g, '').trim();
+  for (let i = 0; i < 4; i++) {
+    const next = stripped
+      .replace(
+        /(?:\s+e\s+continua.*|\s+no\s+pix.*|\s+via\s+pix.*|\s+no\s+cart[aã]o.*|\s+em\s+dinheiro.*|\s+no\s+valor.*|\s+por\s+favor.*|\s+por\s+gentileza.*|\s+agora.*|\s+hoje|\s+ai|\s+aí|\s+pf)$/i,
+        ''
+      )
+      .trim();
+    if (next === stripped) break;
+    stripped = next;
+  }
+  stripped = stripped
     .replace(/\bde\s+\d+(?:[.,]\d+)?\s*(?:reais|real|conto|pila)?\b/gi, ' ')
     .replace(/[.!,?;:]+$/g, '')
     .trim();
@@ -522,7 +604,7 @@ function extractCustomerForAccountAction(
   for (let i = 0; i < 8; i++) {
     const next = stripped
       .replace(
-        /^(?:n[oa]s?|d[oa]s?|de|para\s+o|para\s+a|para|pro|pra|em|o|a|as|os|uma|um|conta|comanda|pagamento|valor|total|cliente|senhor|sr|seu|\d+(?:[.,]\d+)?)\b\s*/i,
+        /^(?:n[oa]s?|d[oa]s?|de|para\s+o|para\s+a|para|pro|pra|em|o|a|as|os|uma|um|conta|comanda|pagamento|valor|total|cliente|senhor|sr|seu|dona|\d+(?:[.,]\d+)?)\b\s*/i,
         ''
       )
       .trim();
@@ -545,28 +627,31 @@ function extractCustomerForAccountAction(
     return resolveCustomerNameFromExisting(stripped, existingCustomerNames);
   }
 
-  // 2. Fallback: scan individual words/phrases in the clause against existingCustomerNames via synonym & phonetic equivalence
+  // 2. Fallback: sliding-window scan across words in the clause against existingCustomerNames via fuzzy & phonetic scoring
   const clauseWords = clauseNoPolite
     .replace(/[.!,?;:]+/g, ' ')
     .split(/\s+/)
     .filter(Boolean);
 
+  let bestExisting = '';
+  let bestScore = 0;
+
   for (const existing of existingCustomerNames) {
     const existingTokens = normalizeText(existing).split(' ').filter(Boolean);
-    for (let i = 0; i < clauseWords.length; i++) {
-      if (areCustomerNamesEquivalent(existing, clauseWords[i])) {
-        return existing;
-      }
-      if (existingTokens.length > 1 && i + existingTokens.length <= clauseWords.length) {
-        const sliceStr = clauseWords.slice(i, i + existingTokens.length).join(' ');
-        if (areCustomerNamesEquivalent(existing, sliceStr)) {
-          return existing;
+    const maxWin = Math.min(3, Math.max(1, existingTokens.length));
+    for (let win = 1; win <= maxWin; win++) {
+      for (let i = 0; i <= clauseWords.length - win; i++) {
+        const sliceStr = clauseWords.slice(i, i + win).join(' ');
+        const sim = computeCustomerNameSimilarity(existing, sliceStr);
+        if (sim >= 0.78 && sim > bestScore) {
+          bestScore = sim;
+          bestExisting = existing;
         }
       }
     }
   }
 
-  return '';
+  return bestExisting;
 }
 
 // --- Product Matching Engine (Qualifier-Aware + Token Scoring + Ambiguity Guard) ---
@@ -1010,9 +1095,12 @@ function parseSingleClauseStrictly(
 
   // Handle FECHAR / QUANTO FICOU A CONTA
   if (intent === 'FECHAR') {
-    const customerName =
+    const rawCustomerName =
       extractCustomerForAccountAction(cleaned, existingCustomerNames) ||
       (fallbackSelectedCustomerName?.trim() || '');
+    const customerName = rawCustomerName
+      ? resolveCustomerNameFromExisting(rawCustomerName, existingCustomerNames)
+      : '';
 
     if (!customerName) {
       return {
@@ -1051,9 +1139,12 @@ function parseSingleClauseStrictly(
     else if (/\bcredito\b/i.test(norm)) paymentMethod = 'Cartão de Crédito';
     else if (/\bdebito|cartao\b/i.test(norm)) paymentMethod = 'Cartão de Débito';
 
-    const customerName =
+    const rawCustomerName =
       extractCustomerForAccountAction(cleaned, existingCustomerNames) ||
       (fallbackSelectedCustomerName?.trim() || '');
+    const customerName = rawCustomerName
+      ? resolveCustomerNameFromExisting(rawCustomerName, existingCustomerNames)
+      : '';
 
     if (!customerName) {
       return {
@@ -1081,7 +1172,7 @@ function parseSingleClauseStrictly(
   let orderPart = cleaned;
 
   const targetRegex =
-    /\b(?:na\s+comanda\s+d[oa]\s+|na\s+conta\s+d[oa]\s+|na\s+para\s+o?\s*|para\s+o\s+|para\s+a\s+|para\s+|pro\s+|pra\s+|no\s+|na\s+)([a-zA-ZÀ-ÿ0-9\s]{2,40})$/i;
+    /\b(?:na\s+comanda\s+d[oa]\s+|na\s+conta\s+d[oa]\s+|comanda\s+d[oa]\s+|conta\s+d[oa]\s+|na\s+para\s+o?\s*|para\s+o\s+|para\s+a\s+|para\s+|pro\s+|pra\s+|no\s+|na\s+)([a-zA-ZÀ-ÿ0-9\s]{2,40})$/i;
   const matchTarget = cleaned.match(targetRegex);
 
   if (matchTarget && matchTarget[1]) {
@@ -1178,6 +1269,72 @@ function parseSingleClauseStrictly(
 }
 
 /**
+ * Detects the "MARCELO" wake word in an open-microphone transcript (e.g. Bluetooth headset).
+ * If the waiter is chatting with customers ("já trago pra senhora... Marcelo, marca 1 litrão pro Tiago"),
+ * discards all background speech before "Marcelo" and extracts only the command directed at the assistant.
+ * Also safely distinguishes "Marcelo" as wake-word vs "Marcelo" as a customer name ("dar baixa no Marcelo").
+ */
+export function extractCommandAfterMarceloWakeWord(transcript: string): {
+  hasWakeWord: boolean;
+  isOnlyWakeWord: boolean;
+  commandTranscript: string;
+} {
+  const cleaned = (transcript ?? '').trim();
+  const norm = normalizeText(cleaned);
+  if (!norm) {
+    return { hasWakeWord: false, isOnlyWakeWord: false, commandTranscript: '' };
+  }
+
+  // 1. User spoke ONLY the wake word (e.g. "Marcelo", "Oi Marcelo", "Ei Marcelo", "Fala Marcelo")
+  if (
+    /^(?:(?:oi|ola|ei|opa|fala|escuta|ai|ou)\s+)*(?:marcelo|marcello|marcelinho)[\s,.:;!?-]*$/i.test(
+      norm
+    )
+  ) {
+    return { hasWakeWord: true, isOnlyWakeWord: true, commandTranscript: '' };
+  }
+
+  // 2. Wake word at the beginning of the sentence (not followed by "pagou/quitou/pediu" where Marcelo is the customer)
+  const startMatch = cleaned.match(
+    /^(?:(?:oi|ola|olá|ei|opa|fala|escuta|ai|aí)\s+)*(?:marcelo|marcello|marcelinho)[\s,.:;!?-]+(?!pagou\b|quitou\b|pediu\b)(.+)$/i
+  );
+  if (startMatch && startMatch[1]) {
+    return {
+      hasWakeWord: true,
+      isOnlyWakeWord: false,
+      commandTranscript: startMatch[1].trim(),
+    };
+  }
+
+  // 3. Wake word spoken in the middle of open-microphone conversation right before an order/action verb
+  // e.g. "beleza amigo já trago viu marcelo marca 1 litrão para o tiago"
+  const midWakeRegex =
+    /\b(?:(?:oi|ola|olá|ei|opa|fala|escuta)\s+)?(?:marcelo|marcello|marcelinho)[\s,.:;!?-]+(?=(?:por\s+favor|pf|quero|preciso|pode|poderia|vamos|me\s+ve|me\s+vê|me\s+fala|me\s+diz|me\s+passa|marque|marca|marcar|coloca|coloque|adiciona|bota|poe|põe|lanca|lança|anota|mais|um|uma|dois|duas|tres|três|quatro|cinco|seis|1|2|3|4|5|6|feche|fecha|fechar|quanto|quando|qual|ver\s+a\s+conta|resumo|dar|da|dá|de|dê|fazer|faz|baixa|baixar|abaixa|abaixar|quitar|quite|zerar|pagar|receber)\b)/i;
+  const midMatch = midWakeRegex.exec(cleaned);
+  if (midMatch && typeof midMatch.index === 'number') {
+    const afterWake = cleaned.slice(midMatch.index + midMatch[0].length).trim();
+    if (afterWake) {
+      return {
+        hasWakeWord: true,
+        isOnlyWakeWord: false,
+        commandTranscript: afterWake,
+      };
+    }
+  }
+
+  // 4. Wake word spoken at the very end of a sentence to trigger listening (e.g. "blz obrigado viu, ei marcelo")
+  if (/(?:,\s*|\s+)(?:(?:oi|ola|olá|ei|opa|fala|escuta)\s+)(?:marcelo|marcello|marcelinho)[\s,.:;!?-]*$/i.test(norm)) {
+    return { hasWakeWord: true, isOnlyWakeWord: true, commandTranscript: '' };
+  }
+
+  return {
+    hasWakeWord: false,
+    isOnlyWakeWord: false,
+    commandTranscript: cleaned,
+  };
+}
+
+/**
  * Supports chained continuous voice commands without pauses:
  * e.g. "Marcelo, marca um litrão para Thiago, marca um litrão para Jonas"
  * AND understands MARCAR, FECHAR ("quanto/quando ficou a conta do Tiago"), and DAR BAIXA
@@ -1192,7 +1349,8 @@ export function parseVoiceOrderLocally(
   const rawCleaned = transcript.trim();
   const normFull = normalizeText(rawCleaned);
 
-  const addressedToMarcelo = /\bmarcelo\b/i.test(normFull);
+  const wakeExtraction = extractCommandAfterMarceloWakeWord(rawCleaned);
+  const addressedToMarcelo = wakeExtraction.hasWakeWord || /\bmarcelo\b/i.test(normFull);
 
   let spokenPin = '';
   const pinMatch = normFull.match(/\b(?:codigo|senha|pin)\s+([a-z0-9]+)\b/i);
@@ -1200,8 +1358,12 @@ export function parseVoiceOrderLocally(
     spokenPin = pinMatch[1];
   }
 
+  const effectiveRaw = wakeExtraction.hasWakeWord
+    ? wakeExtraction.commandTranscript
+    : rawCleaned;
+
   const withoutWake = stripPolitePrefixes(
-    rawCleaned
+    effectiveRaw
       .replace(
         /^(?:oi\s+|ola\s+|olá\s+|ei\s+|fala\s+)?(?:marcelo[\s,.:;-]+)(?!pagou\b|quitou\b|pediu\b)/i,
         ''
@@ -1214,7 +1376,7 @@ export function parseVoiceOrderLocally(
     return {
       understood: false,
       unrecognizedReason:
-        'Diga o comando completo, por exemplo: "Marca 1 litrão para Tiago" ou "Dar baixa na conta do Tiago".',
+        'Diga o comando completo, por exemplo: "Marcelo, marca 1 litrão para Tiago" ou "Marcelo, dar baixa na conta do Tiago".',
       addressedToMarcelo,
       spokenPin,
       commands: [],
@@ -1225,7 +1387,7 @@ export function parseVoiceOrderLocally(
   // Never split "dar" + "uma" + "baixa", "dar" + "baixa", "dá" + "baixa", "dê" + "baixa", or polite auxiliary words.
   const rawParts = withoutWake
     .split(
-      /(?:,\s*|\s+e\s+|\s+)(?=(?:marque|marca|marcar|coloca|coloque|adiciona|bota|lanca|lança|anota|feche|fecha|fechar|quanto\s+ficou|quando\s+ficou|quanto\s+deu|quando\s+deu|quanto\s+ta|dar\s+(?:a\s+|uma\s+)?baixa|dar\s+(?:a\s+)?baixar|d[aáeê]\s+(?:a\s+|uma\s+)?baixa|fazer\s+(?:a\s+|uma\s+)?baixa|faz\s+(?:a\s+|uma\s+)?baixa|baixar|quitar|zerar)\b)|(?:,\s*|\s+e\s+)(?=(?:baixa\s+n[oa]\b|baixa\s+d[oa]\b))/i
+      /(?:,\s*|\s+e\s+|\s+)(?=(?:marque|marca|marcar|coloca|coloque|adiciona|bota|lanca|lança|anota|feche|fecha|fechar|quanto\s+ficou|quando\s+ficou|quanto\s+deu|quando\s+deu|quanto\s+ta|dar\s+(?:a\s+|uma\s+)?baixa|dar\s+(?:a\s+)?baixar|d[aáeê]\s+(?:a\s+|uma\s+)?baixa|fazer\s+(?:a\s+|uma\s+)?baixa|faz\s+(?:a\s+|uma\s+)?baixa|baixar|quitar|zerar)\b)|(?:,\s*|\s+e\s+)(?=(?:baixa\s+(?:n[oa]|d[oa]|a\s+conta)\b))/i
     )
     .map((c) => c.trim())
     .filter(Boolean);

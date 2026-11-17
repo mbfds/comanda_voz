@@ -29,6 +29,7 @@ interface CatalogItemInput {
 }
 
 export type ServerAccountRole = 'SUPERADMIN' | 'ADM' | 'Garçom';
+export type SubscriptionStatusType = 'em_dia' | 'pendente' | 'atrasado' | 'bloqueado';
 
 interface StoredAccount {
   uid: string;
@@ -38,6 +39,10 @@ interface StoredAccount {
   userRole: ServerAccountRole;
   storeName: string;
   storeCode: string;
+  monthlyFee?: number;
+  subscriptionStatus?: SubscriptionStatusType;
+  billingDueDate?: string;
+  lastPaymentAtMs?: number;
   createdAtMs: number;
 }
 
@@ -235,6 +240,10 @@ async function startServer() {
       userRole: 'ADM',
       storeName: cleanStore,
       storeCode: code,
+      monthlyFee: 99.9,
+      subscriptionStatus: 'em_dia',
+      billingDueDate: 'Todo dia 10',
+      lastPaymentAtMs: Date.now(),
       createdAtMs: Date.now(),
     };
 
@@ -294,6 +303,22 @@ async function startServer() {
           'Usuário/E-mail ou senha incorretos. Esqueceu a senha? Clique em "Recuperar Senha" abaixo.',
       });
       return;
+    }
+
+    if (acc.userRole !== 'SUPERADMIN') {
+      const storeAdminBlocked = Array.from(accountMemoryMap.values()).some(
+        (other) =>
+          other.storeCode === acc.storeCode &&
+          other.userRole === 'ADM' &&
+          other.subscriptionStatus === 'bloqueado'
+      );
+      if (acc.subscriptionStatus === 'bloqueado' || storeAdminBlocked) {
+        res.status(403).json({
+          error:
+            'Acesso temporariamente suspenso por pendência na mensalidade do sistema. Contate o suporte (SUPERADMIN) para regularizar.',
+        });
+        return;
+      }
     }
 
     const sessionPayload = {
@@ -497,16 +522,92 @@ async function startServer() {
     });
   });
 
-  // 5. SUPERADMIN Control Panel Endpoints
+  // 4b. Calibrate / Update Waiter Voice Biometrics
+  app.post('/api/auth/update-waiter-voice', (req, res) => {
+    const {
+      storeCode,
+      operatorId,
+      email,
+      pitchHz,
+      spectralCentroid,
+      samplesCount,
+      voicePin,
+    } = req.body as {
+      storeCode?: string;
+      operatorId?: string;
+      email?: string;
+      pitchHz?: number;
+      spectralCentroid?: number;
+      samplesCount?: number;
+      voicePin?: string;
+    };
+
+    const code = cleanStoreCode(storeCode || 'BAR-01');
+    const storeSnap = storeMemoryMap.get(code);
+    const normEmail = email ? normalizeEmailOrUsername(email) : '';
+
+    const cleanPitch = Math.min(Math.max(Number(pitchHz) || 140, 50), 500);
+    const cleanCentroid = Math.min(Math.max(Number(spectralCentroid) || 1600, 200), 8000);
+    const cleanSamples = Math.min(Math.max(Number(samplesCount) || 1, 1), 50);
+
+    if (storeSnap && Array.isArray(storeSnap.voiceOperators)) {
+      storeSnap.voiceOperators = storeSnap.voiceOperators.map((rawOp) => {
+        if (rawOp && typeof rawOp === 'object') {
+          const op = rawOp as {
+            id?: string;
+            email?: string;
+            pitchHz?: number;
+            spectralCentroid?: number;
+            samplesCount?: number;
+            voicePin?: string;
+          };
+          const matchesId = operatorId && op.id === operatorId;
+          const matchesMail = normEmail && op.email && normalizeEmailOrUsername(op.email) === normEmail;
+          if (matchesId || matchesMail) {
+            return {
+              ...op,
+              pitchHz: cleanPitch,
+              spectralCentroid: cleanCentroid,
+              samplesCount: cleanSamples,
+              voicePin: typeof voicePin === 'string' ? voicePin.slice(0, 20) : op.voicePin || '',
+            };
+          }
+        }
+        return rawOp;
+      });
+      storeSnap.updatedAtMs = Date.now();
+      storeMemoryMap.set(code, storeSnap);
+      saveDatabaseToDisk();
+    }
+
+    res.json({
+      ok: true,
+      pitchHz: cleanPitch,
+      spectralCentroid: cleanCentroid,
+      samplesCount: cleanSamples,
+    });
+  });
+
+  // 5. SUPERADMIN Control Panel Endpoints (Users ADM vs Garçom & SaaS Monthly Billing)
   app.get('/api/superadmin/overview', (_req, res) => {
     ensureDefaultSuperAdmin();
-    const accountsList = Array.from(accountMemoryMap.values()).map((acc) => ({
+    const allAccounts = Array.from(accountMemoryMap.values());
+    const accountsList = allAccounts.map((acc) => ({
       uid: acc.uid,
       email: acc.email,
       userName: acc.userName,
       userRole: acc.userRole,
       storeName: acc.storeName,
       storeCode: acc.storeCode,
+      monthlyFee:
+        typeof acc.monthlyFee === 'number'
+          ? acc.monthlyFee
+          : acc.userRole === 'ADM'
+            ? 99.9
+            : 0,
+      subscriptionStatus: acc.subscriptionStatus || 'em_dia',
+      billingDueDate: acc.billingDueDate || (acc.userRole === 'ADM' ? 'Todo dia 10' : 'Isento (Funcionário)'),
+      lastPaymentAtMs: acc.lastPaymentAtMs || acc.createdAtMs,
       createdAtMs: acc.createdAtMs,
     }));
 
@@ -519,13 +620,23 @@ async function startServer() {
         (acc, t) => acc + (Number(t.totalAmount) || 0),
         0
       );
+      const storeAdms = allAccounts.filter(
+        (a) => a.storeCode === st.storeCode && a.userRole === 'ADM'
+      );
+      const storeWaiters = allAccounts.filter(
+        (a) => a.storeCode === st.storeCode && a.userRole === 'Garçom'
+      );
       return {
         storeCode: st.storeCode,
         storeName: st.storeName,
         tabsCount: activeTabs.length,
         totalConsumed: Number(totalConsumed.toFixed(2)),
         menuCount: Array.isArray(st.menuItems) ? st.menuItems.length : 0,
-        operatorsCount: Array.isArray(st.voiceOperators) ? st.voiceOperators.length : 0,
+        operatorsCount: Math.max(
+          Array.isArray(st.voiceOperators) ? st.voiceOperators.length : 0,
+          storeWaiters.length
+        ),
+        admCount: storeAdms.length,
         updatedAtMs: st.updatedAtMs,
       };
     });
@@ -535,6 +646,76 @@ async function startServer() {
       masterRecoveryKey,
       accounts: accountsList,
       stores: storesList,
+    });
+  });
+
+  app.post('/api/superadmin/update-billing', (req, res) => {
+    const {
+      callerRole,
+      email,
+      monthlyFee,
+      subscriptionStatus,
+      billingDueDate,
+      markPaidNow,
+    } = req.body as {
+      callerRole?: string;
+      email?: string;
+      monthlyFee?: number;
+      subscriptionStatus?: SubscriptionStatusType;
+      billingDueDate?: string;
+      markPaidNow?: boolean;
+    };
+
+    if (callerRole !== 'SUPERADMIN') {
+      res.status(403).json({
+        error: 'Somente o SUPERADMIN pode gerenciar cobranças e mensalidades.',
+      });
+      return;
+    }
+
+    const normEmail = normalizeEmailOrUsername(email || '');
+    const target = accountMemoryMap.get(normEmail);
+    if (!target) {
+      res.status(404).json({ error: 'Usuário não encontrado.' });
+      return;
+    }
+
+    if (typeof monthlyFee === 'number' && Number.isFinite(monthlyFee) && monthlyFee >= 0) {
+      target.monthlyFee = Number(monthlyFee.toFixed(2));
+    }
+    if (
+      subscriptionStatus === 'em_dia' ||
+      subscriptionStatus === 'pendente' ||
+      subscriptionStatus === 'atrasado' ||
+      subscriptionStatus === 'bloqueado'
+    ) {
+      target.subscriptionStatus = subscriptionStatus;
+    }
+    if (typeof billingDueDate === 'string' && billingDueDate.trim()) {
+      target.billingDueDate = billingDueDate.trim().slice(0, 40);
+    }
+    if (markPaidNow) {
+      target.subscriptionStatus = 'em_dia';
+      target.lastPaymentAtMs = Date.now();
+    }
+
+    accountMemoryMap.set(normEmail, target);
+    saveDatabaseToDisk();
+
+    res.json({
+      ok: true,
+      account: {
+        uid: target.uid,
+        email: target.email,
+        userName: target.userName,
+        userRole: target.userRole,
+        storeName: target.storeName,
+        storeCode: target.storeCode,
+        monthlyFee: target.monthlyFee,
+        subscriptionStatus: target.subscriptionStatus,
+        billingDueDate: target.billingDueDate,
+        lastPaymentAtMs: target.lastPaymentAtMs,
+      },
     });
   });
 
@@ -605,6 +786,12 @@ async function startServer() {
       userRole: validRole,
       storeName: cleanStore,
       storeCode: code,
+      monthlyFee:
+        existing?.monthlyFee ?? (validRole === 'ADM' ? 99.9 : 0),
+      subscriptionStatus: existing?.subscriptionStatus ?? 'em_dia',
+      billingDueDate:
+        existing?.billingDueDate ?? (validRole === 'ADM' ? 'Todo dia 10' : 'Isento (Funcionário)'),
+      lastPaymentAtMs: existing?.lastPaymentAtMs ?? Date.now(),
       createdAtMs: existing?.createdAtMs || Date.now(),
     };
 
@@ -634,6 +821,10 @@ async function startServer() {
         userRole: updatedAcc.userRole,
         storeName: updatedAcc.storeName,
         storeCode: updatedAcc.storeCode,
+        monthlyFee: updatedAcc.monthlyFee,
+        subscriptionStatus: updatedAcc.subscriptionStatus,
+        billingDueDate: updatedAcc.billingDueDate,
+        lastPaymentAtMs: updatedAcc.lastPaymentAtMs,
       },
     });
   });

@@ -46,6 +46,10 @@ import {
   Edit3,
   Eye,
   EyeOff,
+  Bluetooth,
+  Radio,
+  AudioLines,
+  Users,
 } from 'lucide-react';
 import {
   auth,
@@ -69,7 +73,9 @@ import {
 import {
   areCustomerNamesEquivalent,
   CATEGORY_LABELS,
+  computeCustomerNameSimilarity,
   DEFAULT_BAR_MENU,
+  extractCommandAfterMarceloWakeWord,
   formatBRL,
   normalizePhoneticPt,
   normalizeText,
@@ -80,7 +86,16 @@ import {
   STAGE_LABELS,
   VALIDATION_LIMITS,
 } from './utils/barCatalog';
-import { speakAsMarcelo } from './utils/voiceBiometrics';
+import {
+  AcousticSample,
+  AudioInputDeviceOption,
+  captureVoiceBiometricSample,
+  LiveAcousticTracker,
+  listAudioInputDevices,
+  matchSpeakerAgainstOperators,
+  speakAsMarcelo,
+  startLiveAcousticTracker,
+} from './utils/voiceBiometrics';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { SalesDashboard } from './components/SalesDashboard';
 
@@ -133,6 +148,8 @@ interface LocalAccountBackup {
   storeCode: string;
 }
 
+type SubscriptionStatusType = 'em_dia' | 'pendente' | 'atrasado' | 'bloqueado';
+
 interface SuperAdminAccountSummary {
   uid: string;
   email: string;
@@ -140,6 +157,10 @@ interface SuperAdminAccountSummary {
   userRole: 'SUPERADMIN' | 'ADM' | 'Garçom';
   storeName: string;
   storeCode: string;
+  monthlyFee?: number;
+  subscriptionStatus?: SubscriptionStatusType;
+  billingDueDate?: string;
+  lastPaymentAtMs?: number;
   createdAtMs: number;
 }
 
@@ -150,6 +171,7 @@ interface SuperAdminStoreSummary {
   totalConsumed: number;
   menuCount: number;
   operatorsCount: number;
+  admCount?: number;
   updatedAtMs: number;
 }
 
@@ -365,11 +387,35 @@ function ComandaVozWorkspace() {
     [isSuperAdmin, currentUserRole]
   );
 
-  // Marcelo Assistant State
+  // Marcelo Assistant & Open-Microphone ("MARCELO" Wake-Word + Bluetooth + Biometrics) State
   const [commandInput, setCommandInput] = useState('');
   const [interimTranscript, setInterimTranscript] = useState('');
   const [isListening, setIsListening] = useState(false);
   const [marceloVoiceReplyEnabled, setMarceloVoiceReplyEnabled] = useState(true);
+  const [openMicWakeWordMode, setOpenMicWakeWordMode] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem('comanda_voz_wake_word_mode');
+      return saved ? saved === 'true' : true;
+    } catch {
+      return true;
+    }
+  });
+  const [marceloAwakeWindowActive, setMarceloAwakeWindowActive] = useState(false);
+  const [lastIgnoredOpenMicPhrase, setLastIgnoredOpenMicPhrase] = useState('');
+  const [audioDevices, setAudioDevices] = useState<AudioInputDeviceOption[]>([]);
+  const [selectedMicDeviceId, setSelectedMicDeviceId] = useState<string>(() => {
+    try {
+      return localStorage.getItem('comanda_voz_selected_mic_id') || 'default';
+    } catch {
+      return 'default';
+    }
+  });
+  const [showVoiceConfigBar, setShowVoiceConfigBar] = useState(false);
+  const [lastVoiceCompatibility, setLastVoiceCompatibility] = useState<{
+    operatorName: string;
+    confidence: number;
+    pitchHz: number;
+  } | null>(null);
 
   const [isProcessingCommand, setIsProcessingCommand] = useState(false);
   const [feedbackBanner, setFeedbackBanner] = useState<{
@@ -396,10 +442,14 @@ function ComandaVozWorkspace() {
   const [selectedPaymentMethod, setSelectedPaymentMethod] = useState('PIX');
   const [baixaKeepConsuming, setBaixaKeepConsuming] = useState(false);
 
-  // ADM Waiter Registration State
+  // ADM Waiter Registration & Voice Calibration State
   const [newOpName, setNewOpName] = useState('');
   const [newOpEmail, setNewOpEmail] = useState('');
   const [newOpPassword, setNewOpPassword] = useState('');
+  const [newOpVoiceSample, setNewOpVoiceSample] = useState<AcousticSample | null>(null);
+  const [capturingNewOpVoice, setCapturingNewOpVoice] = useState(false);
+  const [calibratingOpId, setCalibratingOpId] = useState<string | null>(null);
+  const [testingCompatibility, setTestingCompatibility] = useState(false);
   const [registeringWaiter, setRegisteringWaiter] = useState(false);
 
   // Cardápio (Menu Item) Create & Edit Form State
@@ -410,7 +460,7 @@ function ComandaVozWorkspace() {
   const [newMenuSynonyms, setNewMenuSynonyms] = useState('');
   const [savingMenu, setSavingMenu] = useState(false);
 
-  // SUPERADMIN State (All Accounts, All Stores, Master Recovery Key)
+  // SUPERADMIN State (All Accounts, All Stores, Master Recovery Key, SaaS Billing)
   const [superAccounts, setSuperAccounts] = useState<SuperAdminAccountSummary[]>([]);
   const [superStores, setSuperStores] = useState<SuperAdminStoreSummary[]>([]);
   const [masterRecoveryKeyState, setMasterRecoveryKeyState] = useState('SUPER2026');
@@ -423,8 +473,52 @@ function ComandaVozWorkspace() {
   const [saSaving, setSaSaving] = useState(false);
   const [resettingAccountEmail, setResettingAccountEmail] = useState<string | null>(null);
   const [inlineNewPassword, setInlineNewPassword] = useState('');
+  const [saRoleFilter, setSaRoleFilter] = useState<'all' | 'ADM' | 'Garçom' | 'inadimplentes'>('all');
+  const [editingBillingEmail, setEditingBillingEmail] = useState<string | null>(null);
+  const [billingFeeInput, setBillingFeeInput] = useState('99,90');
+  const [billingDueInput, setBillingDueInput] = useState('Todo dia 10');
+  const [billingStatusInput, setBillingStatusInput] = useState<SubscriptionStatusType>('em_dia');
 
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
+  const shouldKeepListeningRef = useRef(false);
+  const marceloAwakeUntilMsRef = useRef(0);
+  const liveAcousticTrackerRef = useRef<LiveAcousticTracker | null>(null);
+  const openMicWakeWordModeRef = useRef(openMicWakeWordMode);
+
+  useEffect(() => {
+    openMicWakeWordModeRef.current = openMicWakeWordMode;
+    try {
+      localStorage.setItem('comanda_voz_wake_word_mode', String(openMicWakeWordMode));
+    } catch {
+      // ignore
+    }
+  }, [openMicWakeWordMode]);
+
+  const refreshAudioDevices = async (requestPermission = false) => {
+    const devs = await listAudioInputDevices(requestPermission);
+    setAudioDevices(devs);
+    // Auto-select Bluetooth microphone if newly connected and user hasn't locked another device
+    const btDev = devs.find((d) => d.isBluetooth);
+    if (btDev && (selectedMicDeviceId === 'default' || !devs.some((d) => d.deviceId === selectedMicDeviceId))) {
+      setSelectedMicDeviceId(btDev.deviceId);
+      try {
+        localStorage.setItem('comanda_voz_selected_mic_id', btDev.deviceId);
+      } catch {
+        // ignore
+      }
+    }
+  };
+
+  useEffect(() => {
+    refreshAudioDevices(false);
+    if (typeof navigator !== 'undefined' && navigator.mediaDevices?.addEventListener) {
+      const onDeviceChange = () => refreshAudioDevices(false);
+      navigator.mediaDevices.addEventListener('devicechange', onDeviceChange);
+      return () => {
+        navigator.mediaDevices.removeEventListener('devicechange', onDeviceChange);
+      };
+    }
+  }, []);
 
   // Helper to persist Store snapshot to localStorage + Express server with RBAC headers
   const syncDirectStoreSnapshot = async (nextData: {
@@ -1619,47 +1713,107 @@ function ComandaVozWorkspace() {
     waiterNameAttr: string
   ) => {
     if (!user) return;
-    const cleanQuery = customerQueryName
-      .trim()
-      .replace(/^(?:o|a|os|as|do|da|dos|das|de|no|na|pro|pra|para)\s+/i, '')
-      .replace(/[.!,?;:]+$/g, '')
-      .trim();
+    let cleanQuery = customerQueryName.trim().replace(/[.!,?;:]+$/g, '').trim();
+    for (let i = 0; i < 5; i++) {
+      const next = cleanQuery
+        .replace(
+          /^(?:o|a|os|as|do|da|dos|das|de|no|na|nos|nas|pro|pra|para|conta|comanda|cliente|senhor|sr|seu|dona)\b\s*/i,
+          ''
+        )
+        .trim();
+      if (next === cleanQuery) break;
+      cleanQuery = next;
+    }
+
     const qNorm = normalizeText(cleanQuery);
     const qPhon = normalizePhoneticPt(cleanQuery);
 
-    const isCustomerTabMatch = (t: BarTab): boolean => {
+    const evaluateCustomerTabMatch = (t: BarTab) => {
       const tabNorm = normalizeText(t.customerName);
       const tabPhon = normalizePhoneticPt(t.customerName);
-      if (!tabNorm || !qNorm) return false;
-      if (tabNorm === qNorm) return true;
-      if (qPhon && tabPhon && tabPhon === qPhon) return true;
-      if (areCustomerNamesEquivalent(t.customerName, cleanQuery)) return true;
-      if (qPhon.length >= 2 && tabPhon.includes(qPhon)) return true;
-      if (qNorm.length >= 2 && tabNorm.includes(qNorm)) return true;
-      return false;
-    };
+      const exactNormalizedMatch = Boolean(tabNorm && qNorm && tabNorm === qNorm);
+      const exactPhoneticMatch = Boolean(tabPhon && qPhon && tabPhon === qPhon);
+      const equivalentMatch = areCustomerNamesEquivalent(t.customerName, cleanQuery);
+      const fuzzySimilarity = Number(
+        computeCustomerNameSimilarity(t.customerName, cleanQuery).toFixed(3)
+      );
+      const substringMatch = Boolean(
+        (qPhon.length >= 2 && tabPhon.includes(qPhon)) ||
+          (tabPhon.length >= 3 && qPhon.includes(tabPhon)) ||
+          (qNorm.length >= 2 && tabNorm.includes(qNorm)) ||
+          (tabNorm.length >= 3 && qNorm.includes(tabNorm))
+      );
 
-    const matchingTabs = activeStageTabs.filter(isCustomerTabMatch);
+      const matched = Boolean(
+        tabNorm &&
+          qNorm &&
+          (exactNormalizedMatch ||
+            exactPhoneticMatch ||
+            equivalentMatch ||
+            fuzzySimilarity >= 0.78 ||
+            substringMatch)
+      );
 
-    console.info('[DarBaixa:Verificacao]', {
-      queryOriginal: customerQueryName,
-      queryNormalizada: qNorm,
-      queryFonetica: qPhon,
-      totalComandasAtivas: activeStageTabs.length,
-      comandasDisponiveis: activeStageTabs.map((t) => ({
-        id: t.id,
-        customerName: t.customerName,
-        normalizado: normalizeText(t.customerName),
-        fonetico: normalizePhoneticPt(t.customerName),
+      let rejectionReason: string | null = null;
+      if (!matched) {
+        if (!tabNorm || !qNorm) {
+          rejectionReason = 'Nome normalizado vazio';
+        } else {
+          rejectionReason = `Divergência entre "${tabNorm}" (fon: "${tabPhon}") e busca "${qNorm}" (fon: "${qPhon}", sim=${fuzzySimilarity})`;
+        }
+      }
+
+      return {
+        tab: t,
+        tabId: t.id,
+        tabCustomerName: t.customerName,
+        tabNormalized: tabNorm,
+        tabPhonetic: tabPhon,
+        queryNormalized: qNorm,
+        queryPhonetic: qPhon,
+        exactNormalizedMatch,
+        exactPhoneticMatch,
+        equivalentMatch,
+        fuzzySimilarity,
+        substringMatch,
         status: t.status,
         totalAmount: t.totalAmount,
         paidAmount: t.paidAmount,
-      })),
+        remainingBalance: getRemainingBalance(t),
+        matched,
+        rejectionReason,
+      };
+    };
+
+    const evaluatedTabs = activeStageTabs.map(evaluateCustomerTabMatch);
+    const matchedEvaluations = evaluatedTabs
+      .filter((e) => e.matched)
+      .sort((a, b) => {
+        const aOpenBalance = a.status !== 'paid' && a.remainingBalance > 0 ? 1 : 0;
+        const bOpenBalance = b.status !== 'paid' && b.remainingBalance > 0 ? 1 : 0;
+        if (bOpenBalance !== aOpenBalance) return bOpenBalance - aOpenBalance;
+        if (b.exactNormalizedMatch !== a.exactNormalizedMatch) {
+          return Number(b.exactNormalizedMatch) - Number(a.exactNormalizedMatch);
+        }
+        if (b.exactPhoneticMatch !== a.exactPhoneticMatch) {
+          return Number(b.exactPhoneticMatch) - Number(a.exactPhoneticMatch);
+        }
+        return b.fuzzySimilarity - a.fuzzySimilarity;
+      });
+    const matchingTabs = matchedEvaluations.map((e) => e.tab);
+
+    console.info('[DarBaixa:Verificacao]', {
+      queryOriginal: customerQueryName,
+      queryLimpa: cleanQuery,
+      queryNormalizada: qNorm,
+      queryFonetica: qPhon,
+      totalComandasAtivas: activeStageTabs.length,
+      comparacoesPorComanda: evaluatedTabs.map(({ tab: _tab, ...details }) => details),
       comandasFiltradasCount: matchingTabs.length,
       comandasFiltradasIds: matchingTabs.map((t) => t.id),
     });
 
-    // Prefer exact normalized match with remaining balance, then open/closing tabs, then any match
+    // Prefer open/closing tab with remaining balance and strongest normalized/phonetic/fuzzy match
     const targetTab =
       matchingTabs.find(
         (t) =>
@@ -1672,18 +1826,21 @@ function ComandaVozWorkspace() {
       matchingTabs[0];
 
     if (!targetTab) {
-      const archivedMatches = tabs.filter(
-        (t) => t.status === 'archived' && isCustomerTabMatch(t)
-      );
+      const archivedMatches = tabs
+        .filter((t) => t.status === 'archived')
+        .map(evaluateCustomerTabMatch)
+        .filter((e) => e.matched);
       console.warn('[DarBaixa:FalhaBusca]', {
-        motivo: 'Nenhuma comanda ativa correspondente encontrada.',
+        motivo:
+          activeStageTabs.length === 0
+            ? 'Nenhuma comanda ativa na loja atual.'
+            : 'Nenhuma comanda ativa passou na comparação de customerName normalizado/fonético/fuzzy.',
         queryOriginal: customerQueryName,
+        queryLimpa: cleanQuery,
         queryNormalizada: qNorm,
-        comandasArquivadasCorrespondentes: archivedMatches.map((t) => ({
-          id: t.id,
-          customerName: t.customerName,
-          status: t.status,
-        })),
+        queryFonetica: qPhon,
+        comparacoesAvaliadas: evaluatedTabs.map(({ tab: _tab, ...details }) => details),
+        comandasArquivadasCorrespondentes: archivedMatches.map(({ tab: _tab, ...details }) => details),
       });
       const msg = `Não encontrei a comanda de "${customerQueryName}" para dar baixa.`;
       setFeedbackBanner({ type: 'error', message: msg });
@@ -1855,8 +2012,28 @@ function ComandaVozWorkspace() {
     const cleanPhrase = phrase.trim();
     if (!cleanPhrase || !user) return;
 
-    const waiterAttr = activeWaiterDisplay.name;
+    let waiterAttr = activeWaiterDisplay.name;
     const storeAttr = activeWaiterDisplay.storeName;
+
+    // Evaluate live voice compatibility against registered Garçons when spoken by voice
+    if (sourceType === 'voz' && voiceOperators.length > 0) {
+      const liveSample = liveAcousticTrackerRef.current?.getRecentSample();
+      if (liveSample) {
+        const match = matchSpeakerAgainstOperators(
+          liveSample,
+          voiceOperators,
+          directSession?.email || user?.email || undefined
+        );
+        if (match.matchedOperator && match.confidence >= 60) {
+          setLastVoiceCompatibility({
+            operatorName: match.matchedOperator.operatorName,
+            confidence: match.confidence,
+            pitchHz: liveSample.pitchHz,
+          });
+          waiterAttr = `${match.matchedOperator.operatorName} (Voz ${match.confidence}%)`;
+        }
+      }
+    }
 
     setIsProcessingCommand(true);
     setFeedbackBanner(null);
@@ -1980,10 +2157,15 @@ function ComandaVozWorkspace() {
     }
   };
 
-  // Start / Stop Web Speech API Microphone Recognition
+  // Start / Stop Web Speech API Microphone Recognition (Supports Open-Mic "MARCELO" Wake-Word + Bluetooth Mic)
   const toggleVoiceRecognition = async () => {
     if (isListening) {
+      shouldKeepListeningRef.current = false;
+      marceloAwakeUntilMsRef.current = 0;
+      setMarceloAwakeWindowActive(false);
       recognitionRef.current?.stop();
+      liveAcousticTrackerRef.current?.stop();
+      liveAcousticTrackerRef.current = null;
       setIsListening(false);
       return;
     }
@@ -2003,9 +2185,14 @@ function ComandaVozWorkspace() {
       return;
     }
 
+    // Warm up Bluetooth / selected microphone and start live voice compatibility tracker
+    await refreshAudioDevices(true);
+    liveAcousticTrackerRef.current?.stop();
+    liveAcousticTrackerRef.current = await startLiveAcousticTracker(selectedMicDeviceId);
+
     const recognition = new SpeechRecognitionCtor();
     recognition.lang = 'pt-BR';
-    recognition.continuous = false;
+    recognition.continuous = openMicWakeWordModeRef.current;
     recognition.interimResults = true;
 
     recognition.onresult = (event: SpeechRecognitionEvent) => {
@@ -2015,7 +2202,41 @@ function ComandaVozWorkspace() {
         if (res.isFinal) {
           const finalPhrase = res[0].transcript.trim();
           setInterimTranscript('');
-          if (finalPhrase) {
+          if (!finalPhrase) continue;
+
+          if (openMicWakeWordModeRef.current) {
+            const wakeInfo = extractCommandAfterMarceloWakeWord(finalPhrase);
+            const nowMs = Date.now();
+
+            if (wakeInfo.hasWakeWord) {
+              setLastIgnoredOpenMicPhrase('');
+              if (wakeInfo.isOnlyWakeWord) {
+                // Waiter said "Marcelo" / "Oi Marcelo": open a 12-second active window for the command
+                marceloAwakeUntilMsRef.current = nowMs + 12000;
+                setMarceloAwakeWindowActive(true);
+                setFeedbackBanner({
+                  type: 'success',
+                  message:
+                    'Marcelo na escuta! Pode falar o comando agora (ex: "marca 1 litrão para Tiago").',
+                });
+                speakAsMarcelo('Pode falar!', marceloVoiceReplyEnabled);
+              } else if (wakeInfo.commandTranscript) {
+                marceloAwakeUntilMsRef.current = 0;
+                setMarceloAwakeWindowActive(false);
+                processOrderPhrase(wakeInfo.commandTranscript, 'voz');
+              }
+            } else if (nowMs < marceloAwakeUntilMsRef.current) {
+              // Spoken within 12 seconds after saying "Marcelo"
+              marceloAwakeUntilMsRef.current = 0;
+              setMarceloAwakeWindowActive(false);
+              setLastIgnoredOpenMicPhrase('');
+              processOrderPhrase(finalPhrase, 'voz');
+            } else {
+              // Casual conversation with open microphone: ignore silently without interrupting the waiter!
+              setMarceloAwakeWindowActive(false);
+              setLastIgnoredOpenMicPhrase(finalPhrase);
+            }
+          } else {
             processOrderPhrase(finalPhrase, 'voz');
           }
         } else {
@@ -2028,23 +2249,199 @@ function ComandaVozWorkspace() {
     };
 
     recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
-      if (event.error !== 'no-speech') {
+      if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
+        shouldKeepListeningRef.current = false;
+        liveAcousticTrackerRef.current?.stop();
+        liveAcousticTrackerRef.current = null;
         setFeedbackBanner({
           type: 'error',
-          message: `Permissão de microfone (${event.error}): verifique o áudio do navegador.`,
+          message: `Permissão de microfone negada (${event.error}): libere o microfone no navegador.`,
         });
         setIsListening(false);
       }
     };
 
     recognition.onend = () => {
+      // If Open-Mic Wake-Word mode is active and user didn't click stop, automatically keep listening
+      if (shouldKeepListeningRef.current && openMicWakeWordModeRef.current) {
+        setTimeout(() => {
+          if (shouldKeepListeningRef.current && recognitionRef.current) {
+            try {
+              recognitionRef.current.start();
+              return;
+            } catch {
+              // ignore if already started
+            }
+          }
+        }, 220);
+        return;
+      }
+      liveAcousticTrackerRef.current?.stop();
+      liveAcousticTrackerRef.current = null;
       setIsListening(false);
     };
 
+    shouldKeepListeningRef.current = true;
     recognitionRef.current = recognition;
     setInterimTranscript('');
+    setLastIgnoredOpenMicPhrase('');
     setIsListening(true);
     recognition.start();
+  };
+
+  useEffect(() => {
+    return () => {
+      shouldKeepListeningRef.current = false;
+      recognitionRef.current?.stop();
+      liveAcousticTrackerRef.current?.stop();
+    };
+  }, []);
+
+  // Capture 2.4s voice sample when registering a new Waiter
+  const handleCaptureVoiceForNewWaiter = async () => {
+    setCapturingNewOpVoice(true);
+    try {
+      const sample = await captureVoiceBiometricSample(2400, selectedMicDeviceId);
+      setNewOpVoiceSample({
+        pitchHz: sample.pitchHz,
+        spectralCentroid: sample.spectralCentroid,
+      });
+      setFeedbackBanner({
+        type: 'success',
+        message: `Voz do garçom capturada com sucesso (${sample.pitchHz} Hz · Timbre ${Math.round(sample.spectralCentroid)} Hz)!`,
+      });
+    } catch {
+      setFeedbackBanner({
+        type: 'error',
+        message: 'Não foi possível capturar o áudio do microfone. Verifique a permissão.',
+      });
+    } finally {
+      setCapturingNewOpVoice(false);
+    }
+  };
+
+  // Calibrate / Re-record Voice for an Existing Waiter (Works for ADM or Logged-In Garçom)
+  const handleCalibrateExistingWaiterVoice = async (targetOp: VoiceOperator) => {
+    if (!user) return;
+    setCalibratingOpId(targetOp.id);
+    try {
+      const sample = await captureVoiceBiometricSample(2500, selectedMicDeviceId);
+      const prevSamples = Math.max(targetOp.samplesCount || 1, 1);
+      const blendedPitch =
+        prevSamples > 1
+          ? Number(((targetOp.pitchHz * prevSamples + sample.pitchHz) / (prevSamples + 1)).toFixed(1))
+          : sample.pitchHz;
+      const blendedCentroid =
+        prevSamples > 1
+          ? Number(
+              (
+                (targetOp.spectralCentroid * prevSamples + sample.spectralCentroid) /
+                (prevSamples + 1)
+              ).toFixed(1)
+            )
+          : sample.spectralCentroid;
+      const nextSamplesCount = Math.min(prevSamples + 1, 50);
+
+      await fetch('/api/auth/update-waiter-voice', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          storeCode: currentStoreCode,
+          operatorId: targetOp.id,
+          email: targetOp.email,
+          pitchHz: blendedPitch,
+          spectralCentroid: blendedCentroid,
+          samplesCount: nextSamplesCount,
+          voicePin: targetOp.voicePin || '',
+        }),
+      }).catch(() => {});
+
+      const localTs = makeLocalTimestamp();
+      const nextOps = voiceOperators.map((op) =>
+        op.id === targetOp.id
+          ? {
+              ...op,
+              pitchHz: blendedPitch,
+              spectralCentroid: blendedCentroid,
+              samplesCount: nextSamplesCount,
+              updatedAt: localTs,
+            }
+          : op
+      );
+      setVoiceOperators(nextOps);
+
+      if (isDirectSession) {
+        await syncDirectStoreSnapshot({ voiceOperators: nextOps, actionType: 'add' });
+      } else {
+        await updateDoc(doc(db, 'voiceOperators', targetOp.id), {
+          operatorName: targetOp.operatorName,
+          roleLabel: targetOp.roleLabel || 'Garçom',
+          storeName: targetOp.storeName || currentStoreName,
+          storeCode: targetOp.storeCode || currentStoreCode,
+          pitchHz: blendedPitch,
+          spectralCentroid: blendedCentroid,
+          voicePin: targetOp.voicePin || '',
+          samplesCount: nextSamplesCount,
+          updatedAt: serverTimestamp(),
+        });
+      }
+
+      setLastVoiceCompatibility({
+        operatorName: targetOp.operatorName,
+        confidence: 98,
+        pitchHz: blendedPitch,
+      });
+
+      setFeedbackBanner({
+        type: 'success',
+        message: `Voz de ${targetOp.operatorName} cadastrada/calibrada (${blendedPitch} Hz · ${nextSamplesCount} amostras)!`,
+      });
+    } catch {
+      setFeedbackBanner({
+        type: 'error',
+        message: 'Erro ao gravar amostra de voz do garçom.',
+      });
+    } finally {
+      setCalibratingOpId(null);
+    }
+  };
+
+  // Test Live Voice Compatibility against Registered Waiters
+  const handleTestLiveVoiceCompatibility = async () => {
+    if (voiceOperators.length === 0) {
+      setFeedbackBanner({
+        type: 'error',
+        message: 'Cadastre pelo menos um garçom na aba Garçons para testar a compatibilidade de voz.',
+      });
+      return;
+    }
+    setTestingCompatibility(true);
+    try {
+      const sample = await captureVoiceBiometricSample(2400, selectedMicDeviceId);
+      const match = matchSpeakerAgainstOperators(
+        sample,
+        voiceOperators,
+        directSession?.email || user?.email || undefined
+      );
+      if (match.matchedOperator) {
+        setLastVoiceCompatibility({
+          operatorName: match.matchedOperator.operatorName,
+          confidence: match.confidence,
+          pitchHz: sample.pitchHz,
+        });
+        setFeedbackBanner({
+          type: 'success',
+          message: `Compatibilidade de Voz: ${match.confidence}% com o garçom ${match.matchedOperator.operatorName} (Tom medido: ${sample.pitchHz} Hz).`,
+        });
+      }
+    } catch {
+      setFeedbackBanner({
+        type: 'error',
+        message: 'Não foi possível medir a voz no microfone.',
+      });
+    } finally {
+      setTestingCompatibility(false);
+    }
   };
 
   // Save Logged-In ADM & Comércio Profile
@@ -2113,7 +2510,7 @@ function ComandaVozWorkspace() {
     }
   };
 
-  // ADM Registers a New Waiter (Garçom) with Email & Password
+  // ADM Registers a New Waiter (Garçom) with Email & Password + Optional Voice Print
   const handleSaveTrainedOperator = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!user || !isAdmin) return;
@@ -2130,6 +2527,10 @@ function ComandaVozWorkspace() {
       return;
     }
 
+    const initialPitch = newOpVoiceSample?.pitchHz || 145;
+    const initialCentroid = newOpVoiceSample?.spectralCentroid || 1850;
+    const initialSamplesCount = newOpVoiceSample ? 2 : 1;
+
     setRegisteringWaiter(true);
     try {
       const apiRes = await fetch('/api/auth/register-waiter', {
@@ -2142,10 +2543,10 @@ function ComandaVozWorkspace() {
           password: cleanPass,
           storeName: currentStoreName,
           storeCode: currentStoreCode,
-          pitchHz: 145,
-          spectralCentroid: 1850,
+          pitchHz: initialPitch,
+          spectralCentroid: initialCentroid,
           voicePin: '',
-          samplesCount: 1,
+          samplesCount: initialSamplesCount,
         }),
       });
 
@@ -2174,10 +2575,10 @@ function ComandaVozWorkspace() {
         roleLabel: 'Garçom',
         storeName: currentStoreName,
         storeCode: currentStoreCode,
-        pitchHz: 145,
-        spectralCentroid: 1850,
+        pitchHz: initialPitch,
+        spectralCentroid: initialCentroid,
         voicePin: '',
-        samplesCount: 1,
+        samplesCount: initialSamplesCount,
         createdAt: makeLocalTimestamp(),
         updatedAt: makeLocalTimestamp(),
       };
@@ -2219,10 +2620,11 @@ function ComandaVozWorkspace() {
       setNewOpName('');
       setNewOpEmail('');
       setNewOpPassword('');
+      setNewOpVoiceSample(null);
 
       setFeedbackBanner({
         type: 'success',
-        message: `Garçom ${cleanName} (${cleanEmail}) cadastrado! Ele já pode entrar com e-mail e senha.`,
+        message: `Garçom ${cleanName} (${cleanEmail}) cadastrado com sucesso!`,
       });
     } catch (err) {
       handleFirestoreError(err, OperationType.CREATE, 'voiceOperators');
@@ -3035,6 +3437,63 @@ function ComandaVozWorkspace() {
     }
   };
 
+  // SUPERADMIN: Update Monthly Subscription Billing or Mark Paid
+  const handleSuperAdminUpdateBilling = async (
+    targetEmail: string,
+    options: {
+      monthlyFee?: number;
+      subscriptionStatus?: SubscriptionStatusType;
+      billingDueDate?: string;
+      markPaidNow?: boolean;
+    }
+  ) => {
+    if (!isSuperAdmin) return;
+    try {
+      const res = await fetch('/api/superadmin/update-billing', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          callerRole: 'SUPERADMIN',
+          email: targetEmail,
+          ...options,
+        }),
+      });
+      if (res.ok) {
+        setEditingBillingEmail(null);
+        await fetchSuperAdminOverview();
+        setFeedbackBanner({
+          type: 'success',
+          message: options.markPaidNow
+            ? `Mensalidade de ${targetEmail} baixada como PAGA (Em Dia)!`
+            : `Dados de mensalidade de ${targetEmail} atualizados!`,
+        });
+      }
+    } catch {
+      setFeedbackBanner({
+        type: 'error',
+        message: 'Erro ao atualizar mensalidade.',
+      });
+    }
+  };
+
+  const handleCopyBillingMessage = (acc: SuperAdminAccountSummary) => {
+    const feeStr = formatBRL(acc.monthlyFee ?? 99.9);
+    const dueStr = acc.billingDueDate || 'Todo dia 10';
+    const text = [
+      `Olá ${acc.userName} (${acc.storeName} - ${acc.storeCode})!`,
+      `Segue o lembrete da mensalidade do sistema Comanda Voz:`,
+      `• Valor da Mensalidade: ${feeStr}`,
+      `• Vencimento: ${dueStr}`,
+      `• Status atual: ${(acc.subscriptionStatus || 'em_dia').toUpperCase().replace('_', ' ')}`,
+      `Assim que realizar o pagamento via PIX, envie o comprovante para darmos baixa imediata. Obrigado!`,
+    ].join('\n');
+    navigator.clipboard.writeText(text);
+    setFeedbackBanner({
+      type: 'success',
+      message: `Mensagem de cobrança (${feeStr}) copiada para enviar no WhatsApp de ${acc.userName}!`,
+    });
+  };
+
   if (!authReady) {
     return (
       <div className="min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center p-6">
@@ -3511,7 +3970,7 @@ function ComandaVozWorkspace() {
       </header>
 
       <main className="max-w-[1320px] w-full mx-auto px-4 sm:px-6 py-5 space-y-5 flex-1">
-        {/* ULTRA-CLEAN MARCELO VOICE BAR (Always visible on Comandas) */}
+        {/* ULTRA-CLEAN MARCELO VOICE BAR (Supports Open-Mic "MARCELO" Wake-Word + Bluetooth Mic + Voice Compatibility) */}
         {activeSection === 'comandas' && (
           <section className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3">
             <form
@@ -3527,21 +3986,27 @@ function ComandaVozWorkspace() {
                 type="button"
                 onClick={toggleVoiceRecognition}
                 disabled={isProcessingCommand}
-                className={`inline-flex items-center justify-center gap-2 px-6 py-3.5 rounded-lg text-sm font-bold transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                className={`inline-flex items-center justify-center gap-2 px-5 py-3.5 rounded-lg text-sm font-bold transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
                   isListening
-                    ? 'bg-red-600 text-white hover:bg-red-500'
+                    ? marceloAwakeWindowActive
+                      ? 'bg-emerald-500 text-slate-950 hover:bg-emerald-400'
+                      : 'bg-red-600 text-white hover:bg-red-500'
                     : 'bg-amber-500 text-slate-950 hover:bg-amber-400'
                 }`}
               >
                 {isListening ? (
                   <>
                     <MicOff className="w-5 h-5" />
-                    Ouvindo... (Clique p/ parar)
+                    {openMicWakeWordMode
+                      ? marceloAwakeWindowActive
+                        ? 'Marcelo Ouvindo Pedido...'
+                        : 'Mic Aberto (Diga "MARCELO")'
+                      : 'Ouvindo... (Clique p/ parar)'}
                   </>
                 ) : (
                   <>
                     <Mic className="w-5 h-5" />
-                    Falar com Marcelo
+                    {openMicWakeWordMode ? 'Ligar Mic Aberto ("MARCELO")' : 'Falar com Marcelo'}
                   </>
                 )}
               </button>
@@ -3555,7 +4020,7 @@ function ComandaVozWorkspace() {
                       : commandInput
                   }
                   onChange={(e) => setCommandInput(e.target.value)}
-                  placeholder='Fale ou digite: "Marca 1 litrão para Tiago", "Quanto ficou a conta do Tiago?" ou "Dar baixa no Tiago"'
+                  placeholder='Com microfone aberto, diga: "Marcelo, marca 1 litrão para Tiago" ou "Marcelo, dar baixa no Tiago"'
                   disabled={isProcessingCommand}
                   className="w-full bg-slate-950 border border-slate-700 focus:border-amber-500 rounded-lg px-4 py-3.5 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none"
                 />
@@ -3577,6 +4042,20 @@ function ComandaVozWorkspace() {
 
               <button
                 type="button"
+                onClick={() => setShowVoiceConfigBar((v) => !v)}
+                title="Configurar Microfone Bluetooth, Palavra MARCELO e Voz do Garçom"
+                className={`inline-flex items-center justify-center gap-1.5 px-3.5 py-3.5 rounded-lg border text-xs font-semibold transition-colors shrink-0 cursor-pointer ${
+                  showVoiceConfigBar || audioDevices.some((d) => d.isBluetooth)
+                    ? 'bg-slate-950 border-sky-500/50 text-sky-400'
+                    : 'bg-slate-950 border-slate-800 text-slate-300 hover:border-slate-700'
+                }`}
+              >
+                <Bluetooth className="w-4 h-4" />
+                <span className="hidden md:inline">Bluetooth / Voz</span>
+              </button>
+
+              <button
+                type="button"
                 onClick={() => setMarceloVoiceReplyEnabled((v) => !v)}
                 title={marceloVoiceReplyEnabled ? 'Voz do Marcelo ligada' : 'Voz do Marcelo muda'}
                 className={`inline-flex items-center justify-center px-3.5 py-3.5 rounded-lg border transition-colors shrink-0 cursor-pointer ${
@@ -3593,21 +4072,140 @@ function ComandaVozWorkspace() {
               </button>
             </form>
 
-            {/* 3 Simple Stage Shortcuts */}
-            <div className="flex flex-wrap items-center gap-2 text-xs">
-              <span className="text-slate-400">Exemplos rápidos:</span>
-              {SIMPLE_VOICE_EXAMPLES.map((ex) => (
+            {/* Compact Status Bar: Wake-Word Mode + Bluetooth + Voice Compatibility */}
+            <div className="flex flex-wrap items-center justify-between gap-2 text-xs pt-0.5">
+              <div className="flex flex-wrap items-center gap-2">
                 <button
-                  key={ex.stage}
                   type="button"
-                  disabled={isProcessingCommand}
-                  onClick={() => processOrderPhrase(ex.phrase, 'manual')}
-                  className="px-2.5 py-1 bg-slate-950 hover:bg-slate-800 border border-slate-800 rounded-md text-slate-300 transition-colors cursor-pointer"
+                  onClick={() => setOpenMicWakeWordMode((prev) => !prev)}
+                  className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md border font-medium transition-colors cursor-pointer ${
+                    openMicWakeWordMode
+                      ? 'bg-amber-500/15 border-amber-500/40 text-amber-300'
+                      : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+                  }`}
                 >
-                  <strong className="text-amber-400">{ex.stage}:</strong> &ldquo;{ex.phrase}&rdquo;
+                  <Radio className="w-3.5 h-3.5" />
+                  {openMicWakeWordMode
+                    ? 'Ativar só ao falar "MARCELO": LIGADO'
+                    : 'Ativar só ao falar "MARCELO": DESLIGADO'}
                 </button>
-              ))}
+
+                {lastVoiceCompatibility && (
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md bg-slate-950 border border-emerald-500/40 text-emerald-300 font-mono">
+                    <AudioLines className="w-3.5 h-3.5" />
+                    Voz: {lastVoiceCompatibility.operatorName} ({lastVoiceCompatibility.confidence}% compatível)
+                  </span>
+                )}
+
+                {isListening && openMicWakeWordMode && lastIgnoredOpenMicPhrase && (
+                  <span className="text-slate-500 truncate max-w-xs">
+                    Conversa ignorada (sem &ldquo;Marcelo&rdquo;): &ldquo;{lastIgnoredOpenMicPhrase}&rdquo;
+                  </span>
+                )}
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2">
+                {SIMPLE_VOICE_EXAMPLES.map((ex) => (
+                  <button
+                    key={ex.stage}
+                    type="button"
+                    disabled={isProcessingCommand}
+                    onClick={() => processOrderPhrase(ex.phrase, 'manual')}
+                    className="px-2.5 py-1 bg-slate-950 hover:bg-slate-800 border border-slate-800 rounded-md text-slate-300 transition-colors cursor-pointer"
+                  >
+                    <strong className="text-amber-400">{ex.stage}:</strong> &ldquo;{ex.phrase}&rdquo;
+                  </button>
+                ))}
+              </div>
             </div>
+
+            {/* Expandable Bluetooth Microphone & Waiter Voice Calibration Drawer */}
+            {showVoiceConfigBar && (
+              <div className="p-3.5 bg-slate-950 border border-slate-800 rounded-lg space-y-3 text-xs">
+                <div className="grid grid-cols-1 md:grid-cols-12 gap-3 items-end">
+                  <div className="md:col-span-5 space-y-1">
+                    <label className="text-slate-300 font-semibold flex items-center gap-1.5">
+                      <Bluetooth className="w-3.5 h-3.5 text-sky-400" />
+                      Microfone do Garçom (Fone Bluetooth / Lapela / Aparelho)
+                    </label>
+                    <div className="flex items-center gap-2">
+                      <select
+                        value={selectedMicDeviceId}
+                        onChange={(e) => {
+                          setSelectedMicDeviceId(e.target.value);
+                          try {
+                            localStorage.setItem('comanda_voz_selected_mic_id', e.target.value);
+                          } catch {
+                            // ignore
+                          }
+                        }}
+                        className="flex-1 bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-slate-100"
+                      >
+                        <option value="default">Microfone Padrão / Automático</option>
+                        {audioDevices.map((dev) => (
+                          <option key={dev.deviceId} value={dev.deviceId}>
+                            {dev.isBluetooth ? `[BLUETOOTH] ${dev.label}` : dev.label}
+                          </option>
+                        ))}
+                      </select>
+                      <button
+                        type="button"
+                        onClick={() => refreshAudioDevices(true)}
+                        className="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-sky-300 font-semibold rounded-lg whitespace-nowrap cursor-pointer"
+                      >
+                        Buscar Bluetooth
+                      </button>
+                    </div>
+                  </div>
+
+                  <div className="md:col-span-7 flex flex-wrap items-center justify-end gap-2">
+                    {(() => {
+                      const loggedWaiterOp = voiceOperators.find(
+                        (op) =>
+                          (op.email &&
+                            directSession?.email &&
+                            op.email.toLowerCase() === directSession.email.toLowerCase()) ||
+                          normalizeText(op.operatorName) ===
+                            normalizeText(userProfile?.userName || directSession?.userName || '')
+                      );
+                      return (
+                        <>
+                          {loggedWaiterOp && (
+                            <button
+                              type="button"
+                              disabled={calibratingOpId === loggedWaiterOp.id}
+                              onClick={() => handleCalibrateExistingWaiterVoice(loggedWaiterOp)}
+                              className="inline-flex items-center gap-1.5 px-3 py-2 bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-bold rounded-lg cursor-pointer"
+                            >
+                              <AudioLines className="w-4 h-4" />
+                              {calibratingOpId === loggedWaiterOp.id
+                                ? 'Gravando sua voz (fale por 3s)...'
+                                : `Gravar Minha Voz (${loggedWaiterOp.operatorName})`}
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            disabled={testingCompatibility}
+                            onClick={handleTestLiveVoiceCompatibility}
+                            className="inline-flex items-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 disabled:opacity-50 text-emerald-300 font-semibold rounded-lg cursor-pointer"
+                          >
+                            <Mic className="w-3.5 h-3.5" />
+                            {testingCompatibility
+                              ? 'Ouvindo voz (2.5s)...'
+                              : 'Testar Compatibilidade de Voz'}
+                          </button>
+                        </>
+                      );
+                    })()}
+                  </div>
+                </div>
+                <p className="text-[11px] text-slate-400">
+                  <strong>Como funciona com Microfone Aberto + Bluetooth:</strong> Conecte o fone Bluetooth no celular/computador e deixe o botão{' '}
+                  <strong className="text-amber-300">Mic Aberto (Diga &ldquo;MARCELO&rdquo;)</strong> ligado. O garçom pode conversar livremente com os clientes; o sistema só executa quando ouvir a palavra{' '}
+                  <strong className="text-amber-300">&ldquo;MARCELO&rdquo;</strong> antes do pedido!
+                </p>
+              </div>
+            )}
 
             {/* Clean Response Banner from Marcelo */}
             {(marceloReport || feedbackBanner) && (
@@ -4410,20 +5008,20 @@ function ComandaVozWorkspace() {
           />
         )}
 
-        {/* SECTION 4: GARÇONS & BAR (ADM ONLY) */}
+        {/* SECTION 4: GARÇONS, BIOMETRIA DE VOZ & BAR (ADM ONLY) */}
         {activeSection === 'equipe_comercio' && isAdmin && (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
             <div className="lg:col-span-5 space-y-5">
-              {/* ADM Register Waiter Form */}
+              {/* ADM Register Waiter Form + Voice Print */}
               <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
                 <div className="space-y-1">
                   <h2 className="text-base font-bold text-slate-100 flex items-center gap-2">
                     <UserPlus className="w-5 h-5 text-amber-400" />
-                    Cadastrar Garçom (Login E-mail e Senha)
+                    Cadastrar Garçom (Login + Voz Compatível)
                   </h2>
                   <p className="text-xs text-slate-400">
-                    O garçom entra com este e-mail e senha e só pode adicionar pedidos (não remove
-                    nada).
+                    O garçom entra com e-mail e senha, usa microfone Bluetooth e só pode adicionar
+                    pedidos (não remove nada).
                   </p>
                 </div>
 
@@ -4464,6 +5062,31 @@ function ComandaVozWorkspace() {
                         minLength={4}
                         className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-slate-100 font-mono"
                       />
+                    </div>
+                  </div>
+
+                  {/* Optional Biometric Voice Capture during Registration */}
+                  <div className="p-3 bg-slate-950 border border-slate-800 rounded-lg space-y-2">
+                    <div className="flex items-center justify-between gap-2">
+                      <div>
+                        <span className="font-semibold text-slate-200 block">
+                          Biometria de Voz do Garçom (Opcional)
+                        </span>
+                        <span className="text-[11px] text-slate-400">
+                          {newOpVoiceSample
+                            ? `Voz capturada: ${newOpVoiceSample.pitchHz} Hz (Timbre ${Math.round(newOpVoiceSample.spectralCentroid)} Hz)`
+                            : 'Peça para o garçom falar por 3s para medir compatibilidade'}
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        disabled={capturingNewOpVoice}
+                        onClick={handleCaptureVoiceForNewWaiter}
+                        className="inline-flex items-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 text-amber-300 font-semibold rounded-lg shrink-0 cursor-pointer"
+                      >
+                        <AudioLines className="w-4 h-4" />
+                        {capturingNewOpVoice ? 'Ouvindo (3s)...' : 'Gravar Voz (3s)'}
+                      </button>
                     </div>
                   </div>
 
@@ -4525,31 +5148,61 @@ function ComandaVozWorkspace() {
             </div>
 
             <div className="lg:col-span-7 bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
-              <h2 className="text-base font-bold text-slate-100">
-                Garçons Cadastrados ({voiceOperators.length})
-              </h2>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div>
+                  <h2 className="text-base font-bold text-slate-100">
+                    Garçons Cadastrados ({voiceOperators.length})
+                  </h2>
+                  <p className="text-xs text-slate-400">
+                    Grave ou calibre a voz de cada garçom para identificar compatibilidade pelo
+                    microfone Bluetooth.
+                  </p>
+                </div>
+                {voiceOperators.length > 0 && (
+                  <button
+                    type="button"
+                    disabled={testingCompatibility}
+                    onClick={handleTestLiveVoiceCompatibility}
+                    className="inline-flex items-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 text-emerald-300 text-xs font-semibold rounded-lg cursor-pointer"
+                  >
+                    <AudioLines className="w-4 h-4" />
+                    {testingCompatibility ? 'Medindo Voz (2.5s)...' : 'Testar Compatibilidade Agora'}
+                  </button>
+                )}
+              </div>
+
+              {lastVoiceCompatibility && (
+                <div className="p-3 bg-slate-950 border border-emerald-500/40 rounded-lg flex items-center justify-between text-xs">
+                  <span className="text-emerald-300 font-medium">
+                    Último teste de voz: <strong>{lastVoiceCompatibility.operatorName}</strong> com{' '}
+                    <strong className="font-mono">{lastVoiceCompatibility.confidence}%</strong> de
+                    compatibilidade ({lastVoiceCompatibility.pitchHz} Hz)
+                  </span>
+                </div>
+              )}
 
               {voiceOperators.length === 0 ? (
                 <div className="p-8 text-center border border-dashed border-slate-800 rounded-lg text-xs text-slate-400">
-                  Nenhum garçom cadastrado ainda. Use o formulário ao lado para criar o login dos
-                  garçons.
+                  Nenhum garçom cadastrado ainda. Use o formulário ao lado para criar o login e
+                  gravar a voz dos garçons.
                 </div>
               ) : (
-                <div className="border border-slate-800 rounded-lg overflow-hidden">
+                <div className="border border-slate-800 rounded-lg overflow-x-auto">
                   <table className="w-full text-left border-collapse text-xs">
                     <thead>
                       <tr className="bg-slate-950 border-b border-slate-800 text-slate-400">
-                        <th className="py-2.5 px-4 font-medium">Nome</th>
-                        <th className="py-2.5 px-4 font-medium">E-mail de Login</th>
-                        <th className="py-2.5 px-4 font-medium">Senha / Permissão</th>
+                        <th className="py-2.5 px-4 font-medium">Garçom</th>
+                        <th className="py-2.5 px-4 font-medium">Login</th>
+                        <th className="py-2.5 px-4 font-medium">Biometria de Voz</th>
                         <th className="py-2.5 px-4 font-medium text-right">Ações</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-800/70 bg-slate-950/40">
                       {voiceOperators.map((op) => (
                         <tr key={op.id} className="hover:bg-slate-800/30">
-                          <td className="py-2.5 px-4 font-semibold text-slate-100">
-                            {op.operatorName}
+                          <td className="py-2.5 px-4">
+                            <div className="font-semibold text-slate-100">{op.operatorName}</div>
+                            <div className="text-[11px] text-amber-400">Somente Adicionar</div>
                           </td>
                           <td className="py-2.5 px-4 text-slate-300 font-mono">
                             {op.email || '—'}
@@ -4585,10 +5238,34 @@ function ComandaVozWorkspace() {
                                 </button>
                               </div>
                             ) : (
-                              <span className="text-amber-400">Somente Adicionar</span>
+                              <div className="space-y-0.5 font-mono">
+                                <span
+                                  className={
+                                    op.samplesCount > 1
+                                      ? 'text-emerald-400 font-semibold block'
+                                      : 'text-slate-400 block'
+                                  }
+                                >
+                                  {op.samplesCount > 1
+                                    ? `Voz Calibrada (${op.pitchHz} Hz)`
+                                    : `Padrão (${op.pitchHz} Hz)`}
+                                </span>
+                                <span className="text-[11px] text-slate-500 block font-sans">
+                                  {op.samplesCount} {op.samplesCount === 1 ? 'amostra' : 'amostras'}
+                                </span>
+                              </div>
                             )}
                           </td>
-                          <td className="py-2.5 px-4 text-right space-x-3 whitespace-nowrap">
+                          <td className="py-2.5 px-4 text-right space-x-2.5 whitespace-nowrap">
+                            <button
+                              type="button"
+                              disabled={calibratingOpId === op.id}
+                              onClick={() => handleCalibrateExistingWaiterVoice(op)}
+                              className="px-2.5 py-1 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 rounded font-semibold cursor-pointer"
+                              title="Gravar 3 segundos da voz deste garçom"
+                            >
+                              {calibratingOpId === op.id ? 'Ouvindo 3s...' : 'Gravar Voz'}
+                            </button>
                             {op.email && (
                               <button
                                 type="button"
@@ -4599,7 +5276,7 @@ function ComandaVozWorkspace() {
                                 className="text-sky-400 hover:underline font-medium cursor-pointer"
                                 title="Redefinir senha do garçom"
                               >
-                                Trocar Senha
+                                Senha
                               </button>
                             )}
                             <button
@@ -4621,204 +5298,554 @@ function ComandaVozWorkspace() {
           </div>
         )}
 
-        {/* SECTION 4: SUPERADMIN (PROGRAMADOR - CONTROLE TOTAL DE BARES, USUÁRIOS E SENHAS) */}
-        {activeSection === 'superadmin' && isSuperAdmin && (
-          <div className="space-y-6">
-            {/* Top Bar: Master Recovery Key & Programmer Status */}
-            <div className="bg-slate-900 border border-emerald-500/40 rounded-xl p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-              <div className="space-y-1">
-                <h2 className="text-base font-bold text-emerald-400 flex items-center gap-2">
-                  <ShieldCheck className="w-5 h-5" />
-                  Painel do Programador (SUPERADMIN) — Controle Total
-                </h2>
-                <p className="text-xs text-slate-300">
-                  Você pode acessar qualquer bar em tempo real, criar/editar contas, trocar senhas e
-                  definir a Chave Mestre de recuperação.
-                </p>
-              </div>
+        {/* SECTION 5: SUPERADMIN (ADMINISTRAÇÃO DE USUÁRIOS ADM vs GARÇOM E COBRANÇA DE MENSALIDADES) */}
+        {activeSection === 'superadmin' && isSuperAdmin && (() => {
+          const admAccounts = superAccounts.filter((a) => a.userRole === 'ADM');
+          const waiterAccounts = superAccounts.filter((a) => a.userRole === 'Garçom');
+          const totalMonthlyMrr = admAccounts.reduce(
+            (sum, a) => sum + (typeof a.monthlyFee === 'number' ? a.monthlyFee : 99.9),
+            0
+          );
+          const unpaidAdms = admAccounts.filter(
+            (a) => a.subscriptionStatus && a.subscriptionStatus !== 'em_dia'
+          );
+          const filteredSuperAccounts = superAccounts.filter((acc) => {
+            if (saRoleFilter === 'ADM') return acc.userRole === 'ADM';
+            if (saRoleFilter === 'Garçom') return acc.userRole === 'Garçom';
+            if (saRoleFilter === 'inadimplentes') {
+              return acc.userRole === 'ADM' && acc.subscriptionStatus !== 'em_dia';
+            }
+            return true;
+          });
 
-              <div className="flex items-center gap-2 text-xs">
+          return (
+            <div className="space-y-6">
+              {/* Top Bar: SUPERADMIN Header & Master Key */}
+              <div className="bg-slate-900 border border-emerald-500/40 rounded-xl p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
                 <div className="space-y-1">
-                  <label className="text-slate-400 block">Chave Mestre de Recuperação</label>
-                  <div className="flex items-center gap-2">
-                    <input
-                      type="text"
-                      value={masterRecoveryKeyState}
-                      onChange={(e) => setMasterRecoveryKeyState(e.target.value)}
-                      className="bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 font-mono font-bold w-36"
-                    />
-                    <button
-                      type="button"
-                      onClick={() => handleSuperAdminStoreAction('update_master_key')}
-                      className="px-3.5 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold rounded-lg transition-colors cursor-pointer"
-                    >
-                      Salvar Chave
-                    </button>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-              {/* Left Column: Create or Update Any Account (SUPERADMIN, ADM, Garçom) */}
-              <div className="lg:col-span-4 bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
-                <div className="space-y-1">
-                  <h3 className="text-sm font-bold text-slate-100">
-                    Criar ou Editar Qualquer Usuário
-                  </h3>
-                  <p className="text-xs text-slate-400">
-                    Crie novos ADMs, Garçons ou altere a senha do seu próprio usuário SUPERADMIN.
+                  <h2 className="text-base font-bold text-emerald-400 flex items-center gap-2">
+                    <ShieldCheck className="w-5 h-5" />
+                    Painel SUPERADMIN — Gestão de Mensalidades, ADMs (Donos) e Garçons
+                  </h2>
+                  <p className="text-xs text-slate-300">
+                    Controle quem é <strong>ADM (Dono do Bar)</strong> e quem é{' '}
+                    <strong>Garçom</strong>, cobre mensalidades, dê baixa nos pagamentos e gerencie
+                    acessos.
                   </p>
                 </div>
 
-                <form onSubmit={handleSuperAdminSaveAccount} className="space-y-3 text-xs">
+                <div className="flex items-center gap-2 text-xs">
                   <div className="space-y-1">
-                    <label className="text-slate-300 block font-medium">Nome *</label>
-                    <input
-                      type="text"
-                      value={saUserName}
-                      onChange={(e) => setSaUserName(e.target.value)}
-                      placeholder="Ex: Programador ou Dono do Bar"
-                      required
-                      className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100"
-                    />
-                  </div>
-
-                  <div className="space-y-1">
-                    <label className="text-slate-300 block font-medium">E-mail de Login *</label>
-                    <input
-                      type="email"
-                      value={saUserEmail}
-                      onChange={(e) => setSaUserEmail(e.target.value)}
-                      placeholder="Ex: superadmin@comandavoz.com"
-                      required
-                      className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 font-mono"
-                    />
-                  </div>
-
-                  <div className="grid grid-cols-2 gap-2.5">
-                    <div className="space-y-1">
-                      <label className="text-slate-300 block font-medium">Cargo</label>
-                      <select
-                        value={saUserRole}
-                        onChange={(e) =>
-                          setSaUserRole(e.target.value as 'SUPERADMIN' | 'ADM' | 'Garçom')
-                        }
-                        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100"
+                    <label className="text-slate-400 block">Chave Mestre de Recuperação</label>
+                    <div className="flex items-center gap-2">
+                      <input
+                        type="text"
+                        value={masterRecoveryKeyState}
+                        onChange={(e) => setMasterRecoveryKeyState(e.target.value)}
+                        className="bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 font-mono font-bold w-36"
+                      />
+                      <button
+                        type="button"
+                        onClick={() => handleSuperAdminStoreAction('update_master_key')}
+                        className="px-3.5 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold rounded-lg transition-colors cursor-pointer"
                       >
-                        <option value="ADM">ADM (Dono do Bar)</option>
-                        <option value="Garçom">Garçom (Só Adiciona)</option>
-                        <option value="SUPERADMIN">SUPERADMIN (Programador)</option>
-                      </select>
-                    </div>
-
-                    <div className="space-y-1">
-                      <label className="text-slate-300 block font-medium">Senha *</label>
-                      <input
-                        type="text"
-                        value={saUserPassword}
-                        onChange={(e) => setSaUserPassword(e.target.value)}
-                        placeholder="Mín. 4 dígitos"
-                        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 font-mono"
-                      />
+                        Salvar Chave
+                      </button>
                     </div>
                   </div>
-
-                  <div className="grid grid-cols-2 gap-2.5">
-                    <div className="space-y-1">
-                      <label className="text-slate-300 block font-medium">Nome do Bar</label>
-                      <input
-                        type="text"
-                        value={saStoreName}
-                        onChange={(e) => setSaStoreName(e.target.value)}
-                        placeholder="Ex: Bar Central"
-                        required
-                        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100"
-                      />
-                    </div>
-
-                    <div className="space-y-1">
-                      <label className="text-slate-300 block font-medium">Código do Bar</label>
-                      <input
-                        type="text"
-                        value={saStoreCode}
-                        onChange={(e) => setSaStoreCode(e.target.value)}
-                        placeholder="Ex: BAR-01"
-                        required
-                        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 font-mono"
-                      />
-                    </div>
-                  </div>
-
-                  <button
-                    type="submit"
-                    disabled={saSaving}
-                    className="w-full py-2.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-lg transition-colors cursor-pointer"
-                  >
-                    {saSaving ? 'Salvando...' : 'Salvar Conta / Redefinir Senha'}
-                  </button>
-                </form>
+                </div>
               </div>
 
-              {/* Right Column: All Users & All Stores Tables */}
-              <div className="lg:col-span-8 space-y-6">
-                {/* Stores List */}
-                <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-3">
-                  <h3 className="text-sm font-bold text-slate-100">
-                    Todos os Bares Cadastrados ({superStores.length})
-                  </h3>
+              {/* 4 SaaS Summary KPI Cards (Users Breakdown & Monthly Billing) */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-4">
+                <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-1">
+                  <span className="text-xs text-slate-400 block">
+                    Usuários ADM (Donos de Bar)
+                  </span>
+                  <div className="text-2xl font-bold font-mono tabular-nums text-amber-400">
+                    {admAccounts.length}
+                  </div>
+                  <span className="text-[11px] text-slate-500 block">
+                    Clientes pagantes de mensalidade
+                  </span>
+                </div>
 
-                  {superStores.length === 0 ? (
-                    <p className="text-xs text-slate-400">Nenhum bar registrado ainda.</p>
-                  ) : (
-                    <div className="border border-slate-800 rounded-lg overflow-hidden">
+                <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-1">
+                  <span className="text-xs text-slate-400 block">
+                    Usuários Garçom (Funcionários)
+                  </span>
+                  <div className="text-2xl font-bold font-mono tabular-nums text-sky-400">
+                    {waiterAccounts.length}
+                  </div>
+                  <span className="text-[11px] text-slate-500 block">
+                    Vinculados aos bares (somente adicionam)
+                  </span>
+                </div>
+
+                <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-1">
+                  <span className="text-xs text-slate-400 block">
+                    Receita Mensal de Mensalidades
+                  </span>
+                  <div className="text-2xl font-bold font-mono tabular-nums text-emerald-400">
+                    {formatBRL(totalMonthlyMrr)}
+                  </div>
+                  <span className="text-[11px] text-slate-500 block">
+                    Soma das assinaturas dos ADMs
+                  </span>
+                </div>
+
+                <div className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-1">
+                  <span className="text-xs text-slate-400 block">
+                    Mensalidades Pendentes / Atrasadas
+                  </span>
+                  <div
+                    className={`text-2xl font-bold font-mono tabular-nums ${
+                      unpaidAdms.length > 0 ? 'text-red-400' : 'text-slate-200'
+                    }`}
+                  >
+                    {unpaidAdms.length}
+                  </div>
+                  <span className="text-[11px] text-slate-500 block">
+                    {unpaidAdms.length === 0
+                      ? 'Todos os ADMs estão em dia'
+                      : 'Requer cobrança / regularização'}
+                  </span>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+                {/* Left Column: Create or Update Any Account (SUPERADMIN, ADM, Garçom) */}
+                <div className="lg:col-span-4 bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
+                  <div className="space-y-1">
+                    <h3 className="text-sm font-bold text-slate-100 flex items-center gap-2">
+                      <Users className="w-4 h-4 text-amber-400" />
+                      Cadastrar ou Editar Usuário (ADM / Garçom)
+                    </h3>
+                    <p className="text-xs text-slate-400">
+                      Defina se o usuário é <strong>ADM (Dono do Bar)</strong> ou{' '}
+                      <strong>Garçom</strong> e vincule ao código do bar.
+                    </p>
+                  </div>
+
+                  <form onSubmit={handleSuperAdminSaveAccount} className="space-y-3 text-xs">
+                    <div className="space-y-1">
+                      <label className="text-slate-300 block font-medium">Nome *</label>
+                      <input
+                        type="text"
+                        value={saUserName}
+                        onChange={(e) => setSaUserName(e.target.value)}
+                        placeholder="Ex: Dono do Bar ou Garçom"
+                        required
+                        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100"
+                      />
+                    </div>
+
+                    <div className="space-y-1">
+                      <label className="text-slate-300 block font-medium">E-mail de Login *</label>
+                      <input
+                        type="email"
+                        value={saUserEmail}
+                        onChange={(e) => setSaUserEmail(e.target.value)}
+                        placeholder="Ex: dono@bar.com"
+                        required
+                        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 font-mono"
+                      />
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2.5">
+                      <div className="space-y-1">
+                        <label className="text-slate-300 block font-medium">Tipo de Usuário</label>
+                        <select
+                          value={saUserRole}
+                          onChange={(e) =>
+                            setSaUserRole(e.target.value as 'SUPERADMIN' | 'ADM' | 'Garçom')
+                          }
+                          className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100"
+                        >
+                          <option value="ADM">ADM (Dono - Paga Mensalidade)</option>
+                          <option value="Garçom">Garçom (Funcionário)</option>
+                          <option value="SUPERADMIN">SUPERADMIN (Programador)</option>
+                        </select>
+                      </div>
+
+                      <div className="space-y-1">
+                        <label className="text-slate-300 block font-medium">Senha *</label>
+                        <input
+                          type="text"
+                          value={saUserPassword}
+                          onChange={(e) => setSaUserPassword(e.target.value)}
+                          placeholder="Mín. 4 dígitos"
+                          className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 font-mono"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-2.5">
+                      <div className="space-y-1">
+                        <label className="text-slate-300 block font-medium">Nome do Bar</label>
+                        <input
+                          type="text"
+                          value={saStoreName}
+                          onChange={(e) => setSaStoreName(e.target.value)}
+                          placeholder="Ex: Bar Central"
+                          required
+                          className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100"
+                        />
+                      </div>
+
+                      <div className="space-y-1">
+                        <label className="text-slate-300 block font-medium">Código do Bar</label>
+                        <input
+                          type="text"
+                          value={saStoreCode}
+                          onChange={(e) => setSaStoreCode(e.target.value)}
+                          placeholder="Ex: BAR-01"
+                          required
+                          className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 font-mono"
+                        />
+                      </div>
+                    </div>
+
+                    <button
+                      type="submit"
+                      disabled={saSaving}
+                      className="w-full py-2.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-lg transition-colors cursor-pointer"
+                    >
+                      {saSaving ? 'Salvando...' : 'Salvar Usuário / Senha'}
+                    </button>
+                  </form>
+                </div>
+
+                {/* Right Column: Users + Monthly Billing Table & Stores Table */}
+                <div className="lg:col-span-8 space-y-6">
+                  {/* Users & Monthly Fee Management */}
+                  <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                      <div>
+                        <h3 className="text-sm font-bold text-slate-100">
+                          Administração de Usuários (ADM vs Garçom) e Mensalidades
+                        </h3>
+                        <p className="text-xs text-slate-400">
+                          Filtre rapidamente quem é ADM ou Garçom e controle o pagamento das
+                          mensalidades.
+                        </p>
+                      </div>
+
+                      {/* Filter Tabs: All / ADM / Garçom / Inadimplentes */}
+                      <div className="flex flex-wrap items-center gap-1.5 text-xs">
+                        <button
+                          type="button"
+                          onClick={() => setSaRoleFilter('all')}
+                          className={`px-2.5 py-1.5 rounded-lg font-medium cursor-pointer ${
+                            saRoleFilter === 'all'
+                              ? 'bg-slate-800 text-slate-100'
+                              : 'bg-slate-950 text-slate-400 hover:text-slate-200'
+                          }`}
+                        >
+                          Todos ({superAccounts.length})
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setSaRoleFilter('ADM')}
+                          className={`px-2.5 py-1.5 rounded-lg font-semibold cursor-pointer ${
+                            saRoleFilter === 'ADM'
+                              ? 'bg-amber-500 text-slate-950'
+                              : 'bg-slate-950 text-amber-400 border border-amber-500/30'
+                          }`}
+                        >
+                          Somente ADMs ({admAccounts.length})
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setSaRoleFilter('Garçom')}
+                          className={`px-2.5 py-1.5 rounded-lg font-semibold cursor-pointer ${
+                            saRoleFilter === 'Garçom'
+                              ? 'bg-sky-500 text-slate-950'
+                              : 'bg-slate-950 text-sky-400 border border-sky-500/30'
+                          }`}
+                        >
+                          Somente Garçons ({waiterAccounts.length})
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setSaRoleFilter('inadimplentes')}
+                          className={`px-2.5 py-1.5 rounded-lg font-semibold cursor-pointer ${
+                            saRoleFilter === 'inadimplentes'
+                              ? 'bg-red-500 text-white'
+                              : 'bg-slate-950 text-red-400 border border-red-500/30'
+                          }`}
+                        >
+                          Pendentes / Atrasados ({unpaidAdms.length})
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="border border-slate-800 rounded-lg overflow-x-auto">
                       <table className="w-full text-left border-collapse text-xs">
                         <thead>
                           <tr className="bg-slate-950 border-b border-slate-800 text-slate-400">
-                            <th className="py-2.5 px-3 font-medium">Bar / Código</th>
-                            <th className="py-2.5 px-3 font-medium">Comandas</th>
-                            <th className="py-2.5 px-3 font-medium">Cardápio</th>
-                            <th className="py-2.5 px-3 font-medium text-right">Controle</th>
+                            <th className="py-2.5 px-3 font-medium">Usuário / E-mail</th>
+                            <th className="py-2.5 px-3 font-medium">Tipo (ADM / Garçom)</th>
+                            <th className="py-2.5 px-3 font-medium">Bar Vinculado</th>
+                            <th className="py-2.5 px-3 font-medium">Mensalidade & Status</th>
+                            <th className="py-2.5 px-3 font-medium text-right">Cobrança & Ações</th>
                           </tr>
                         </thead>
                         <tbody className="divide-y divide-slate-800/70 bg-slate-950/40">
-                          {superStores.map((st) => {
-                            const isCurrent = st.storeCode === currentStoreCode;
+                          {filteredSuperAccounts.map((acc) => {
+                            const status = acc.subscriptionStatus || 'em_dia';
+                            const fee = typeof acc.monthlyFee === 'number' ? acc.monthlyFee : 99.9;
                             return (
-                              <tr key={st.storeCode} className="hover:bg-slate-800/30">
-                                <td className="py-2.5 px-3 font-semibold text-slate-100">
-                                  {st.storeName}{' '}
-                                  <span className="font-mono text-amber-400">({st.storeCode})</span>
+                              <tr key={acc.email} className="hover:bg-slate-800/30">
+                                <td className="py-3 px-3">
+                                  <div className="font-semibold text-slate-100">{acc.userName}</div>
+                                  <div className="font-mono text-[11px] text-slate-400">
+                                    {acc.email}
+                                  </div>
                                 </td>
-                                <td className="py-2.5 px-3 font-mono text-slate-300">
-                                  {st.tabsCount} ativas · {formatBRL(st.totalConsumed)}
-                                </td>
-                                <td className="py-2.5 px-3 text-slate-400">
-                                  {st.menuCount} itens · {st.operatorsCount} garçons
-                                </td>
-                                <td className="py-2.5 px-3 text-right space-x-2 whitespace-nowrap">
-                                  <button
-                                    type="button"
-                                    onClick={() =>
-                                      handleSuperAdminSwitchStore(st.storeCode, st.storeName)
+                                <td className="py-3 px-3">
+                                  <span
+                                    className={
+                                      acc.userRole === 'SUPERADMIN'
+                                        ? 'text-emerald-400 font-bold'
+                                        : acc.userRole === 'ADM'
+                                          ? 'text-amber-400 font-bold'
+                                          : 'text-sky-400 font-semibold'
                                     }
-                                    className={`px-2.5 py-1 rounded font-bold cursor-pointer ${
-                                      isCurrent
-                                        ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
-                                        : 'bg-amber-500 text-slate-950 hover:bg-amber-400'
-                                    }`}
                                   >
-                                    {isCurrent ? 'Bar Ativo' : 'Acessar Bar'}
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={() =>
-                                      handleSuperAdminStoreAction('clear_tabs', st.storeCode)
-                                    }
-                                    className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded cursor-pointer"
-                                  >
-                                    Zerar Comandas
-                                  </button>
+                                    {acc.userRole === 'ADM'
+                                      ? 'ADM (Dono do Bar)'
+                                      : acc.userRole === 'Garçom'
+                                        ? 'Garçom (Funcionário)'
+                                        : 'SUPERADMIN'}
+                                  </span>
+                                </td>
+                                <td className="py-3 px-3 text-slate-300">
+                                  <div>{acc.storeName}</div>
+                                  <div className="font-mono text-[11px] text-slate-400">
+                                    Código: {acc.storeCode}
+                                  </div>
+                                </td>
+                                <td className="py-3 px-3">
+                                  {acc.userRole === 'ADM' ? (
+                                    editingBillingEmail === acc.email ? (
+                                      <div className="space-y-1.5 bg-slate-900 p-2 rounded border border-slate-700">
+                                        <div className="flex items-center gap-1.5">
+                                          <input
+                                            type="text"
+                                            value={billingFeeInput}
+                                            onChange={(e) => setBillingFeeInput(e.target.value)}
+                                            placeholder="Valor R$"
+                                            className="w-20 bg-slate-950 border border-slate-700 rounded px-2 py-1 text-slate-100 font-mono"
+                                          />
+                                          <input
+                                            type="text"
+                                            value={billingDueInput}
+                                            onChange={(e) => setBillingDueInput(e.target.value)}
+                                            placeholder="Vencimento"
+                                            className="w-28 bg-slate-950 border border-slate-700 rounded px-2 py-1 text-slate-100"
+                                          />
+                                        </div>
+                                        <div className="flex items-center gap-1.5">
+                                          <select
+                                            value={billingStatusInput}
+                                            onChange={(e) =>
+                                              setBillingStatusInput(
+                                                e.target.value as SubscriptionStatusType
+                                              )
+                                            }
+                                            className="bg-slate-950 border border-slate-700 rounded px-2 py-1 text-slate-100"
+                                          >
+                                            <option value="em_dia">Em Dia (Pago)</option>
+                                            <option value="pendente">Pendente</option>
+                                            <option value="atrasado">Atrasado</option>
+                                            <option value="bloqueado">Bloqueado</option>
+                                          </select>
+                                          <button
+                                            type="button"
+                                            onClick={() => {
+                                              const parsedFee = parseFloat(
+                                                billingFeeInput.replace(',', '.')
+                                              );
+                                              handleSuperAdminUpdateBilling(acc.email, {
+                                                monthlyFee: Number.isFinite(parsedFee)
+                                                  ? parsedFee
+                                                  : 99.9,
+                                                billingDueDate: billingDueInput,
+                                                subscriptionStatus: billingStatusInput,
+                                              });
+                                            }}
+                                            className="px-2 py-1 bg-emerald-500 text-slate-950 font-bold rounded cursor-pointer"
+                                          >
+                                            Salvar
+                                          </button>
+                                          <button
+                                            type="button"
+                                            onClick={() => setEditingBillingEmail(null)}
+                                            className="text-slate-400 px-1 cursor-pointer"
+                                          >
+                                            ✕
+                                          </button>
+                                        </div>
+                                      </div>
+                                    ) : (
+                                      <div className="space-y-0.5 font-mono tabular-nums">
+                                        <div className="font-bold text-slate-100">
+                                          {formatBRL(fee)}{' '}
+                                          <span className="text-[11px] font-normal text-slate-400 font-sans">
+                                            ({acc.billingDueDate || 'Todo dia 10'})
+                                          </span>
+                                        </div>
+                                        <div>
+                                          <span
+                                            className={
+                                              status === 'em_dia'
+                                                ? 'text-emerald-400 font-semibold'
+                                                : status === 'pendente'
+                                                  ? 'text-amber-400 font-semibold'
+                                                  : 'text-red-400 font-bold'
+                                            }
+                                          >
+                                            {status === 'em_dia'
+                                              ? '● Em Dia (Paga)'
+                                              : status === 'pendente'
+                                                ? '● Pendente'
+                                                : status === 'atrasado'
+                                                  ? '▲ Atrasada'
+                                                  : '✖ Bloqueado'}
+                                          </span>
+                                        </div>
+                                      </div>
+                                    )
+                                  ) : (
+                                    <span className="text-slate-500">
+                                      Isento (Incluso no Bar)
+                                    </span>
+                                  )}
+                                </td>
+                                <td className="py-3 px-3 text-right space-x-2 whitespace-nowrap">
+                                  {resettingAccountEmail === acc.email ? (
+                                    <span className="inline-flex items-center gap-1">
+                                      <input
+                                        type="text"
+                                        value={inlineNewPassword}
+                                        onChange={(e) => setInlineNewPassword(e.target.value)}
+                                        placeholder="Nova senha"
+                                        className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-100 w-24"
+                                      />
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          handleQuickResetUserPassword(acc.email, acc.userName)
+                                        }
+                                        className="px-2 py-1 bg-emerald-500 text-slate-950 font-bold rounded cursor-pointer"
+                                      >
+                                        OK
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setResettingAccountEmail(null);
+                                          setInlineNewPassword('');
+                                        }}
+                                        className="text-slate-400 px-1 cursor-pointer"
+                                      >
+                                        ✕
+                                      </button>
+                                    </span>
+                                  ) : (
+                                    <>
+                                      {acc.userRole === 'ADM' && (
+                                        <>
+                                          {status !== 'em_dia' ? (
+                                            <button
+                                              type="button"
+                                              onClick={() =>
+                                                handleSuperAdminUpdateBilling(acc.email, {
+                                                  markPaidNow: true,
+                                                })
+                                              }
+                                              className="px-2.5 py-1 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold rounded cursor-pointer"
+                                              title="Confirmar pagamento da mensalidade"
+                                            >
+                                              Dar Baixa Mensalidade
+                                            </button>
+                                          ) : (
+                                            <button
+                                              type="button"
+                                              onClick={() =>
+                                                handleSuperAdminUpdateBilling(acc.email, {
+                                                  subscriptionStatus: 'pendente',
+                                                })
+                                              }
+                                              className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-amber-300 rounded cursor-pointer"
+                                              title="Marcar mensalidade do mês como pendente"
+                                            >
+                                              Gerar Cobrança
+                                            </button>
+                                          )}
+                                          <button
+                                            type="button"
+                                            onClick={() => handleCopyBillingMessage(acc)}
+                                            className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded cursor-pointer"
+                                            title="Copiar lembrete de mensalidade para WhatsApp"
+                                          >
+                                            Cobrar
+                                          </button>
+                                          <button
+                                            type="button"
+                                            onClick={() => {
+                                              setEditingBillingEmail(acc.email);
+                                              setBillingFeeInput(
+                                                fee.toFixed(2).replace('.', ',')
+                                              );
+                                              setBillingDueInput(
+                                                acc.billingDueDate || 'Todo dia 10'
+                                              );
+                                              setBillingStatusInput(status);
+                                            }}
+                                            className="text-amber-400 hover:underline font-medium cursor-pointer"
+                                          >
+                                            Valor/Status
+                                          </button>
+                                        </>
+                                      )}
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setResettingAccountEmail(acc.email);
+                                          setInlineNewPassword('');
+                                        }}
+                                        className="text-sky-400 hover:underline font-medium cursor-pointer"
+                                      >
+                                        Senha
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setSaUserName(acc.userName);
+                                          setSaUserEmail(acc.email);
+                                          setSaUserRole(acc.userRole);
+                                          setSaStoreName(acc.storeName);
+                                          setSaStoreCode(acc.storeCode);
+                                          setSaUserPassword('');
+                                        }}
+                                        className="text-slate-300 hover:underline font-medium cursor-pointer"
+                                      >
+                                        Editar
+                                      </button>
+                                      {acc.userRole !== 'SUPERADMIN' && (
+                                        <button
+                                          type="button"
+                                          onClick={() => handleSuperAdminDeleteAccount(acc.email)}
+                                          className="text-slate-400 hover:text-red-400 cursor-pointer"
+                                          title="Excluir usuário"
+                                        >
+                                          <Trash2 className="w-3.5 h-3.5 inline" />
+                                        </button>
+                                      )}
+                                    </>
+                                  )}
                                 </td>
                               </tr>
                             );
@@ -4826,130 +5853,87 @@ function ComandaVozWorkspace() {
                         </tbody>
                       </table>
                     </div>
-                  )}
-                </div>
+                  </div>
 
-                {/* All Accounts List */}
-                <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-3">
-                  <h3 className="text-sm font-bold text-slate-100">
-                    Todos os Usuários e Senhas ({superAccounts.length})
-                  </h3>
+                  {/* Stores List */}
+                  <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-3">
+                    <h3 className="text-sm font-bold text-slate-100">
+                      Todos os Bares Cadastrados ({superStores.length})
+                    </h3>
 
-                  <div className="border border-slate-800 rounded-lg overflow-hidden">
-                    <table className="w-full text-left border-collapse text-xs">
-                      <thead>
-                        <tr className="bg-slate-950 border-b border-slate-800 text-slate-400">
-                          <th className="py-2.5 px-3 font-medium">Usuário / E-mail</th>
-                          <th className="py-2.5 px-3 font-medium">Cargo</th>
-                          <th className="py-2.5 px-3 font-medium">Bar</th>
-                          <th className="py-2.5 px-3 font-medium text-right">Ações</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-slate-800/70 bg-slate-950/40">
-                        {superAccounts.map((acc) => (
-                          <tr key={acc.email} className="hover:bg-slate-800/30">
-                            <td className="py-2.5 px-3">
-                              <div className="font-semibold text-slate-100">{acc.userName}</div>
-                              <div className="font-mono text-[11px] text-slate-400">
-                                {acc.email}
-                              </div>
-                            </td>
-                            <td className="py-2.5 px-3">
-                              <span
-                                className={
-                                  acc.userRole === 'SUPERADMIN'
-                                    ? 'text-emerald-400 font-bold'
-                                    : acc.userRole === 'ADM'
-                                      ? 'text-amber-400 font-bold'
-                                      : 'text-slate-300'
-                                }
-                              >
-                                {acc.userRole}
-                              </span>
-                            </td>
-                            <td className="py-2.5 px-3 text-slate-300">
-                              {acc.storeName}{' '}
-                              <span className="font-mono text-slate-400">({acc.storeCode})</span>
-                            </td>
-                            <td className="py-2.5 px-3 text-right space-x-2 whitespace-nowrap">
-                              {resettingAccountEmail === acc.email ? (
-                                <span className="inline-flex items-center gap-1">
-                                  <input
-                                    type="text"
-                                    value={inlineNewPassword}
-                                    onChange={(e) => setInlineNewPassword(e.target.value)}
-                                    placeholder="Nova senha"
-                                    className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-100 w-24"
-                                  />
-                                  <button
-                                    type="button"
-                                    onClick={() =>
-                                      handleQuickResetUserPassword(acc.email, acc.userName)
-                                    }
-                                    className="px-2 py-1 bg-emerald-500 text-slate-950 font-bold rounded cursor-pointer"
-                                  >
-                                    OK
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={() => {
-                                      setResettingAccountEmail(null);
-                                      setInlineNewPassword('');
-                                    }}
-                                    className="text-slate-400 px-1 cursor-pointer"
-                                  >
-                                    ✕
-                                  </button>
-                                </span>
-                              ) : (
-                                <>
-                                  <button
-                                    type="button"
-                                    onClick={() => {
-                                      setResettingAccountEmail(acc.email);
-                                      setInlineNewPassword('');
-                                    }}
-                                    className="text-sky-400 hover:underline font-medium cursor-pointer"
-                                  >
-                                    Trocar Senha
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={() => {
-                                      setSaUserName(acc.userName);
-                                      setSaUserEmail(acc.email);
-                                      setSaUserRole(acc.userRole);
-                                      setSaStoreName(acc.storeName);
-                                      setSaStoreCode(acc.storeCode);
-                                      setSaUserPassword('');
-                                    }}
-                                    className="text-amber-400 hover:underline font-medium cursor-pointer"
-                                  >
-                                    Editar
-                                  </button>
-                                  {acc.userRole !== 'SUPERADMIN' && (
+                    {superStores.length === 0 ? (
+                      <p className="text-xs text-slate-400">Nenhum bar registrado ainda.</p>
+                    ) : (
+                      <div className="border border-slate-800 rounded-lg overflow-x-auto">
+                        <table className="w-full text-left border-collapse text-xs">
+                          <thead>
+                            <tr className="bg-slate-950 border-b border-slate-800 text-slate-400">
+                              <th className="py-2.5 px-3 font-medium">Bar / Código</th>
+                              <th className="py-2.5 px-3 font-medium">Equipe (ADM / Garçons)</th>
+                              <th className="py-2.5 px-3 font-medium">Movimento</th>
+                              <th className="py-2.5 px-3 font-medium text-right">Controle</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-800/70 bg-slate-950/40">
+                            {superStores.map((st) => {
+                              const isCurrent = st.storeCode === currentStoreCode;
+                              return (
+                                <tr key={st.storeCode} className="hover:bg-slate-800/30">
+                                  <td className="py-2.5 px-3 font-semibold text-slate-100">
+                                    {st.storeName}{' '}
+                                    <span className="font-mono text-amber-400">
+                                      ({st.storeCode})
+                                    </span>
+                                  </td>
+                                  <td className="py-2.5 px-3 text-slate-300">
+                                    <span className="text-amber-400 font-semibold">
+                                      {st.admCount ?? 1} ADM
+                                    </span>{' '}
+                                    ·{' '}
+                                    <span className="text-sky-400 font-semibold">
+                                      {st.operatorsCount} Garçons
+                                    </span>
+                                  </td>
+                                  <td className="py-2.5 px-3 font-mono text-slate-300">
+                                    {st.tabsCount} comandas · {formatBRL(st.totalConsumed)}
+                                  </td>
+                                  <td className="py-2.5 px-3 text-right space-x-2 whitespace-nowrap">
                                     <button
                                       type="button"
-                                      onClick={() => handleSuperAdminDeleteAccount(acc.email)}
-                                      className="text-slate-400 hover:text-red-400 cursor-pointer"
-                                      title="Excluir usuário"
+                                      onClick={() =>
+                                        handleSuperAdminSwitchStore(st.storeCode, st.storeName)
+                                      }
+                                      className={`px-2.5 py-1 rounded font-bold cursor-pointer ${
+                                        isCurrent
+                                          ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                                          : 'bg-amber-500 text-slate-950 hover:bg-amber-400'
+                                      }`}
                                     >
-                                      <Trash2 className="w-3.5 h-3.5 inline" />
+                                      {isCurrent ? 'Bar Ativo' : 'Acessar Bar'}
                                     </button>
-                                  )}
-                                </>
-                              )}
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
+                                    <button
+                                      type="button"
+                                      onClick={() =>
+                                        handleSuperAdminStoreAction('clear_tabs', st.storeCode)
+                                      }
+                                      className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded cursor-pointer"
+                                    >
+                                      Zerar Comandas
+                                    </button>
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
                   </div>
                 </div>
               </div>
             </div>
-          </div>
-        )}
+          );
+        })()}
       </main>
     </div>
   );
