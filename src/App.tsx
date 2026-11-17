@@ -46,6 +46,12 @@ import {
   FileSpreadsheet,
   Store,
   UserCheck,
+  Lock,
+  Mail,
+  KeyRound,
+  Edit3,
+  Eye,
+  EyeOff,
 } from 'lucide-react';
 import {
   auth,
@@ -122,8 +128,19 @@ type ActiveSection = 'comandas' | 'equipe_comercio' | 'auditoria' | 'cardapio';
 
 interface DirectBarSession {
   uid: string;
+  email: string;
   userName: string;
   userRole: UserRoleType;
+  storeName: string;
+  storeCode: string;
+}
+
+interface LocalAccountBackup {
+  uid: string;
+  email: string;
+  passwordPlainOrHash: string;
+  userName: string;
+  userRole: 'ADM' | 'Garçom';
   storeName: string;
   storeCode: string;
 }
@@ -158,7 +175,8 @@ interface MarceloReportCard {
   remainingBalance: number;
 }
 
-const DIRECT_SESSION_STORAGE_KEY = 'comanda_voz_direct_session_v1';
+const DIRECT_SESSION_STORAGE_KEY = 'comanda_voz_direct_session_v2';
+const LOCAL_ACCOUNTS_BACKUP_KEY = 'comanda_voz_accounts_backup_v1';
 
 const MARCELO_VOICE_EXAMPLES = [
   'Marcelo, marca 1 litrão para Thiago, marca 1 litrão para Jonas',
@@ -217,6 +235,41 @@ function getRemainingBalance(tab: BarTab): number {
   return Math.max(0, Number((tab.totalAmount - paid).toFixed(2)));
 }
 
+function loadLocalAccountsBackup(): LocalAccountBackup[] {
+  try {
+    const raw = localStorage.getItem(LOCAL_ACCOUNTS_BACKUP_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveAccountToLocalBackup(acc: LocalAccountBackup) {
+  try {
+    const list = loadLocalAccountsBackup().filter(
+      (a) => a.email.toLowerCase() !== acc.email.toLowerCase()
+    );
+    list.push(acc);
+    localStorage.setItem(LOCAL_ACCOUNTS_BACKUP_KEY, JSON.stringify(list));
+  } catch {
+    // ignore storage errors
+  }
+}
+
+function removeAccountFromLocalBackup(email?: string) {
+  if (!email) return;
+  try {
+    const list = loadLocalAccountsBackup().filter(
+      (a) => a.email.toLowerCase() !== email.toLowerCase()
+    );
+    localStorage.setItem(LOCAL_ACCOUNTS_BACKUP_KEY, JSON.stringify(list));
+  } catch {
+    // ignore
+  }
+}
+
 function ComandaVozWorkspace() {
   const [firebaseUser, setFirebaseUser] = useState<User | null>(null);
   const [directSession, setDirectSession] = useState<DirectBarSession | null>(() => {
@@ -235,7 +288,22 @@ function ComandaVozWorkspace() {
   const [authReady, setAuthReady] = useState(false);
   const [activeSection, setActiveSection] = useState<ActiveSection>('comandas');
 
-  // Login Screen State (Google Error Diagnostic + Direct Bar Access on Render)
+  // Email & Password Auth State (Login Tab vs Register ADM Tab)
+  const [authTab, setAuthTab] = useState<'login' | 'register_adm'>('login');
+  const [loginEmail, setLoginEmail] = useState('');
+  const [loginPassword, setLoginPassword] = useState('');
+  const [showPassword, setShowPassword] = useState(false);
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authFormError, setAuthFormError] = useState<string | null>(null);
+
+  // Register ADM Form State
+  const [regAdmName, setRegAdmName] = useState('');
+  const [regAdmEmail, setRegAdmEmail] = useState('');
+  const [regAdmPassword, setRegAdmPassword] = useState('');
+  const [regStoreName, setRegStoreName] = useState('Bar & Comércio Central');
+  const [regStoreCode, setRegStoreCode] = useState('BAR-01');
+
+  // Google Auth Error Diagnostic State
   const [googleLoginBusy, setGoogleLoginBusy] = useState(false);
   const [googleAuthError, setGoogleAuthError] = useState<{
     code: string;
@@ -243,12 +311,8 @@ function ComandaVozWorkspace() {
     message: string;
   } | null>(null);
   const [copiedDomain, setCopiedDomain] = useState(false);
-  const [directNameInput, setDirectNameInput] = useState('Operador Principal');
-  const [directRoleInput, setDirectRoleInput] = useState<UserRoleType>('Proprietário');
-  const [directStoreNameInput, setDirectStoreNameInput] = useState('Bar & Comércio Central');
-  const [directStoreCodeInput, setDirectStoreCodeInput] = useState('BAR-01');
 
-  // Unified user accessor (works for both Firebase Auth User and Render Direct Session)
+  // Unified user accessor (works for both Email/Password Session and Firebase Auth User)
   const isDirectSession = !firebaseUser && Boolean(directSession);
   const user = useMemo(() => {
     if (firebaseUser) return firebaseUser;
@@ -256,7 +320,7 @@ function ComandaVozWorkspace() {
       return {
         uid: directSession.uid,
         displayName: directSession.userName,
-        email: `${directSession.storeCode.toLowerCase()}@comandavoz.bar`,
+        email: directSession.email || `${directSession.storeCode.toLowerCase()}@comandavoz.bar`,
       } as User;
     }
     return null;
@@ -269,15 +333,32 @@ function ComandaVozWorkspace() {
   const [tabItems, setTabItems] = useState<TabItem[]>([]);
   const [voiceOperators, setVoiceOperators] = useState<VoiceOperator[]>([]);
   const [dataLoading, setDataLoading] = useState(true);
-  const [seedingMenu, setSeedingMenu] = useState(false);
+
+  // Mutation Lock Refs to prevent background polling from overwriting Cardápio / Tab edits
+  const isMutatingRef = useRef(false);
+  const lastMutationMsRef = useRef(0);
 
   // Active Waiter / User Selector & Store Profile Form
   const [selectedWaiterId, setSelectedWaiterId] = useState<string>('logged_user');
   const [profileUserName, setProfileUserName] = useState('');
-  const [profileUserRole, setProfileUserRole] = useState<UserRoleType>('Proprietário');
+  const [profileUserRole, setProfileUserRole] = useState<UserRoleType>('ADM');
   const [profileStoreName, setProfileStoreName] = useState('');
   const [profileStoreCode, setProfileStoreCode] = useState('');
   const [savingProfile, setSavingProfile] = useState(false);
+
+  // Strict Role-Based Access Control (RBAC):
+  // ADM ('ADM' or 'Proprietário') has full control.
+  // Garçom ('Garçom') can ONLY add items, NEVER remove anything or manage Cardápio/Garçons.
+  const currentUserRole: UserRoleType = useMemo(() => {
+    if (directSession?.userRole) return directSession.userRole;
+    if (userProfile?.userRole) return userProfile.userRole;
+    return 'ADM';
+  }, [directSession, userProfile]);
+
+  const isAdmin = useMemo(
+    () => currentUserRole === 'ADM' || currentUserRole === 'Proprietário',
+    [currentUserRole]
+  );
 
   // Marcelo Assistant & Security State
   const [commandInput, setCommandInput] = useState('');
@@ -320,34 +401,40 @@ function ComandaVozWorkspace() {
   const [selectedPaymentMethod, setSelectedPaymentMethod] = useState('PIX');
   const [baixaKeepConsuming, setBaixaKeepConsuming] = useState(false);
 
-  // Voice Operator / Waiter Registration State
+  // ADM Waiter Registration State (Email + Senha + Optional Voice Biometrics)
   const [newOpName, setNewOpName] = useState('');
-  const [newOpRole, setNewOpRole] = useState('Garçom');
+  const [newOpEmail, setNewOpEmail] = useState('');
+  const [newOpPassword, setNewOpPassword] = useState('');
   const [newOpPin, setNewOpPin] = useState('');
   const [trainingSamples, setTrainingSamples] = useState<AcousticSample[]>([]);
   const [isRecordingSample, setIsRecordingSample] = useState(false);
+  const [registeringWaiter, setRegisteringWaiter] = useState(false);
 
-  // New Menu Item Form State
+  // Cardápio (Menu Item) Create & Edit Form State
+  const [editingMenuId, setEditingMenuId] = useState<string | null>(null);
   const [newMenuName, setNewMenuName] = useState('');
   const [newMenuCategory, setNewMenuCategory] = useState<ItemCategory>('cervejas');
   const [newMenuPrice, setNewMenuPrice] = useState('');
   const [newMenuSynonyms, setNewMenuSynonyms] = useState('');
+  const [savingMenu, setSavingMenu] = useState(false);
 
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
   const continuousModeRef = useRef(continuousMode);
   continuousModeRef.current = continuousMode;
 
-  // Helper to persist Direct Render Store snapshot to localStorage + Render Express server
-  const syncDirectStoreSnapshot = async (
-    nextData: {
-      storeCode?: string;
-      storeName?: string;
-      menuItems?: MenuItem[];
-      tabs?: BarTab[];
-      tabItems?: TabItem[];
-      voiceOperators?: VoiceOperator[];
-    }
-  ) => {
+  // Helper to persist Store snapshot to localStorage + Express server with RBAC headers
+  const syncDirectStoreSnapshot = async (nextData: {
+    storeCode?: string;
+    storeName?: string;
+    menuItems?: MenuItem[];
+    tabs?: BarTab[];
+    tabItems?: TabItem[];
+    voiceOperators?: VoiceOperator[];
+    actionType?: 'add' | 'remove' | 'catalog';
+  }) => {
+    isMutatingRef.current = true;
+    lastMutationMsRef.current = Date.now();
+
     const code = sanitizeStoreCode(
       nextData.storeCode || directSession?.storeCode || profileStoreCode || 'BAR-01'
     );
@@ -355,20 +442,31 @@ function ComandaVozWorkspace() {
       nextData.storeName || directSession?.storeName || profileStoreName || 'Bar & Comércio Central',
       VALIDATION_LIMITS.STORE_NAME_MAX_LEN
     );
+    const updatedMenu = nextData.menuItems ?? menuItems;
+    const updatedTabs = nextData.tabs ?? tabs;
+    const updatedTabItems = nextData.tabItems ?? tabItems;
+    const updatedOperators = nextData.voiceOperators ?? voiceOperators;
+
     const payload = {
       storeCode: code,
       storeName: sName,
-      menuItems: nextData.menuItems ?? menuItems,
-      tabs: nextData.tabs ?? tabs,
-      tabItems: nextData.tabItems ?? tabItems,
-      voiceOperators: nextData.voiceOperators ?? voiceOperators,
+      catalogInitialized: true,
+      menuItems: updatedMenu,
+      tabs: updatedTabs,
+      tabItems: updatedTabItems,
+      voiceOperators: updatedOperators,
+      callerRole: isAdmin ? 'ADM' : 'Garçom',
+      actionType: nextData.actionType || 'add',
       updatedAtMs: Date.now(),
     };
+
     try {
       localStorage.setItem(`comanda_voz_store_${code}`, JSON.stringify(payload));
+      localStorage.setItem(`comanda_voz_catalog_init_${code}`, 'true');
     } catch {
       // ignore storage quota errors
     }
+
     try {
       await fetch(`/api/store/${encodeURIComponent(code)}`, {
         method: 'POST',
@@ -377,6 +475,190 @@ function ComandaVozWorkspace() {
       });
     } catch {
       // offline fallback handled by localStorage
+    } finally {
+      lastMutationMsRef.current = Date.now();
+      isMutatingRef.current = false;
+    }
+  };
+
+  // Email & Password Login Handler (For both ADM and Garçom registered by ADM)
+  const handleEmailPasswordLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthFormError(null);
+    const cleanEmail = loginEmail.trim().toLowerCase();
+    const cleanPass = loginPassword.trim();
+
+    if (!cleanEmail || !cleanPass) {
+      setAuthFormError('Informe seu e-mail e senha para entrar.');
+      return;
+    }
+
+    setAuthBusy(true);
+    try {
+      const response = await fetch('/api/auth/login', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: cleanEmail, password: cleanPass }),
+      });
+
+      if (response.ok) {
+        const data = (await response.json()) as {
+          ok: boolean;
+          account: {
+            uid: string;
+            email: string;
+            userName: string;
+            userRole: UserRoleType;
+            storeName: string;
+            storeCode: string;
+          };
+        };
+        if (data.ok && data.account) {
+          const session: DirectBarSession = {
+            uid: data.account.uid,
+            email: data.account.email,
+            userName: data.account.userName,
+            userRole: data.account.userRole,
+            storeName: data.account.storeName,
+            storeCode: data.account.storeCode,
+          };
+          localStorage.setItem(DIRECT_SESSION_STORAGE_KEY, JSON.stringify(session));
+          saveAccountToLocalBackup({
+            uid: session.uid,
+            email: session.email,
+            passwordPlainOrHash: cleanPass,
+            userName: session.userName,
+            userRole: session.userRole === 'Garçom' ? 'Garçom' : 'ADM',
+            storeName: session.storeName,
+            storeCode: session.storeCode,
+          });
+          setDirectSession(session);
+          setLoginPassword('');
+          return;
+        }
+      }
+
+      // Check local backup in case Render free-tier container restarted and lost memory
+      const backupMatch = loadLocalAccountsBackup().find(
+        (acc) =>
+          acc.email.toLowerCase() === cleanEmail && acc.passwordPlainOrHash === cleanPass
+      );
+
+      if (backupMatch) {
+        // Re-register on server transparently
+        if (backupMatch.userRole === 'ADM') {
+          await fetch('/api/auth/register-admin', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              userName: backupMatch.userName,
+              email: backupMatch.email,
+              password: cleanPass,
+              storeName: backupMatch.storeName,
+              storeCode: backupMatch.storeCode,
+            }),
+          }).catch(() => {});
+        }
+        const session: DirectBarSession = {
+          uid: backupMatch.uid,
+          email: backupMatch.email,
+          userName: backupMatch.userName,
+          userRole: backupMatch.userRole,
+          storeName: backupMatch.storeName,
+          storeCode: backupMatch.storeCode,
+        };
+        localStorage.setItem(DIRECT_SESSION_STORAGE_KEY, JSON.stringify(session));
+        setDirectSession(session);
+        setLoginPassword('');
+        return;
+      }
+
+      const errData = (await response.json().catch(() => ({}))) as { error?: string };
+      setAuthFormError(
+        errData.error ||
+          'E-mail ou senha incorretos. Se você é o dono do bar, clique na aba "Criar Conta ADM" ao lado.'
+      );
+    } catch {
+      setAuthFormError('Erro de conexão ao validar login. Tente novamente.');
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  // Register ADM Account (Email & Password + Bar Info)
+  const handleRegisterAdminAccount = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthFormError(null);
+
+    const cleanName = sanitizeString(regAdmName, VALIDATION_LIMITS.OPERATOR_NAME_MAX_LEN);
+    const cleanEmail = regAdmEmail.trim().toLowerCase();
+    const cleanPass = regAdmPassword.trim();
+    const cleanStore = sanitizeString(regStoreName, VALIDATION_LIMITS.STORE_NAME_MAX_LEN);
+    const cleanCode = sanitizeStoreCode(regStoreCode, 'BAR-01');
+
+    if (!cleanName || !cleanEmail.includes('@') || cleanPass.length < 4) {
+      setAuthFormError('Preencha seu nome, um e-mail válido e uma senha de pelo menos 4 caracteres.');
+      return;
+    }
+
+    setAuthBusy(true);
+    try {
+      const response = await fetch('/api/auth/register-admin', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          userName: cleanName,
+          email: cleanEmail,
+          password: cleanPass,
+          storeName: cleanStore,
+          storeCode: cleanCode,
+        }),
+      });
+
+      const data = (await response.json().catch(() => ({}))) as {
+        ok?: boolean;
+        error?: string;
+        account?: {
+          uid: string;
+          email: string;
+          userName: string;
+          userRole: UserRoleType;
+          storeName: string;
+          storeCode: string;
+        };
+      };
+
+      if (!response.ok || !data.ok || !data.account) {
+        setAuthFormError(data.error || 'Não foi possível criar a conta ADM.');
+        return;
+      }
+
+      const session: DirectBarSession = {
+        uid: data.account.uid,
+        email: data.account.email,
+        userName: data.account.userName,
+        userRole: 'ADM',
+        storeName: data.account.storeName,
+        storeCode: data.account.storeCode,
+      };
+
+      localStorage.setItem(DIRECT_SESSION_STORAGE_KEY, JSON.stringify(session));
+      saveAccountToLocalBackup({
+        uid: session.uid,
+        email: session.email,
+        passwordPlainOrHash: cleanPass,
+        userName: session.userName,
+        userRole: 'ADM',
+        storeName: session.storeName,
+        storeCode: session.storeCode,
+      });
+
+      setDirectSession(session);
+      setRegAdmPassword('');
+    } catch {
+      setAuthFormError('Erro ao criar conta ADM. Verifique sua conexão.');
+    } finally {
+      setAuthBusy(false);
     }
   };
 
@@ -407,48 +689,18 @@ function ComandaVozWorkspace() {
         setGoogleAuthError({
           code: 'auth/unauthorized-domain',
           domain: currentDomain,
-          message: `O domínio "${currentDomain}" ainda não está na lista de domínios autorizados do Firebase para abrir o pop-up do Google. Use o Acesso Direto do Bar ao lado para entrar imediatamente no Render ou adicione o domínio no Firebase Console.`,
+          message: `O domínio "${currentDomain}" não está autorizado para pop-up do Google. Use o Login por E-mail e Senha ao lado para entrar imediatamente como ADM ou Garçom.`,
         });
       } else if (code !== 'auth/popup-closed-by-user') {
         setGoogleAuthError({
           code,
           domain: currentDomain,
-          message: `Não foi possível abrir o login Google (${code}). Você pode entrar agora mesmo usando o Acesso Direto do Bar / Comércio ao lado.`,
+          message: `Não foi possível abrir o login Google (${code}). Use o Login por E-mail e Senha ao lado.`,
         });
       }
     } finally {
       setGoogleLoginBusy(false);
     }
-  };
-
-  // Direct Bar Login Handler (Works immediately on Render without Google OAuth domain restrictions)
-  const handleDirectBarLogin = (e?: React.FormEvent) => {
-    if (e) e.preventDefault();
-    const cleanName = sanitizeString(
-      directNameInput,
-      VALIDATION_LIMITS.OPERATOR_NAME_MAX_LEN,
-      'Operador Principal'
-    );
-    const cleanStore = sanitizeString(
-      directStoreNameInput,
-      VALIDATION_LIMITS.STORE_NAME_MAX_LEN,
-      'Bar & Comércio Central'
-    );
-    const cleanCode = sanitizeStoreCode(directStoreCodeInput, 'BAR-01');
-    const session: DirectBarSession = {
-      uid: `bar_${cleanCode.toLowerCase().replace(/[^a-z0-9]/g, '')}`,
-      userName: cleanName,
-      userRole: directRoleInput,
-      storeName: cleanStore,
-      storeCode: cleanCode,
-    };
-    try {
-      localStorage.setItem(DIRECT_SESSION_STORAGE_KEY, JSON.stringify(session));
-    } catch {
-      // ignore
-    }
-    setDirectSession(session);
-    setGoogleAuthError(null);
   };
 
   const handleSignOutAll = async () => {
@@ -458,6 +710,7 @@ function ComandaVozWorkspace() {
       // ignore
     }
     setDirectSession(null);
+    setSelectedWaiterId('logged_user');
     if (firebaseUser) {
       await logoutUser();
     }
@@ -473,7 +726,7 @@ function ComandaVozWorkspace() {
     return () => unsub();
   }, []);
 
-  // 2A. Direct Render Mode Loader & Real-Time Polling Sync
+  // 2A. Email/Password Session Loader & Real-Time Polling Sync (With Mutation Lock & Zero Unwanted Reseed!)
   useEffect(() => {
     if (!authReady || firebaseUser || !directSession) return;
     setDataLoading(true);
@@ -483,6 +736,7 @@ function ComandaVozWorkspace() {
     const initialProfile: UserProfile = {
       id: directSession.uid,
       ownerId: directSession.uid,
+      email: directSession.email,
       userName: directSession.userName,
       userRole: directSession.userRole,
       storeName: directSession.storeName,
@@ -511,21 +765,47 @@ function ComandaVozWorkspace() {
     let isCancelled = false;
 
     const loadFromServerOrLocal = async (isInitial: boolean) => {
+      // Never overwrite state with a background poll while a mutation is in flight or just finished!
+      if (!isInitial && (isMutatingRef.current || Date.now() - lastMutationMsRef.current < 4000)) {
+        return;
+      }
+
+      const wasCatalogInitializedLocally =
+        localStorage.getItem(`comanda_voz_catalog_init_${code}`) === 'true';
+
       try {
         const res = await fetch(`/api/store/${encodeURIComponent(code)}`);
         if (res.ok) {
           const data = (await res.json()) as {
             exists?: boolean;
+            catalogInitialized?: boolean;
             menuItems?: MenuItem[];
             tabs?: BarTab[];
             tabItems?: TabItem[];
             voiceOperators?: VoiceOperator[];
           };
-          if (!isCancelled && data.exists) {
-            const loadedMenu =
-              Array.isArray(data.menuItems) && data.menuItems.length > 0
+
+          if (
+            !isCancelled &&
+            !isMutatingRef.current &&
+            Date.now() - lastMutationMsRef.current >= (isInitial ? 0 : 4000) &&
+            data.exists
+          ) {
+            const isCatInit =
+              Boolean(data.catalogInitialized) ||
+              wasCatalogInitializedLocally ||
+              Array.isArray(data.menuItems);
+
+            // CRITICAL FIX: Respect empty array if user deleted items! Only seed if never initialized.
+            const loadedMenu = Array.isArray(data.menuItems)
+              ? isCatInit
                 ? data.menuItems
-                : buildSeededMenu();
+                : data.menuItems.length > 0
+                  ? data.menuItems
+                  : buildSeededMenu()
+              : buildSeededMenu();
+
+            localStorage.setItem(`comanda_voz_catalog_init_${code}`, 'true');
             setMenuItems(loadedMenu);
             setTabs(Array.isArray(data.tabs) ? data.tabs : []);
             setTabItems(Array.isArray(data.tabItems) ? data.tabItems : []);
@@ -545,20 +825,36 @@ function ComandaVozWorkspace() {
           const localRaw = localStorage.getItem(`comanda_voz_store_${code}`);
           if (localRaw) {
             const parsed = JSON.parse(localRaw) as {
+              catalogInitialized?: boolean;
               menuItems?: MenuItem[];
               tabs?: BarTab[];
               tabItems?: TabItem[];
               voiceOperators?: VoiceOperator[];
             };
-            const loadedMenu =
-              Array.isArray(parsed.menuItems) && parsed.menuItems.length > 0
-                ? parsed.menuItems
-                : buildSeededMenu();
+            const loadedMenu = Array.isArray(parsed.menuItems)
+              ? parsed.menuItems
+              : buildSeededMenu();
+
+            const loadedTabs = Array.isArray(parsed.tabs) ? parsed.tabs : [];
+            const loadedTabItems = Array.isArray(parsed.tabItems) ? parsed.tabItems : [];
+            const loadedOps = Array.isArray(parsed.voiceOperators) ? parsed.voiceOperators : [];
+
             setMenuItems(loadedMenu);
-            setTabs(Array.isArray(parsed.tabs) ? parsed.tabs : []);
-            setTabItems(Array.isArray(parsed.tabItems) ? parsed.tabItems : []);
-            setVoiceOperators(Array.isArray(parsed.voiceOperators) ? parsed.voiceOperators : []);
+            setTabs(loadedTabs);
+            setTabItems(loadedTabItems);
+            setVoiceOperators(loadedOps);
             setDataLoading(false);
+
+            // Re-push local store to server in case Render container woke up from sleep
+            await syncDirectStoreSnapshot({
+              storeCode: code,
+              storeName: directSession.storeName,
+              menuItems: loadedMenu,
+              tabs: loadedTabs,
+              tabItems: loadedTabItems,
+              voiceOperators: loadedOps,
+              actionType: 'add',
+            });
             return;
           }
         } catch {
@@ -578,6 +874,7 @@ function ComandaVozWorkspace() {
           tabs: [],
           tabItems: [],
           voiceOperators: [],
+          actionType: 'add',
         });
       }
     };
@@ -628,9 +925,9 @@ function ComandaVozWorkspace() {
           const defaultUserName = sanitizeString(
             firebaseUser.displayName ||
               firebaseUser.email?.split('@')[0] ||
-              'Operador Principal',
+              'Administrador Principal',
             VALIDATION_LIMITS.OPERATOR_NAME_MAX_LEN,
-            'Operador Principal'
+            'Administrador Principal'
           );
           const defaultStoreName = 'Bar & Comércio Central';
           const defaultStoreCode = `BAR-${firebaseUser.uid.slice(0, 5).toUpperCase()}`;
@@ -638,7 +935,7 @@ function ComandaVozWorkspace() {
           setDoc(profileRef, {
             ownerId: firebaseUser.uid,
             userName: defaultUserName,
-            userRole: 'Proprietário',
+            userRole: 'ADM',
             storeName: defaultStoreName,
             storeCode: sanitizeStoreCode(defaultStoreCode),
             createdAt: serverTimestamp(),
@@ -653,7 +950,38 @@ function ComandaVozWorkspace() {
 
     const unsubMenu = onSnapshot(
       menuQuery,
-      (snap) => {
+      async (snap) => {
+        const seededFlagKey = `comanda_voz_fb_menu_seeded_${firebaseUser.uid}`;
+        const alreadySeededOnce = localStorage.getItem(seededFlagKey) === 'true';
+
+        if (snap.empty && !alreadySeededOnce) {
+          localStorage.setItem(seededFlagKey, 'true');
+          try {
+            const batch = writeBatch(db);
+            for (const seed of DEFAULT_BAR_MENU) {
+              const docId = `${seed.id}_${firebaseUser.uid.slice(0, 8)}`;
+              const ref = doc(db, 'menuItems', docId);
+              batch.set(ref, {
+                ownerId: firebaseUser.uid,
+                name: sanitizeString(seed.name, VALIDATION_LIMITS.NAME_MAX_LEN),
+                category: sanitizeCategory(seed.category),
+                price: Math.min(Math.max(seed.price, 0), VALIDATION_LIMITS.MAX_PRICE),
+                synonyms: sanitizeString(seed.synonyms, VALIDATION_LIMITS.SYNONYMS_MAX_LEN),
+                createdAt: serverTimestamp(),
+                updatedAt: serverTimestamp(),
+              });
+            }
+            await batch.commit();
+          } catch (err) {
+            handleFirestoreError(err, OperationType.WRITE, 'menuItems');
+          }
+          return;
+        }
+
+        if (!snap.empty && !alreadySeededOnce) {
+          localStorage.setItem(seededFlagKey, 'true');
+        }
+
         const loaded: MenuItem[] = snap.docs.map((d) => ({
           id: d.id,
           ...(d.data() as Omit<MenuItem, 'id'>),
@@ -716,38 +1044,6 @@ function ComandaVozWorkspace() {
     };
   }, [authReady, firebaseUser]);
 
-  // Seed default Brazilian bar catalog automatically if Firebase user has 0 menu items
-  useEffect(() => {
-    if (!authReady || !firebaseUser || dataLoading || seedingMenu) return;
-    if (menuItems.length === 0) {
-      setSeedingMenu(true);
-      const seedDefaultMenu = async () => {
-        try {
-          const batch = writeBatch(db);
-          for (const seed of DEFAULT_BAR_MENU) {
-            const docId = `${seed.id}_${firebaseUser.uid.slice(0, 8)}`;
-            const ref = doc(db, 'menuItems', docId);
-            batch.set(ref, {
-              ownerId: firebaseUser.uid,
-              name: sanitizeString(seed.name, VALIDATION_LIMITS.NAME_MAX_LEN),
-              category: sanitizeCategory(seed.category),
-              price: Math.min(Math.max(seed.price, 0), VALIDATION_LIMITS.MAX_PRICE),
-              synonyms: sanitizeString(seed.synonyms, VALIDATION_LIMITS.SYNONYMS_MAX_LEN),
-              createdAt: serverTimestamp(),
-              updatedAt: serverTimestamp(),
-            });
-          }
-          await batch.commit();
-        } catch (err) {
-          handleFirestoreError(err, OperationType.WRITE, 'menuItems');
-        } finally {
-          setSeedingMenu(false);
-        }
-      };
-      seedDefaultMenu();
-    }
-  }, [authReady, firebaseUser, dataLoading, menuItems.length, seedingMenu]);
-
   // Active Waiter & Store Attribution Resolver
   const currentStoreName = useMemo(
     () =>
@@ -761,10 +1057,20 @@ function ComandaVozWorkspace() {
 
   const currentStoreCode = useMemo(
     () => sanitizeStoreCode(userProfile?.storeCode || directSession?.storeCode || 'BAR-01'),
-    [userProfile]
+    [userProfile, directSession]
   );
 
   const activeWaiterDisplay = useMemo(() => {
+    // If logged in as Garçom, always attribute launches to the logged-in Garçom
+    if (!isAdmin) {
+      const waiterName =
+        directSession?.userName || userProfile?.userName || user?.displayName || 'Garçom';
+      return {
+        name: `${waiterName} (Garçom)`,
+        storeName: currentStoreName,
+      };
+    }
+
     if (selectedWaiterId !== 'logged_user') {
       const foundOp = voiceOperators.find((op) => op.id === selectedWaiterId);
       if (foundOp) {
@@ -775,13 +1081,17 @@ function ComandaVozWorkspace() {
       }
     }
     const baseName =
-      userProfile?.userName || user?.displayName || user?.email?.split('@')[0] || 'Operador';
-    const baseRole = userProfile?.userRole || 'Proprietário';
+      userProfile?.userName ||
+      directSession?.userName ||
+      user?.displayName ||
+      user?.email?.split('@')[0] ||
+      'ADM';
+    const baseRole = userProfile?.userRole || directSession?.userRole || 'ADM';
     return {
       name: `${baseName} (${baseRole})`,
       storeName: currentStoreName,
     };
-  }, [selectedWaiterId, voiceOperators, userProfile, user, currentStoreName]);
+  }, [isAdmin, selectedWaiterId, voiceOperators, userProfile, directSession, user, currentStoreName]);
 
   // Active (non-archived) tabs across the 3 stages
   const activeStageTabs = useMemo(
@@ -906,7 +1216,7 @@ function ComandaVozWorkspace() {
     return tabItems.filter((i) => i.launchedByName === waiterFilter);
   }, [tabItems, waiterFilter]);
 
-  // MULTI-CUSTOMER BATCH STAGE 1 HANDLER: MARCAR ITENS (Supports 1 or N customers in a single continuous breath!)
+  // MULTI-CUSTOMER BATCH STAGE 1 HANDLER: MARCAR ITENS (Allowed for both ADM and Garçom)
   const executeMultiCustomerStage1Marcar = async (
     marcarCommands: ParsedSingleCommand[],
     rawTranscript: string,
@@ -972,7 +1282,6 @@ function ComandaVozWorkspace() {
         ''
       );
 
-      // Check if we already touched this customer in this same chained phrase or in existing active tabs
       const normCust = normalizeText(cleanCustomerName);
       let tabState = Array.from(tabsAffectedMap.values()).find(
         (t) => normalizeText(t.customerName) === normCust
@@ -1110,7 +1419,11 @@ function ComandaVozWorkspace() {
         const nextTabItems = [...newLocalTabItems, ...tabItems];
         setTabs(nextTabs);
         setTabItems(nextTabItems);
-        await syncDirectStoreSnapshot({ tabs: nextTabs, tabItems: nextTabItems });
+        await syncDirectStoreSnapshot({
+          tabs: nextTabs,
+          tabItems: nextTabItems,
+          actionType: 'add',
+        });
       } else {
         const batch = writeBatch(db);
         for (const newItem of newLocalTabItems) {
@@ -1197,20 +1510,22 @@ function ComandaVozWorkspace() {
       });
       speakAsMarcelo(spokenText, marceloVoiceReplyEnabled);
 
-      setLastUndo({
-        description: perCustomerSpokenParts.join(' | '),
-        tabsAffected: Array.from(tabsAffectedMap.values()).map((t) => ({
-          tabId: t.tabId,
-          createdNewTab: t.createdNewTab,
-          customerName: t.customerName,
-          tableLabel: t.tableLabel,
-          previousTotal: t.previousTotal,
-          previousPaid: t.previousPaid,
-          previousCount: t.previousCount,
-          previousStatus: t.previousStatus,
-        })),
-        addedItemIds,
-      });
+      if (isAdmin) {
+        setLastUndo({
+          description: perCustomerSpokenParts.join(' | '),
+          tabsAffected: Array.from(tabsAffectedMap.values()).map((t) => ({
+            tabId: t.tabId,
+            createdNewTab: t.createdNewTab,
+            customerName: t.customerName,
+            tableLabel: t.tableLabel,
+            previousTotal: t.previousTotal,
+            previousPaid: t.previousPaid,
+            previousCount: t.previousCount,
+            previousStatus: t.previousStatus,
+          })),
+          addedItemIds,
+        });
+      }
     } catch (err) {
       handleFirestoreError(err, OperationType.WRITE, 'tabs/tabItems');
     }
@@ -1229,7 +1544,6 @@ function ComandaVozWorkspace() {
         normalizeText(t.customerName).includes(normalizeText(customerQueryName))
     );
 
-    // STRICT RULE: "se não entendeu, não faça nada!"
     if (!targetTab) {
       const msg = `Marcelo informa: Não encontrei comanda aberta para "${customerQueryName}". Nenhuma conta foi alterada.`;
       setFeedbackBanner({ type: 'error', message: msg });
@@ -1257,7 +1571,7 @@ function ComandaVozWorkspace() {
             : t
         );
         setTabs(nextTabs);
-        await syncDirectStoreSnapshot({ tabs: nextTabs });
+        await syncDirectStoreSnapshot({ tabs: nextTabs, actionType: 'add' });
       } else {
         await updateDoc(doc(db, 'tabs', targetTab.id), {
           status: 'closing',
@@ -1356,7 +1670,7 @@ function ComandaVozWorkspace() {
             : t
         );
         setTabs(nextTabs);
-        await syncDirectStoreSnapshot({ tabs: nextTabs });
+        await syncDirectStoreSnapshot({ tabs: nextTabs, actionType: 'add' });
       } else {
         await updateDoc(doc(db, 'tabs', targetTab.id), {
           status: nextStatus,
@@ -1417,7 +1731,6 @@ function ComandaVozWorkspace() {
     const cleanPhrase = phrase.trim();
     if (!cleanPhrase || !user) return;
 
-    // 1. Check wake word "Marcelo" if required on voice commands
     const hasWakeWord = /\bmarcelo\b/i.test(normalizeText(cleanPhrase));
     if (sourceType === 'voz' && requireWakeWordMarcelo && !hasWakeWord) {
       const msg = `Marcelo não executou nada: chame pelo nome dizendo "Marcelo, marque..." para evitar comandos acidentais.`;
@@ -1425,7 +1738,6 @@ function ComandaVozWorkspace() {
       return;
     }
 
-    // 2. Check trained voice operator lock if enabled
     if (sourceType === 'voz' && requireTrainedVoiceLock && !speakerVerified) {
       const msg = `Marcelo bloqueou o comando: Voz não reconhecida como garçom/operador cadastrado deste comércio. Nada foi alterado.`;
       setFeedbackBanner({ type: 'error', message: msg });
@@ -1436,17 +1748,17 @@ function ComandaVozWorkspace() {
       return;
     }
 
-    // Resolve which Waiter and Store are executing this command
-    const waiterAttr = matchedWaiterOp
-      ? `${matchedWaiterOp.operatorName} (${matchedWaiterOp.roleLabel})`
-      : activeWaiterDisplay.name;
+    const waiterAttr = !isAdmin
+      ? activeWaiterDisplay.name
+      : matchedWaiterOp
+        ? `${matchedWaiterOp.operatorName} (${matchedWaiterOp.roleLabel})`
+        : activeWaiterDisplay.name;
     const storeAttr = matchedWaiterOp?.storeName || activeWaiterDisplay.storeName;
 
     setIsProcessingCommand(true);
     setFeedbackBanner(null);
 
     try {
-      // First run our strict local multi-customer parser to validate catalog items & customers
       const localStrict = parseVoiceOrderLocally(
         cleanPhrase,
         menuItems,
@@ -1455,7 +1767,6 @@ function ComandaVozWorkspace() {
 
       let finalParsed: ParsedVoiceOrder = localStrict;
 
-      // If local parser didn't immediately match, or to handle complex phrasing via Gemini:
       if (!localStrict.understood) {
         const response = await fetch('/api/parse-order', {
           method: 'POST',
@@ -1481,7 +1792,6 @@ function ComandaVozWorkspace() {
         }
       }
 
-      // STRICT SAFETY CHECK: "se não entendeu, não faça nada hein!"
       if (
         !finalParsed.understood ||
         !Array.isArray(finalParsed.commands) ||
@@ -1503,7 +1813,6 @@ function ComandaVozWorkspace() {
         return;
       }
 
-      // Verify that every MARCAR command has valid customerName and at least 1 valid item in the bar's catalog
       for (const cmd of finalParsed.commands) {
         if (!cmd.customerName || cmd.customerName.trim().length < 2) {
           const abortMsg = `Marcelo não fez nada: faltou informar o nome do cliente em um dos pedidos.`;
@@ -1523,7 +1832,6 @@ function ComandaVozWorkspace() {
         }
       }
 
-      // Group all MARCAR commands so chained orders ("marca 1 litrão para Thiago, marca 1 litrão para Jonas") commit together
       const marcarCmds = finalParsed.commands.filter((c) => c.intent === 'MARCAR');
       const fecharCmds = finalParsed.commands.filter((c) => c.intent === 'FECHAR');
       const baixaCmds = finalParsed.commands.filter((c) => c.intent === 'BAIXA');
@@ -1667,22 +1975,23 @@ function ComandaVozWorkspace() {
     recognition.start();
   };
 
-  // Save Logged-In User & Comércio Profile
+  // Save Logged-In ADM & Comércio Profile (Restricted to ADM)
   const handleSaveUserProfile = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!user || !profileUserName.trim() || !profileStoreName.trim()) return;
+    if (!user || !isAdmin || !profileUserName.trim() || !profileStoreName.trim()) return;
     setSavingProfile(true);
     try {
       const cleanName = sanitizeString(profileUserName, VALIDATION_LIMITS.OPERATOR_NAME_MAX_LEN);
       const cleanRole: UserRoleType = VALIDATION_LIMITS.VALID_ROLES.includes(profileUserRole)
         ? profileUserRole
-        : 'Proprietário';
+        : 'ADM';
       const cleanStore = sanitizeString(profileStoreName, VALIDATION_LIMITS.STORE_NAME_MAX_LEN);
       const cleanCode = sanitizeStoreCode(profileStoreCode, 'BAR-01');
 
       if (isDirectSession) {
         const nextSession: DirectBarSession = {
-          uid: `bar_${cleanCode.toLowerCase().replace(/[^a-z0-9]/g, '')}`,
+          uid: directSession?.uid || `adm_${cleanCode.toLowerCase().replace(/[^a-z0-9]/g, '')}`,
+          email: directSession?.email || '',
           userName: cleanName,
           userRole: cleanRole,
           storeName: cleanStore,
@@ -1697,6 +2006,7 @@ function ComandaVozWorkspace() {
         setUserProfile({
           id: nextSession.uid,
           ownerId: nextSession.uid,
+          email: nextSession.email,
           userName: cleanName,
           userRole: cleanRole,
           storeName: cleanStore,
@@ -1704,7 +2014,11 @@ function ComandaVozWorkspace() {
           createdAt: userProfile?.createdAt || makeLocalTimestamp(),
           updatedAt: makeLocalTimestamp(),
         });
-        await syncDirectStoreSnapshot({ storeCode: cleanCode, storeName: cleanStore });
+        await syncDirectStoreSnapshot({
+          storeCode: cleanCode,
+          storeName: cleanStore,
+          actionType: 'add',
+        });
       } else {
         await setDoc(doc(db, 'userProfiles', user.uid), {
           ownerId: user.uid,
@@ -1718,7 +2032,7 @@ function ComandaVozWorkspace() {
       }
       setFeedbackBanner({
         type: 'success',
-        message: `Perfil de usuário (${cleanName}) e Comércio (${cleanStore}) atualizados!`,
+        message: `Dados do Comércio (${cleanStore}) e Administrador (${cleanName}) atualizados!`,
       });
     } catch (err) {
       handleFirestoreError(err, OperationType.WRITE, `userProfiles/${user.uid}`);
@@ -1744,38 +2058,110 @@ function ComandaVozWorkspace() {
     }
   };
 
-  // Save Trained Waiter / Operator Profile to Firestore or Render Store
+  // ADM Registers a New Waiter (Garçom) with Email & Password + Optional Voice Biometrics
   const handleSaveTrainedOperator = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!user || !newOpName.trim() || trainingSamples.length === 0) return;
+    if (!user || !isAdmin) {
+      setFeedbackBanner({
+        type: 'error',
+        message: 'Permissão negada: Somente o ADM pode cadastrar garçons.',
+      });
+      return;
+    }
 
+    const cleanName = sanitizeString(newOpName, VALIDATION_LIMITS.OPERATOR_NAME_MAX_LEN);
+    const cleanEmail = newOpEmail.trim().toLowerCase();
+    const cleanPass = newOpPassword.trim();
+
+    if (!cleanName || !cleanEmail.includes('@') || cleanPass.length < 4) {
+      setFeedbackBanner({
+        type: 'error',
+        message: 'Informe o nome do garçom, um e-mail válido e uma senha (mínimo 4 caracteres).',
+      });
+      return;
+    }
+
+    setRegisteringWaiter(true);
     const avgPitch =
-      trainingSamples.reduce((acc, s) => acc + s.pitchHz, 0) / trainingSamples.length;
+      trainingSamples.length > 0
+        ? trainingSamples.reduce((acc, s) => acc + s.pitchHz, 0) / trainingSamples.length
+        : 145;
     const avgCentroid =
-      trainingSamples.reduce((acc, s) => acc + s.spectralCentroid, 0) /
-      trainingSamples.length;
+      trainingSamples.length > 0
+        ? trainingSamples.reduce((acc, s) => acc + s.spectralCentroid, 0) /
+          trainingSamples.length
+        : 1850;
+    const samplesCount = trainingSamples.length > 0 ? trainingSamples.length : 1;
 
-    const opId = `op_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     try {
+      // 1. Register Waiter Login Account on Server API so Garçom can log in with Email & Password
+      const apiRes = await fetch('/api/auth/register-waiter', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          callerRole: 'ADM',
+          operatorName: cleanName,
+          email: cleanEmail,
+          password: cleanPass,
+          storeName: currentStoreName,
+          storeCode: currentStoreCode,
+          pitchHz: Math.min(Math.max(Number(avgPitch.toFixed(1)), 45), 550),
+          spectralCentroid: Math.min(Math.max(Number(avgCentroid.toFixed(1)), 100), 9500),
+          voicePin: sanitizeString(newOpPin, VALIDATION_LIMITS.VOICE_PIN_MAX_LEN, ''),
+          samplesCount,
+        }),
+      });
+
+      const apiData = (await apiRes.json().catch(() => ({}))) as {
+        ok?: boolean;
+        error?: string;
+        operator?: VoiceOperator;
+      };
+
+      if (!apiRes.ok && apiData.error) {
+        setFeedbackBanner({ type: 'error', message: apiData.error });
+        setRegisteringWaiter(false);
+        return;
+      }
+
+      const opId =
+        apiData.operator?.id || `op_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+
       const opPayload: VoiceOperator = {
         id: opId,
         ownerId: user.uid,
-        operatorName: sanitizeString(newOpName, VALIDATION_LIMITS.OPERATOR_NAME_MAX_LEN),
-        roleLabel: sanitizeString(newOpRole, VALIDATION_LIMITS.TABLE_MAX_LEN, 'Garçom'),
+        operatorName: cleanName,
+        email: cleanEmail,
+        roleLabel: 'Garçom',
         storeName: currentStoreName,
         storeCode: currentStoreCode,
         pitchHz: Math.min(Math.max(Number(avgPitch.toFixed(1)), 45), 550),
         spectralCentroid: Math.min(Math.max(Number(avgCentroid.toFixed(1)), 100), 9500),
         voicePin: sanitizeString(newOpPin, VALIDATION_LIMITS.VOICE_PIN_MAX_LEN, ''),
-        samplesCount: trainingSamples.length,
+        samplesCount,
         createdAt: makeLocalTimestamp(),
         updatedAt: makeLocalTimestamp(),
       };
 
+      // Save Waiter Account in local backup so it works even across Render restarts
+      saveAccountToLocalBackup({
+        uid: opId,
+        email: cleanEmail,
+        passwordPlainOrHash: cleanPass,
+        userName: cleanName,
+        userRole: 'Garçom',
+        storeName: currentStoreName,
+        storeCode: currentStoreCode,
+      });
+
+      const nextOps = [
+        ...voiceOperators.filter((op) => (op.email || '').toLowerCase() !== cleanEmail),
+        opPayload,
+      ];
+      setVoiceOperators(nextOps);
+
       if (isDirectSession) {
-        const nextOps = [...voiceOperators, opPayload];
-        setVoiceOperators(nextOps);
-        await syncDirectStoreSnapshot({ voiceOperators: nextOps });
+        await syncDirectStoreSnapshot({ voiceOperators: nextOps, actionType: 'add' });
       } else {
         await setDoc(doc(db, 'voiceOperators', opId), {
           ownerId: opPayload.ownerId,
@@ -1793,39 +2179,70 @@ function ComandaVozWorkspace() {
       }
 
       setNewOpName('');
+      setNewOpEmail('');
+      setNewOpPassword('');
       setNewOpPin('');
       setTrainingSamples([]);
-      setSelectedWaiterId(opId);
-      setRequireTrainedVoiceLock(true);
-      const msg = `Garçom/Usuário ${newOpName} cadastrado no comércio ${currentStoreName} com sucesso!`;
+      if (trainingSamples.length > 0) {
+        setRequireTrainedVoiceLock(true);
+      }
+
+      const msg = `Garçom ${cleanName} (${cleanEmail}) cadastrado pelo ADM! Ele já pode entrar com e-mail e senha (permissão: somente adicionar).`;
       setFeedbackBanner({ type: 'success', message: msg });
-      speakAsMarcelo(msg, marceloVoiceReplyEnabled);
+      speakAsMarcelo(`Garçom ${cleanName} cadastrado com sucesso.`, marceloVoiceReplyEnabled);
     } catch (err) {
-      handleFirestoreError(err, OperationType.CREATE, `voiceOperators/${opId}`);
+      handleFirestoreError(err, OperationType.CREATE, 'voiceOperators');
+    } finally {
+      setRegisteringWaiter(false);
     }
   };
 
+  // Delete Waiter Operator (STRICTLY ADM ONLY)
   const handleDeleteOperator = async (opId: string) => {
-    if (!user) return;
+    if (!user || !isAdmin) {
+      setFeedbackBanner({
+        type: 'error',
+        message: 'Permissão negada: Somente o ADM pode remover garçons.',
+      });
+      return;
+    }
+
+    const targetOp = voiceOperators.find((op) => op.id === opId);
     try {
+      const nextOps = voiceOperators.filter((op) => op.id !== opId);
+      setVoiceOperators(nextOps);
+      if (targetOp?.email) {
+        removeAccountFromLocalBackup(targetOp.email);
+      }
+
       if (isDirectSession) {
-        const nextOps = voiceOperators.filter((op) => op.id !== opId);
-        setVoiceOperators(nextOps);
-        await syncDirectStoreSnapshot({ voiceOperators: nextOps });
+        await syncDirectStoreSnapshot({ voiceOperators: nextOps, actionType: 'remove' });
       } else {
         await deleteDoc(doc(db, 'voiceOperators', opId));
       }
       if (selectedWaiterId === opId) {
         setSelectedWaiterId('logged_user');
       }
+      setFeedbackBanner({
+        type: 'success',
+        message: `Garçom ${targetOp?.operatorName || ''} removido pelo ADM.`,
+      });
     } catch (err) {
       handleFirestoreError(err, OperationType.DELETE, `voiceOperators/${opId}`);
     }
   };
 
-  // Undo last single or multi-customer launch in 1 click
+  // Undo last single or multi-customer launch in 1 click (STRICTLY ADM ONLY)
   const handleUndoLastLaunch = async () => {
     if (!lastUndo || !user) return;
+    if (!isAdmin) {
+      setFeedbackBanner({
+        type: 'error',
+        message: 'Permissão negada: Garçom não pode remover ou desfazer itens. Solicite ao ADM.',
+      });
+      return;
+    }
+
     const undoInfo = lastUndo;
     setLastUndo(null);
 
@@ -1856,7 +2273,11 @@ function ComandaVozWorkspace() {
         }
         setTabs(nextTabs);
         setTabItems(nextTabItems);
-        await syncDirectStoreSnapshot({ tabs: nextTabs, tabItems: nextTabItems });
+        await syncDirectStoreSnapshot({
+          tabs: nextTabs,
+          tabItems: nextTabItems,
+          actionType: 'remove',
+        });
       } else {
         const batch = writeBatch(db);
         for (const itemId of undoInfo.addedItemIds) {
@@ -1883,14 +2304,14 @@ function ComandaVozWorkspace() {
       setMarceloReport(null);
       setFeedbackBanner({
         type: 'success',
-        message: `Lançamento desfeito com sucesso: ${undoInfo.description}`,
+        message: `Lançamento desfeito pelo ADM: ${undoInfo.description}`,
       });
     } catch (err) {
       handleFirestoreError(err, OperationType.DELETE, 'tabItems');
     }
   };
 
-  // Quick 1-Tap Add Menu Item to Selected Tab
+  // Quick 1-Tap Add Menu Item to Selected Tab (Allowed for both ADM and Garçom)
   const handleQuickAddMenuItem = async (menuItem: MenuItem) => {
     if (!user || !selectedTab) return;
 
@@ -1945,7 +2366,11 @@ function ComandaVozWorkspace() {
         );
         setTabs(nextTabs);
         setTabItems(nextTabItems);
-        await syncDirectStoreSnapshot({ tabs: nextTabs, tabItems: nextTabItems });
+        await syncDirectStoreSnapshot({
+          tabs: nextTabs,
+          tabItems: nextTabItems,
+          actionType: 'add',
+        });
       } else {
         const batch = writeBatch(db);
         batch.set(doc(db, 'tabItems', itemId), {
@@ -1979,7 +2404,7 @@ function ComandaVozWorkspace() {
       }
       setFeedbackBanner({
         type: 'success',
-        message: `+1 ${menuItem.name} marcado para ${selectedTab.customerName} por ${activeWaiterDisplay.name}`,
+        message: `+1 ${menuItem.name} adicionado para ${selectedTab.customerName} por ${activeWaiterDisplay.name}`,
       });
     } catch (err) {
       handleFirestoreError(err, OperationType.WRITE, 'tabItems');
@@ -1987,8 +2412,17 @@ function ComandaVozWorkspace() {
   };
 
   // Adjust quantity or delete an individual TabItem entry
+  // STRICT RULE: Garçom can ONLY add (delta > 0). Only ADM can decrease or delete (delta < 0).
   const handleAdjustTabItemQty = async (item: TabItem, delta: number) => {
     if (!user) return;
+    if (delta < 0 && !isAdmin) {
+      setFeedbackBanner({
+        type: 'error',
+        message: 'Permissão negada: O Garçom só pode adicionar itens. Somente o ADM pode remover itens da comanda.',
+      });
+      return;
+    }
+
     const parentTab = activeStageTabs.find((t) => t.id === item.tabId);
     if (!parentTab) return;
 
@@ -2029,7 +2463,11 @@ function ComandaVozWorkspace() {
         );
         setTabs(nextTabs);
         setTabItems(nextTabItems);
-        await syncDirectStoreSnapshot({ tabs: nextTabs, tabItems: nextTabItems });
+        await syncDirectStoreSnapshot({
+          tabs: nextTabs,
+          tabItems: nextTabItems,
+          actionType: delta < 0 ? 'remove' : 'add',
+        });
       } else {
         const batch = writeBatch(db);
         const itemRef = doc(db, 'tabItems', item.id);
@@ -2065,7 +2503,7 @@ function ComandaVozWorkspace() {
     }
   };
 
-  // Create a new Open Comanda manually
+  // Create a new Open Comanda manually (Allowed for both ADM and Garçom)
   const handleCreateManualTab = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!user || !newCustomerName.trim()) return;
@@ -2102,7 +2540,7 @@ function ComandaVozWorkspace() {
         };
         const nextTabs = [newTabObj, ...tabs];
         setTabs(nextTabs);
-        await syncDirectStoreSnapshot({ tabs: nextTabs });
+        await syncDirectStoreSnapshot({ tabs: nextTabs, actionType: 'add' });
       } else {
         await setDoc(doc(db, 'tabs', tabId), {
           ownerId: user.uid,
@@ -2161,69 +2599,256 @@ function ComandaVozWorkspace() {
     setTimeout(() => setCopiedReceipt(false), 2500);
   };
 
-  // Add New Product to Bar Menu Catalog
-  const handleAddMenuItem = async (e: React.FormEvent) => {
+  // CARDÁPIO CRUD: Add or Edit Product in Bar Menu Catalog (ADM ONLY)
+  const handleAddOrUpdateMenuItem = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!user || !newMenuName.trim() || !newMenuPrice) return;
+    if (!user || !isAdmin) {
+      setFeedbackBanner({
+        type: 'error',
+        message: 'Permissão negada: Somente o ADM pode criar ou editar itens do cardápio.',
+      });
+      return;
+    }
 
-    const priceNum = parseFloat(newMenuPrice.replace(',', '.'));
-    if (Number.isNaN(priceNum) || priceNum < 0) return;
+    const trimmedName = newMenuName.trim();
+    const cleanedPriceStr = newMenuPrice.replace(/[R$\s]/g, '').replace(',', '.');
+    const priceNum = parseFloat(cleanedPriceStr);
 
-    const menuId = `menu_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+    if (!trimmedName || Number.isNaN(priceNum) || priceNum < 0) {
+      setFeedbackBanner({
+        type: 'error',
+        message: 'Informe um nome válido para o produto e o preço (ex: 18,00).',
+      });
+      return;
+    }
+
+    setSavingMenu(true);
+    isMutatingRef.current = true;
+    lastMutationMsRef.current = Date.now();
+
+    const menuId =
+      editingMenuId || `menu_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+
     try {
-      const cleanName = sanitizeString(newMenuName, VALIDATION_LIMITS.NAME_MAX_LEN);
+      const cleanName = sanitizeString(trimmedName, VALIDATION_LIMITS.NAME_MAX_LEN);
       const cleanCat = sanitizeCategory(newMenuCategory);
       const cleanPrice = Math.min(Number(priceNum.toFixed(2)), VALIDATION_LIMITS.MAX_PRICE);
-      const cleanSyn = sanitizeString(newMenuSynonyms, VALIDATION_LIMITS.SYNONYMS_MAX_LEN);
+      const cleanSyn = sanitizeString(
+        newMenuSynonyms.trim() || cleanName.toLowerCase(),
+        VALIDATION_LIMITS.SYNONYMS_MAX_LEN
+      );
+      const localTs = makeLocalTimestamp();
+
+      const updatedItemObj: MenuItem = {
+        id: menuId,
+        ownerId: user.uid,
+        name: cleanName,
+        category: cleanCat,
+        price: cleanPrice,
+        synonyms: cleanSyn,
+        createdAt: localTs,
+        updatedAt: localTs,
+      };
+
+      const nextMenu = [
+        ...menuItems.filter((m) => m.id !== menuId),
+        updatedItemObj,
+      ].sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
+
+      // Update UI immediately so there is zero lag or race condition
+      setMenuItems(nextMenu);
 
       if (isDirectSession) {
-        const localTs = makeLocalTimestamp();
-        const nextMenu = [
-          ...menuItems,
-          {
-            id: menuId,
+        await syncDirectStoreSnapshot({
+          menuItems: nextMenu,
+          actionType: 'catalog',
+        });
+      } else {
+        localStorage.setItem(`comanda_voz_fb_menu_seeded_${user.uid}`, 'true');
+        if (editingMenuId) {
+          await updateDoc(doc(db, 'menuItems', menuId), {
+            name: cleanName,
+            category: cleanCat,
+            price: cleanPrice,
+            synonyms: cleanSyn,
+            updatedAt: serverTimestamp(),
+          });
+        } else {
+          await setDoc(doc(db, 'menuItems', menuId), {
             ownerId: user.uid,
             name: cleanName,
             category: cleanCat,
             price: cleanPrice,
             synonyms: cleanSyn,
-            createdAt: localTs,
-            updatedAt: localTs,
-          },
-        ].sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
-        setMenuItems(nextMenu);
-        await syncDirectStoreSnapshot({ menuItems: nextMenu });
-      } else {
-        await setDoc(doc(db, 'menuItems', menuId), {
-          ownerId: user.uid,
-          name: cleanName,
-          category: cleanCat,
-          price: cleanPrice,
-          synonyms: cleanSyn,
-          createdAt: serverTimestamp(),
-          updatedAt: serverTimestamp(),
-        });
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        }
       }
+
+      const actionWord = editingMenuId ? 'atualizado' : 'cadastrado';
+      setEditingMenuId(null);
       setNewMenuName('');
       setNewMenuPrice('');
       setNewMenuSynonyms('');
+      setFeedbackBanner({
+        type: 'success',
+        message: `Produto "${cleanName}" (${formatBRL(cleanPrice)}) ${actionWord} no cardápio com sucesso!`,
+      });
     } catch (err) {
       handleFirestoreError(err, OperationType.CREATE, `menuItems/${menuId}`);
+    } finally {
+      lastMutationMsRef.current = Date.now();
+      isMutatingRef.current = false;
+      setSavingMenu(false);
     }
   };
 
+  // Start Editing an Existing Menu Item
+  const handleStartEditMenuItem = (item: MenuItem) => {
+    if (!isAdmin) return;
+    setEditingMenuId(item.id);
+    setNewMenuName(item.name);
+    setNewMenuCategory(item.category);
+    setNewMenuPrice(item.price.toFixed(2).replace('.', ','));
+    setNewMenuSynonyms(item.synonyms || '');
+  };
+
+  // Delete Individual Product from Cardápio (ADM ONLY, Permanent without auto-reseeding!)
   const handleDeleteMenuItem = async (menuId: string) => {
-    if (!user) return;
+    if (!user || !isAdmin) {
+      setFeedbackBanner({
+        type: 'error',
+        message: 'Permissão negada: Somente o ADM pode remover produtos do cardápio.',
+      });
+      return;
+    }
+
+    isMutatingRef.current = true;
+    lastMutationMsRef.current = Date.now();
+
+    const targetItem = menuItems.find((m) => m.id === menuId);
+    const nextMenu = menuItems.filter((m) => m.id !== menuId);
+
+    // Immediately update UI state and mark catalog as initialized so it never auto-reseeds
+    setMenuItems(nextMenu);
+    if (editingMenuId === menuId) {
+      setEditingMenuId(null);
+      setNewMenuName('');
+      setNewMenuPrice('');
+      setNewMenuSynonyms('');
+    }
+
     try {
       if (isDirectSession) {
-        const nextMenu = menuItems.filter((m) => m.id !== menuId);
-        setMenuItems(nextMenu);
-        await syncDirectStoreSnapshot({ menuItems: nextMenu });
+        await syncDirectStoreSnapshot({
+          menuItems: nextMenu,
+          actionType: 'remove',
+        });
       } else {
+        localStorage.setItem(`comanda_voz_fb_menu_seeded_${user.uid}`, 'true');
         await deleteDoc(doc(db, 'menuItems', menuId));
       }
+      setFeedbackBanner({
+        type: 'success',
+        message: `Produto "${targetItem?.name || 'Item'}" removido do cardápio pelo ADM.`,
+      });
     } catch (err) {
       handleFirestoreError(err, OperationType.DELETE, `menuItems/${menuId}`);
+    } finally {
+      lastMutationMsRef.current = Date.now();
+      isMutatingRef.current = false;
+    }
+  };
+
+  // Clear All Menu Items so ADM can build custom menu from scratch (ADM ONLY)
+  const handleClearAllMenuItems = async () => {
+    if (!user || !isAdmin || menuItems.length === 0) return;
+
+    isMutatingRef.current = true;
+    lastMutationMsRef.current = Date.now();
+    const oldItems = [...menuItems];
+    setMenuItems([]);
+
+    try {
+      if (isDirectSession) {
+        await syncDirectStoreSnapshot({
+          menuItems: [],
+          actionType: 'remove',
+        });
+      } else {
+        localStorage.setItem(`comanda_voz_fb_menu_seeded_${user.uid}`, 'true');
+        const batch = writeBatch(db);
+        for (const item of oldItems) {
+          batch.delete(doc(db, 'menuItems', item.id));
+        }
+        await batch.commit();
+      }
+      setFeedbackBanner({
+        type: 'success',
+        message: 'Cardápio limpo pelo ADM! Agora você pode cadastrar apenas os seus produtos.',
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.DELETE, 'menuItems');
+    } finally {
+      lastMutationMsRef.current = Date.now();
+      isMutatingRef.current = false;
+    }
+  };
+
+  // Restore Default Bar Menu Items (ADM ONLY)
+  const handleRestoreDefaultMenu = async () => {
+    if (!user || !isAdmin) return;
+
+    isMutatingRef.current = true;
+    lastMutationMsRef.current = Date.now();
+    const nowTs = makeLocalTimestamp();
+    const code = currentStoreCode.toLowerCase();
+
+    const restored: MenuItem[] = DEFAULT_BAR_MENU.map((seed) => ({
+      id: `${seed.id}_${code}_${Date.now().toString(36).slice(-3)}`,
+      ownerId: user.uid,
+      name: sanitizeString(seed.name, VALIDATION_LIMITS.NAME_MAX_LEN),
+      category: sanitizeCategory(seed.category),
+      price: Math.min(Math.max(seed.price, 0), VALIDATION_LIMITS.MAX_PRICE),
+      synonyms: sanitizeString(seed.synonyms, VALIDATION_LIMITS.SYNONYMS_MAX_LEN),
+      createdAt: nowTs,
+      updatedAt: nowTs,
+    })).sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
+
+    setMenuItems(restored);
+
+    try {
+      if (isDirectSession) {
+        await syncDirectStoreSnapshot({
+          menuItems: restored,
+          actionType: 'catalog',
+        });
+      } else {
+        localStorage.setItem(`comanda_voz_fb_menu_seeded_${user.uid}`, 'true');
+        const batch = writeBatch(db);
+        for (const item of restored) {
+          batch.set(doc(db, 'menuItems', item.id), {
+            ownerId: user.uid,
+            name: item.name,
+            category: item.category,
+            price: item.price,
+            synonyms: item.synonyms,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        }
+        await batch.commit();
+      }
+      setFeedbackBanner({
+        type: 'success',
+        message: 'Cardápio padrão do bar restaurado com sucesso!',
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, 'menuItems');
+    } finally {
+      lastMutationMsRef.current = Date.now();
+      isMutatingRef.current = false;
     }
   };
 
@@ -2246,94 +2871,110 @@ function ComandaVozWorkspace() {
             Comanda Voz · Marcelo
           </a>
           <nav className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-400">
-            <a href="#acesso-bar" className="hover:text-slate-100 transition-colors whitespace-nowrap shrink-0">
-              Acesso Direto (Render)
+            <a
+              href="#login-email"
+              onClick={() => setAuthTab('login')}
+              className="hover:text-slate-100 transition-colors whitespace-nowrap shrink-0"
+            >
+              Login (E-mail e Senha)
             </a>
-            <a href="#equipe" className="hover:text-slate-100 transition-colors whitespace-nowrap shrink-0">
-              Garçons & Comércio
+            <a
+              href="#login-email"
+              onClick={() => setAuthTab('register_adm')}
+              className="hover:text-slate-100 transition-colors whitespace-nowrap shrink-0"
+            >
+              Cadastro ADM
             </a>
-            <a href="#seguranca" className="hover:text-slate-100 transition-colors whitespace-nowrap shrink-0">
-              Proteção de Voz
+            <a
+              href="#login-email"
+              className="hover:text-slate-100 transition-colors whitespace-nowrap shrink-0"
+            >
+              Acesso Garçons
             </a>
           </nav>
           <div className="flex items-center gap-3 shrink-0">
             <button
               type="button"
-              onClick={() => handleDirectBarLogin()}
+              onClick={() => setAuthTab('register_adm')}
               className="px-3.5 py-2 text-xs font-semibold bg-slate-800 text-amber-400 border border-slate-700 rounded-lg hover:bg-slate-700 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
-              Entrar Direto no Bar
+              Criar Conta ADM
             </button>
             <button
               type="button"
-              onClick={handleGoogleSignIn}
-              disabled={googleLoginBusy}
+              onClick={() => setAuthTab('login')}
               className="px-4 py-2 text-xs font-semibold bg-amber-500 text-slate-950 rounded-lg hover:bg-amber-400 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
-              {googleLoginBusy ? 'Abrindo...' : 'Entrar com Google'}
+              Entrar com E-mail
             </button>
           </div>
         </header>
 
-        <main className="max-w-[1200px] w-full mx-auto px-6 py-12 grid grid-cols-1 lg:grid-cols-12 gap-10 items-start">
+        <main className="max-w-[1200px] w-full mx-auto px-6 py-10 grid grid-cols-1 lg:grid-cols-12 gap-10 items-start">
           <div className="lg:col-span-7 space-y-6">
             <p className="text-xs font-medium text-amber-400 tracking-wide">
-              Assistente Virtual Marcelo · Controle por Garçom e Comércio
+              Assistente Virtual Marcelo · Controle de Acesso ADM & Garçons
             </p>
             <h1
               className="text-3xl sm:text-5xl font-bold text-slate-50 tracking-tight leading-tight"
               style={{ textWrap: 'balance' }}
             >
-              Fale vários clientes sem pausa: &ldquo;Marcelo, marca 1 litrão para Thiago, marca 1 litrão para Jonas&rdquo;.
+              Fale sem pausa: &ldquo;Marcelo, marca 1 litrão para Thiago, marca 1 litrão para Jonas&rdquo;.
             </h1>
             <p className="text-base text-slate-300 leading-relaxed max-w-2xl">
-              Na correria do bar, fale vários pedidos seguidos e o Marcelo separa cada produto na
-              comanda certa, registrando qual garçom lançou e a qual comércio pertence. E se o
-              Marcelo não entender com 100% de certeza, ele não altera nada na conta.
+              O <strong>Administrador (ADM)</strong> cadastra o cardápio e cria o login (e-mail e
+              senha) de cada <strong>Garçom</strong>. O garçom entra no celular dele e consegue{' '}
+              <strong>somente adicionar</strong> pedidos — qualquer remoção ou exclusão é exclusiva
+              do ADM.
             </p>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1 text-xs">
+              <div className="p-3.5 bg-slate-900 border border-slate-800 rounded-xl space-y-1">
+                <div className="font-bold text-emerald-400 flex items-center gap-1.5">
+                  <ShieldCheck className="w-4 h-4" />
+                  Perfil ADM (Dono / Gerente)
+                </div>
+                <p className="text-slate-400">
+                  Cadastra garçons com e-mail e senha, edita e deleta itens do cardápio, dá baixa e
+                  pode remover itens de comandas.
+                </p>
+              </div>
+              <div className="p-3.5 bg-slate-900 border border-slate-800 rounded-xl space-y-1">
+                <div className="font-bold text-amber-400 flex items-center gap-1.5">
+                  <Lock className="w-4 h-4" />
+                  Perfil Garçom (Somente Adição)
+                </div>
+                <p className="text-slate-400">
+                  Entra com o e-mail e senha criados pelo ADM. Lança pedidos por voz ou toque, mas
+                  é bloqueado de remover qualquer item.
+                </p>
+              </div>
+            </div>
 
             <div className="pt-2 flex flex-wrap items-center gap-3">
               <button
                 type="button"
                 onClick={handleGoogleSignIn}
                 disabled={googleLoginBusy}
-                className="px-6 py-3 text-sm font-semibold bg-amber-500 text-slate-950 rounded-lg hover:bg-amber-400 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+                className="px-4 py-2.5 text-xs font-semibold bg-slate-900 text-slate-300 border border-slate-800 rounded-lg hover:bg-slate-800 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
               >
-                {googleLoginBusy ? 'Conectando ao Google...' : 'Entrar com Google'}
-              </button>
-              <button
-                type="button"
-                onClick={() => handleDirectBarLogin()}
-                className="px-5 py-3 text-sm font-semibold bg-slate-800 text-slate-100 border border-slate-700 rounded-lg hover:bg-slate-700 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
-              >
-                Entrar Agora (Acesso Direto Render)
+                {googleLoginBusy ? 'Conectando ao Google...' : 'Opcional: Entrar com Google (ADM)'}
               </button>
             </div>
 
-            {/* Diagnostic Panel when Google Login is blocked on onrender.com (auth/unauthorized-domain) */}
+            {/* Diagnostic Panel when Google Login is blocked on onrender.com */}
             {googleAuthError && (
-              <div className="p-4 bg-slate-900 border border-amber-500/60 rounded-xl space-y-3 text-xs">
+              <div className="p-4 bg-slate-900 border border-amber-500/60 rounded-xl space-y-2 text-xs">
                 <div className="flex items-start gap-2.5">
                   <AlertCircle className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
                   <div className="space-y-1">
                     <p className="font-bold text-amber-300">
-                      Por que o botão Google não abriu em {googleAuthError.domain}?
+                      Aviso de Domínio Google ({googleAuthError.domain})
                     </p>
-                    <p className="text-slate-300 leading-relaxed">
-                      {googleAuthError.message}
-                    </p>
+                    <p className="text-slate-300 leading-relaxed">{googleAuthError.message}</p>
                   </div>
                 </div>
-
-                <div className="flex flex-wrap items-center gap-2 pt-1">
-                  <button
-                    type="button"
-                    onClick={() => handleDirectBarLogin()}
-                    className="px-4 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold rounded-lg transition-colors cursor-pointer"
-                  >
-                    Entrar Imediatamente no Bar (Sem Pop-up Google)
-                  </button>
-
+                <div className="flex items-center gap-2 pt-1">
                   <button
                     type="button"
                     onClick={() => {
@@ -2341,7 +2982,7 @@ function ComandaVozWorkspace() {
                       setCopiedDomain(true);
                       setTimeout(() => setCopiedDomain(false), 2500);
                     }}
-                    className="inline-flex items-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg transition-colors cursor-pointer"
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg transition-colors cursor-pointer"
                   >
                     {copiedDomain ? (
                       <>
@@ -2351,120 +2992,218 @@ function ComandaVozWorkspace() {
                     ) : (
                       <>
                         <Copy className="w-3.5 h-3.5" />
-                        Copiar domínio ({googleAuthError.domain})
+                        Copiar domínio ({googleAuthError.domain}) para o Firebase
                       </>
                     )}
                   </button>
-                </div>
-
-                <div className="p-3 bg-slate-950 border border-slate-800 rounded-lg text-[11px] text-slate-400 space-y-1">
-                  <p className="font-semibold text-slate-300">
-                    Opcional — Como liberar o login Google no domínio do Render:
-                  </p>
-                  <p>
-                    1. No Firebase Console do projeto (<code className="text-amber-300">{firebaseProjectId}</code>), acesse <strong>Authentication &gt; Settings &gt; Domínios autorizados</strong>.
-                  </p>
-                  <p>
-                    2. Clique em <strong>Adicionar domínio</strong> e cole <code className="text-amber-300">{googleAuthError.domain}</code>.
-                  </p>
                 </div>
               </div>
             )}
           </div>
 
-          {/* Right Column: Direct Bar & Waiter Login Card (Works 100% on Render without OAuth domain blocks) */}
+          {/* Right Column: Email & Password Login + ADM Account Creation */}
           <div
-            id="acesso-bar"
-            className="lg:col-span-5 bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-4 text-xs"
+            id="login-email"
+            className="lg:col-span-5 bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-5 text-xs"
           >
-            <div className="space-y-1 border-b border-slate-800 pb-3">
-              <span className="text-amber-400 font-semibold block">
-                Funciona Direto no Render (onrender.com) e Celulares do Bar
-              </span>
-              <h2 className="text-base font-bold text-slate-100">
-                Acesso Direto por Usuário / Garçom e Comércio
-              </h2>
-              <p className="text-slate-400">
-                Entre com seu nome e código do comércio para lançar pedidos com o Marcelo em tempo real, mesmo sem pop-up do Google.
-              </p>
+            {/* Segmented Tab Switcher: Entrar vs Criar Conta ADM */}
+            <div className="grid grid-cols-2 gap-1.5 p-1 bg-slate-950 border border-slate-800 rounded-lg">
+              <button
+                type="button"
+                onClick={() => {
+                  setAuthTab('login');
+                  setAuthFormError(null);
+                }}
+                className={`py-2.5 px-3 rounded-md font-bold transition-colors cursor-pointer ${
+                  authTab === 'login'
+                    ? 'bg-amber-500 text-slate-950'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                Entrar (E-mail e Senha)
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setAuthTab('register_adm');
+                  setAuthFormError(null);
+                }}
+                className={`py-2.5 px-3 rounded-md font-bold transition-colors cursor-pointer ${
+                  authTab === 'register_adm'
+                    ? 'bg-amber-500 text-slate-950'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                Criar Conta ADM
+              </button>
             </div>
 
-            <form onSubmit={handleDirectBarLogin} className="space-y-3">
-              <div className="space-y-1">
-                <label className="text-slate-300 block font-medium">
-                  Seu Nome (Usuário / Garçom)
-                </label>
-                <input
-                  type="text"
-                  value={directNameInput}
-                  onChange={(e) => setDirectNameInput(e.target.value)}
-                  placeholder="Ex: Carlos ou Garçom Rodrigo"
-                  required
-                  maxLength={60}
-                  className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-amber-500"
-                />
+            {authFormError && (
+              <div className="p-3 bg-red-950/60 border border-red-800/80 rounded-lg text-red-200 flex items-start gap-2">
+                <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
+                <span>{authFormError}</span>
               </div>
+            )}
 
-              <div className="grid grid-cols-2 gap-3">
+            {authTab === 'login' ? (
+              <form onSubmit={handleEmailPasswordLogin} className="space-y-4">
                 <div className="space-y-1">
-                  <label className="text-slate-300 block font-medium">Função</label>
-                  <select
-                    value={directRoleInput}
-                    onChange={(e) => setDirectRoleInput(e.target.value as UserRoleType)}
-                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-slate-100"
-                  >
-                    <option value="Proprietário">Proprietário</option>
-                    <option value="Garçom">Garçom</option>
-                    <option value="Caixa">Caixa</option>
-                    <option value="Gerente">Gerente</option>
-                  </select>
+                  <h2 className="text-base font-bold text-slate-100">
+                    Acesso do ADM ou Garçom
+                  </h2>
+                  <p className="text-slate-400">
+                    Digite seu e-mail e senha cadastrados para acessar as comandas do bar.
+                  </p>
                 </div>
 
-                <div className="space-y-1">
-                  <label className="text-slate-300 block font-medium">Código do Comércio</label>
+                <div className="space-y-1.5">
+                  <label className="text-slate-300 font-medium flex items-center gap-1.5">
+                    <Mail className="w-3.5 h-3.5 text-amber-400" />
+                    E-mail de Acesso
+                  </label>
                   <input
-                    type="text"
-                    value={directStoreCodeInput}
-                    onChange={(e) => setDirectStoreCodeInput(e.target.value)}
-                    placeholder="Ex: BAR-01"
+                    type="email"
+                    value={loginEmail}
+                    onChange={(e) => setLoginEmail(e.target.value)}
+                    placeholder="Ex: adm@bar.com ou garcom@bar.com"
                     required
-                    maxLength={30}
-                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-slate-100 font-mono"
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3.5 py-2.5 text-slate-100 focus:outline-none focus:border-amber-500"
                   />
                 </div>
-              </div>
 
-              <div className="space-y-1">
-                <label className="text-slate-300 block font-medium">
-                  Nome do Bar / Comércio
-                </label>
-                <input
-                  type="text"
-                  value={directStoreNameInput}
-                  onChange={(e) => setDirectStoreNameInput(e.target.value)}
-                  placeholder="Ex: Bar do Zé"
-                  required
-                  maxLength={80}
-                  className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-amber-500"
-                />
-              </div>
+                <div className="space-y-1.5">
+                  <label className="text-slate-300 font-medium flex items-center gap-1.5">
+                    <KeyRound className="w-3.5 h-3.5 text-amber-400" />
+                    Senha
+                  </label>
+                  <div className="relative">
+                    <input
+                      type={showPassword ? 'text' : 'password'}
+                      value={loginPassword}
+                      onChange={(e) => setLoginPassword(e.target.value)}
+                      placeholder="Digite sua senha"
+                      required
+                      className="w-full bg-slate-950 border border-slate-700 rounded-lg pl-3.5 pr-10 py-2.5 text-slate-100 focus:outline-none focus:border-amber-500"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowPassword((prev) => !prev)}
+                      className="absolute right-3 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200 cursor-pointer"
+                    >
+                      {showPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                    </button>
+                  </div>
+                </div>
 
-              <button
-                type="submit"
-                className="w-full py-3 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-sm rounded-lg transition-colors cursor-pointer"
-              >
-                Entrar no Sistema do Bar ({sanitizeStoreCode(directStoreCodeInput, 'BAR-01')})
-              </button>
-            </form>
+                <button
+                  type="submit"
+                  disabled={authBusy}
+                  className="w-full py-3 bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-bold text-sm rounded-lg transition-colors cursor-pointer"
+                >
+                  {authBusy ? 'Verificando credenciais...' : 'Entrar no Sistema'}
+                </button>
 
-            <div className="pt-2 border-t border-slate-800 space-y-2 text-[11px] text-slate-400">
-              <p>
-                • <strong className="text-slate-200">Sincronização em Tempo Real no Render:</strong> todos os garçons que entrarem com o mesmo Código do Comércio (<code className="text-amber-300">{sanitizeStoreCode(directStoreCodeInput, 'BAR-01')}</code>) compartilham as comandas ao vivo.
-              </p>
-              <p>
-                • <strong className="text-slate-200">Zero Erro:</strong> se o Marcelo não entender o produto ou o nome do cliente, nada é lançado.
-              </p>
-            </div>
+                <div className="pt-2 border-t border-slate-800 text-center">
+                  <span className="text-slate-400">Primeiro acesso do dono do bar? </span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setAuthTab('register_adm');
+                      setAuthFormError(null);
+                    }}
+                    className="text-amber-400 font-semibold hover:underline cursor-pointer"
+                  >
+                    Criar Conta ADM aqui
+                  </button>
+                </div>
+              </form>
+            ) : (
+              <form onSubmit={handleRegisterAdminAccount} className="space-y-3.5">
+                <div className="space-y-1">
+                  <h2 className="text-base font-bold text-slate-100">
+                    Cadastrar Administrador (Dono do Bar)
+                  </h2>
+                  <p className="text-slate-400">
+                    Crie sua conta ADM com e-mail e senha. Depois de entrar, você poderá cadastrar
+                    os garçons e editar o cardápio.
+                  </p>
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-slate-300 block font-medium">Nome do Administrador (ADM)</label>
+                  <input
+                    type="text"
+                    value={regAdmName}
+                    onChange={(e) => setRegAdmName(e.target.value)}
+                    placeholder="Ex: Carlos (ADM)"
+                    required
+                    maxLength={60}
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-amber-500"
+                  />
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div className="space-y-1">
+                    <label className="text-slate-300 block font-medium">E-mail do ADM</label>
+                    <input
+                      type="email"
+                      value={regAdmEmail}
+                      onChange={(e) => setRegAdmEmail(e.target.value)}
+                      placeholder="Ex: adm@bar.com"
+                      required
+                      className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-amber-500"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-slate-300 block font-medium">Senha do ADM</label>
+                    <input
+                      type={showPassword ? 'text' : 'password'}
+                      value={regAdmPassword}
+                      onChange={(e) => setRegAdmPassword(e.target.value)}
+                      placeholder="Mín. 4 caracteres"
+                      required
+                      minLength={4}
+                      className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-amber-500"
+                    />
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div className="space-y-1">
+                    <label className="text-slate-300 block font-medium">Nome do Bar / Comércio</label>
+                    <input
+                      type="text"
+                      value={regStoreName}
+                      onChange={(e) => setRegStoreName(e.target.value)}
+                      placeholder="Ex: Bar do Zé"
+                      required
+                      maxLength={80}
+                      className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-amber-500"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-slate-300 block font-medium">Código do Comércio</label>
+                    <input
+                      type="text"
+                      value={regStoreCode}
+                      onChange={(e) => setRegStoreCode(e.target.value)}
+                      placeholder="Ex: BAR-01"
+                      required
+                      maxLength={30}
+                      className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-slate-100 font-mono focus:outline-none focus:border-amber-500"
+                    />
+                  </div>
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={authBusy}
+                  className="w-full py-3 bg-emerald-500 hover:bg-emerald-400 disabled:opacity-50 text-slate-950 font-bold text-sm rounded-lg transition-colors cursor-pointer"
+                >
+                  {authBusy ? 'Criando Conta ADM...' : 'Criar Conta ADM e Entrar'}
+                </button>
+              </form>
+            )}
           </div>
         </main>
 
@@ -2535,8 +3274,27 @@ function ComandaVozWorkspace() {
           </button>
         </nav>
 
-        {/* Zone 3: 1 Primary Action */}
+        {/* Zone 3: Role Indicator + Sign Out */}
         <div className="flex items-center gap-3 shrink-0">
+          <span
+            className={`hidden sm:inline-flex items-center gap-1.5 px-2.5 py-1 rounded text-xs font-bold ${
+              isAdmin
+                ? 'bg-emerald-950/80 text-emerald-300 border border-emerald-700/50'
+                : 'bg-amber-950/80 text-amber-300 border border-amber-700/50'
+            }`}
+          >
+            {isAdmin ? (
+              <>
+                <ShieldCheck className="w-3.5 h-3.5" />
+                ADM ({userProfile?.userName || directSession?.userName || 'Dono'})
+              </>
+            ) : (
+              <>
+                <Lock className="w-3.5 h-3.5" />
+                GARÇOM ({directSession?.userName || userProfile?.userName || 'Somente Adição'})
+              </>
+            )}
+          </span>
           <button
             onClick={handleSignOutAll}
             className="inline-flex items-center gap-2 px-3.5 py-1.5 text-xs font-medium text-slate-300 bg-slate-800 rounded-lg hover:bg-slate-700 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
@@ -2557,7 +3315,7 @@ function ComandaVozWorkspace() {
                   Assistente Marcelo — Pedidos Contínuos Sem Pausa & Proteção Anti-Erro
                 </h1>
                 <span className="text-xs text-slate-400">
-                  · Se não entender, nada é alterado
+                  · {isAdmin ? 'Modo ADM (Controle Total)' : 'Modo Garçom (Somente Adição — Sem Remoção)'}
                 </span>
               </div>
               <p className="text-xs text-slate-400">
@@ -2568,7 +3326,7 @@ function ComandaVozWorkspace() {
               </p>
             </div>
 
-            {/* Active Establishment (Comércio) + Waiter Selector & KPI Strip */}
+            {/* Active Establishment (Comércio) + Waiter Attribution & KPI Strip */}
             <div className="flex flex-wrap items-center gap-4 text-xs border-t lg:border-t-0 pt-3 lg:pt-0 border-slate-800 shrink-0">
               <div className="bg-slate-950 border border-slate-800 rounded-lg px-3 py-1.5">
                 <span className="text-slate-400 block text-[11px]">
@@ -2577,20 +3335,26 @@ function ComandaVozWorkspace() {
                 <div className="flex items-center gap-1.5 mt-0.5">
                   <UserCheck className="w-3.5 h-3.5 text-amber-400 shrink-0" />
                   <span className="text-slate-400">Lançando como:</span>
-                  <select
-                    value={selectedWaiterId}
-                    onChange={(e) => setSelectedWaiterId(e.target.value)}
-                    className="bg-transparent text-amber-400 font-semibold focus:outline-none cursor-pointer"
-                  >
-                    <option value="logged_user" className="bg-slate-900 text-slate-100">
-                      {userProfile?.userName || user.displayName || 'Usuário Principal'} ({userProfile?.userRole || 'Proprietário'})
-                    </option>
-                    {voiceOperators.map((op) => (
-                      <option key={op.id} value={op.id} className="bg-slate-900 text-slate-100">
-                        {op.operatorName} ({op.roleLabel})
+                  {isAdmin ? (
+                    <select
+                      value={selectedWaiterId}
+                      onChange={(e) => setSelectedWaiterId(e.target.value)}
+                      className="bg-transparent text-amber-400 font-semibold focus:outline-none cursor-pointer"
+                    >
+                      <option value="logged_user" className="bg-slate-900 text-slate-100">
+                        {userProfile?.userName || directSession?.userName || 'ADM'} (ADM)
                       </option>
-                    ))}
-                  </select>
+                      {voiceOperators.map((op) => (
+                        <option key={op.id} value={op.id} className="bg-slate-900 text-slate-100">
+                          {op.operatorName} ({op.roleLabel})
+                        </option>
+                      ))}
+                    </select>
+                  ) : (
+                    <span className="text-amber-400 font-bold">
+                      {activeWaiterDisplay.name}
+                    </span>
+                  )}
                 </div>
               </div>
 
@@ -2782,7 +3546,7 @@ function ComandaVozWorkspace() {
                     {marceloReport.title}
                   </span>
                   <span className="text-xs text-slate-400">
-                    · {marceloReport.stageLabel} · Garçom: {marceloReport.waiterAttribution}
+                    · {marceloReport.stageLabel} · Lançado por: {marceloReport.waiterAttribution}
                   </span>
                 </div>
                 <div className="flex items-center gap-2">
@@ -2793,14 +3557,14 @@ function ComandaVozWorkspace() {
                   >
                     Ouvir Marcelo Novamente
                   </button>
-                  {lastUndo && marceloReport.intent === 'MARCAR' && (
+                  {isAdmin && lastUndo && marceloReport.intent === 'MARCAR' && (
                     <button
                       type="button"
                       onClick={handleUndoLastLaunch}
                       className="inline-flex items-center gap-1 px-2.5 py-1 text-xs bg-slate-900 hover:bg-slate-800 text-slate-300 border border-slate-700 rounded cursor-pointer"
                     >
                       <RotateCcw className="w-3 h-3" />
-                      Desfazer Lote
+                      Desfazer Lote (ADM)
                     </button>
                   )}
                 </div>
@@ -2846,8 +3610,8 @@ function ComandaVozWorkspace() {
             </div>
           )}
 
-          {/* Feedback Banner for strict abort ("se não entendeu, não faça nada") or quick notifications */}
-          {feedbackBanner && !marceloReport && (
+          {/* Feedback Banner */}
+          {feedbackBanner && (
             <div
               className={`flex flex-wrap items-center justify-between gap-3 px-4 py-3 rounded-lg border text-xs ${
                 feedbackBanner.type === 'success'
@@ -2863,6 +3627,13 @@ function ComandaVozWorkspace() {
                 )}
                 <span>{feedbackBanner.message}</span>
               </div>
+              <button
+                type="button"
+                onClick={() => setFeedbackBanner(null)}
+                className="text-slate-400 hover:text-slate-200 text-[11px] underline cursor-pointer"
+              >
+                Fechar aviso
+              </button>
             </div>
           )}
         </section>
@@ -3112,7 +3883,7 @@ function ComandaVozWorkspace() {
                               : t
                           );
                           setTabs(nextTabs);
-                          await syncDirectStoreSnapshot({ tabs: nextTabs });
+                          await syncDirectStoreSnapshot({ tabs: nextTabs, actionType: 'add' });
                         } else {
                           await updateDoc(doc(db, 'tabs', selectedTab.id), {
                             status: 'open',
@@ -3339,7 +4110,9 @@ function ComandaVozWorkspace() {
                         Produtos Marcados na Conta de {selectedTab.customerName}
                       </h3>
                       <span className="text-xs text-slate-400">
-                        Use + ou - para ajuste rápido
+                        {isAdmin
+                          ? 'ADM: pode adicionar (+) ou remover (-)'
+                          : 'Garçom: somente adicionar (+)'}
                       </span>
                     </div>
 
@@ -3378,13 +4151,16 @@ function ComandaVozWorkspace() {
                                   </td>
                                   <td className="py-2.5 px-3">
                                     <div className="flex items-center justify-center gap-2">
-                                      <button
-                                        type="button"
-                                        onClick={() => handleAdjustTabItemQty(latestEntry, -1)}
-                                        className="w-6 h-6 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 flex items-center justify-center cursor-pointer"
-                                      >
-                                        <Minus className="w-3 h-3" />
-                                      </button>
+                                      {isAdmin && (
+                                        <button
+                                          type="button"
+                                          onClick={() => handleAdjustTabItemQty(latestEntry, -1)}
+                                          className="w-6 h-6 rounded bg-slate-800 hover:bg-red-900/60 text-slate-200 flex items-center justify-center cursor-pointer"
+                                          title="ADM: Diminuir quantidade"
+                                        >
+                                          <Minus className="w-3 h-3" />
+                                        </button>
+                                      )}
                                       <span className="font-mono tabular-nums font-bold text-sm text-slate-100 w-7 text-center">
                                         {group.totalQuantity}
                                       </span>
@@ -3392,6 +4168,7 @@ function ComandaVozWorkspace() {
                                         type="button"
                                         onClick={() => handleAdjustTabItemQty(latestEntry, 1)}
                                         className="w-6 h-6 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 flex items-center justify-center cursor-pointer"
+                                        title="Adicionar +1 unidade"
                                       >
                                         <Plus className="w-3 h-3" />
                                       </button>
@@ -3440,7 +4217,7 @@ function ComandaVozWorkspace() {
                         .filter(
                           (m) => categoryFilter === 'todas' || m.category === categoryFilter
                         )
-                        .slice(0, 9)
+                        .slice(0, 12)
                         .map((item) => (
                           <button
                             key={item.id}
@@ -3470,7 +4247,9 @@ function ComandaVozWorkspace() {
                         Prova de Consumo & Garçom Responsável ({selectedTabItems.length} registros)
                       </h3>
                       <span className="text-[11px] text-slate-400">
-                        Hora exata + qual garçom lançou
+                        {isAdmin
+                          ? 'ADM pode excluir lançamentos incorretos'
+                          : 'Somente o ADM pode remover lançamentos'}
                       </span>
                     </div>
 
@@ -3490,12 +4269,16 @@ function ComandaVozWorkspace() {
                                   +{entry.quantity}x {entry.itemName}
                                 </span>
                                 <span className="text-slate-400">
-                                  · Garçom: <strong className="text-amber-300">{entry.launchedByName || activeWaiterDisplay.name}</strong>
+                                  · Garçom:{' '}
+                                  <strong className="text-amber-300">
+                                    {entry.launchedByName || activeWaiterDisplay.name}
+                                  </strong>
                                 </span>
                               </div>
                               {entry.voiceTranscript && (
                                 <p className="text-[11px] text-slate-400 truncate">
-                                  Frase: &ldquo;{entry.voiceTranscript}&rdquo; ({entry.storeName || currentStoreName})
+                                  Frase: &ldquo;{entry.voiceTranscript}&rdquo; (
+                                  {entry.storeName || currentStoreName})
                                 </p>
                               )}
                             </div>
@@ -3504,14 +4287,16 @@ function ComandaVozWorkspace() {
                               <span className="font-mono tabular-nums font-semibold text-slate-200">
                                 {formatBRL(entry.totalPrice)}
                               </span>
-                              <button
-                                type="button"
-                                onClick={() => handleAdjustTabItemQty(entry, -entry.quantity)}
-                                className="text-slate-500 hover:text-red-400 transition-colors cursor-pointer"
-                                title="Remover este lançamento"
-                              >
-                                <Trash2 className="w-3.5 h-3.5" />
-                              </button>
+                              {isAdmin && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleAdjustTabItemQty(entry, -entry.quantity)}
+                                  className="text-slate-500 hover:text-red-400 transition-colors cursor-pointer"
+                                  title="ADM: Remover este lançamento"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5" />
+                                </button>
+                              )}
                             </div>
                           </div>
                         ))}
@@ -3524,195 +4309,232 @@ function ComandaVozWorkspace() {
           </div>
         )}
 
-        {/* SECTION 2: GARÇONS, USUÁRIOS & COMÉRCIO + TREINAMENTO DE VOZ */}
+        {/* SECTION 2: GARÇONS, USUÁRIOS & COMÉRCIO + CADASTRO DE GARÇOM PELO ADM */}
         {activeSection === 'equipe_comercio' && (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-            {/* Left Column: Establishment (Comércio) & Logged-in User Profile + New Waiter Registration */}
+            {/* Left Column: ADM Store Settings & ADM Waiter Registration (Email + Password + Voice) */}
             <div className="lg:col-span-5 space-y-6">
-              {/* Store & Current User Card */}
-              <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
-                <div className="space-y-1">
-                  <h2 className="text-base font-bold text-slate-100 flex items-center gap-2">
-                    <Store className="w-5 h-5 text-amber-400" />
-                    Identificação do Comércio e Meu Usuário
-                  </h2>
-                  <p className="text-xs text-slate-400">
-                    Defina o nome e código do seu bar/comércio e seus dados de usuário
-                  </p>
-                </div>
+              {isAdmin ? (
+                <>
+                  {/* Store & ADM User Card */}
+                  <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
+                    <div className="space-y-1">
+                      <h2 className="text-base font-bold text-slate-100 flex items-center gap-2">
+                        <Store className="w-5 h-5 text-amber-400" />
+                        Configurações do Comércio e Administrador (ADM)
+                      </h2>
+                      <p className="text-xs text-slate-400">
+                        Defina o nome e código do seu bar/comércio e seus dados de ADM
+                      </p>
+                    </div>
 
-                <form onSubmit={handleSaveUserProfile} className="space-y-3 text-xs">
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    <div className="space-y-1">
-                      <label className="text-slate-300 block">Nome do Comércio / Bar</label>
-                      <input
-                        type="text"
-                        value={profileStoreName}
-                        onChange={(e) => setProfileStoreName(e.target.value)}
-                        placeholder="Ex: Bar do Zé"
-                        required
-                        maxLength={80}
-                        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100"
-                      />
-                    </div>
-                    <div className="space-y-1">
-                      <label className="text-slate-300 block">Código do Comércio</label>
-                      <input
-                        type="text"
-                        value={profileStoreCode}
-                        onChange={(e) => setProfileStoreCode(e.target.value)}
-                        placeholder="Ex: BAR-ZE-01"
-                        required
-                        maxLength={30}
-                        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 font-mono"
-                      />
-                    </div>
-                  </div>
+                    <form onSubmit={handleSaveUserProfile} className="space-y-3 text-xs">
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                        <div className="space-y-1">
+                          <label className="text-slate-300 block">Nome do Comércio / Bar</label>
+                          <input
+                            type="text"
+                            value={profileStoreName}
+                            onChange={(e) => setProfileStoreName(e.target.value)}
+                            placeholder="Ex: Bar do Zé"
+                            required
+                            maxLength={80}
+                            className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100"
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <label className="text-slate-300 block">Código do Comércio</label>
+                          <input
+                            type="text"
+                            value={profileStoreCode}
+                            onChange={(e) => setProfileStoreCode(e.target.value)}
+                            placeholder="Ex: BAR-01"
+                            required
+                            maxLength={30}
+                            className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 font-mono"
+                          />
+                        </div>
+                      </div>
 
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                    <div className="space-y-1">
-                      <label className="text-slate-300 block">Seu Nome de Usuário</label>
-                      <input
-                        type="text"
-                        value={profileUserName}
-                        onChange={(e) => setProfileUserName(e.target.value)}
-                        placeholder="Ex: Carlos Silva"
-                        required
-                        maxLength={60}
-                        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100"
-                      />
-                    </div>
-                    <div className="space-y-1">
-                      <label className="text-slate-300 block">Sua Função no Comércio</label>
-                      <select
-                        value={profileUserRole}
-                        onChange={(e) => setProfileUserRole(e.target.value as UserRoleType)}
-                        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100"
+                      <div className="space-y-1">
+                        <label className="text-slate-300 block">Nome do Administrador (ADM)</label>
+                        <input
+                          type="text"
+                          value={profileUserName}
+                          onChange={(e) => setProfileUserName(e.target.value)}
+                          placeholder="Ex: Carlos Silva"
+                          required
+                          maxLength={60}
+                          className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100"
+                        />
+                      </div>
+
+                      <button
+                        type="submit"
+                        disabled={savingProfile}
+                        className="w-full py-2.5 bg-slate-800 hover:bg-slate-700 text-amber-400 font-bold rounded-lg transition-colors cursor-pointer"
                       >
-                        <option value="Proprietário">Proprietário</option>
-                        <option value="Gerente">Gerente</option>
-                        <option value="Garçom">Garçom</option>
-                        <option value="Caixa">Caixa</option>
-                      </select>
-                    </div>
+                        {savingProfile ? 'Salvando...' : 'Atualizar Dados do Comércio'}
+                      </button>
+                    </form>
                   </div>
 
-                  <button
-                    type="submit"
-                    disabled={savingProfile}
-                    className="w-full py-2.5 bg-slate-800 hover:bg-slate-700 text-amber-400 font-bold rounded-lg transition-colors cursor-pointer"
-                  >
-                    {savingProfile ? 'Salvando...' : 'Atualizar Dados do Comércio e Meu Usuário'}
-                  </button>
-                </form>
-              </div>
-
-              {/* Register & Train Waiter Voice Profile */}
-              <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
-                <div className="space-y-1">
-                  <h2 className="text-base font-bold text-slate-100 flex items-center gap-2">
-                    <Fingerprint className="w-5 h-5 text-amber-400" />
-                    Cadastrar Garçom / Usuário com Voz Treinada
-                  </h2>
-                  <p className="text-xs text-slate-400">
-                    Vincule cada garçom ao comércio <strong className="text-slate-200">{currentStoreName}</strong> e grave 3 frases da voz dele para sabermos quem lançou cada item.
-                  </p>
-                </div>
-
-                <form onSubmit={handleSaveTrainedOperator} className="space-y-4 text-xs">
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5">
+                  {/* ADM Register Waiter Form (Email & Password + Optional Voice) */}
+                  <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
                     <div className="space-y-1">
-                      <label className="text-slate-300 block">Nome do Garçom</label>
-                      <input
-                        type="text"
-                        value={newOpName}
-                        onChange={(e) => setNewOpName(e.target.value)}
-                        placeholder="Ex: Rodrigo"
-                        required
-                        maxLength={60}
-                        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100"
-                      />
+                      <h2 className="text-base font-bold text-slate-100 flex items-center gap-2">
+                        <UserPlus className="w-5 h-5 text-amber-400" />
+                        Cadastrar Garçom (E-mail, Senha e Voz)
+                      </h2>
+                      <p className="text-xs text-slate-400">
+                        Crie o e-mail e senha para o garçom entrar no sistema. O garçom cadastrado{' '}
+                        <strong className="text-amber-300">só consegue adicionar itens</strong> (não
+                        remove nada).
+                      </p>
                     </div>
-                    <div className="space-y-1">
-                      <label className="text-slate-300 block">Cargo</label>
-                      <select
-                        value={newOpRole}
-                        onChange={(e) => setNewOpRole(e.target.value)}
-                        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100"
-                      >
-                        <option value="Garçom">Garçom</option>
-                        <option value="Proprietário">Proprietário</option>
-                        <option value="Caixa">Caixa</option>
-                        <option value="Gerente">Gerente</option>
-                      </select>
-                    </div>
-                    <div className="space-y-1">
-                      <label className="text-slate-300 block">PIN Falado</label>
-                      <input
-                        type="text"
-                        value={newOpPin}
-                        onChange={(e) => setNewOpPin(e.target.value)}
-                        placeholder="Ex: 10"
-                        maxLength={20}
-                        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 font-mono"
-                      />
-                    </div>
-                  </div>
 
-                  {/* 3 Voice Sample Recording Steps */}
-                  <div className="p-3.5 bg-slate-950 border border-slate-800 rounded-lg space-y-3">
-                    <div className="flex items-center justify-between">
-                      <span className="font-semibold text-slate-200">
-                        Treinamento Vocal ({trainingSamples.length}/3 amostras)
-                      </span>
-                      {trainingSamples.length > 0 && (
+                    <form onSubmit={handleSaveTrainedOperator} className="space-y-3.5 text-xs">
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                        <div className="space-y-1">
+                          <label className="text-slate-300 block font-medium">
+                            Nome do Garçom *
+                          </label>
+                          <input
+                            type="text"
+                            value={newOpName}
+                            onChange={(e) => setNewOpName(e.target.value)}
+                            placeholder="Ex: Rodrigo"
+                            required
+                            maxLength={60}
+                            className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100"
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <label className="text-slate-300 block font-medium">
+                            PIN Falado (Opcional)
+                          </label>
+                          <input
+                            type="text"
+                            value={newOpPin}
+                            onChange={(e) => setNewOpPin(e.target.value)}
+                            placeholder="Ex: 10"
+                            maxLength={20}
+                            className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 font-mono"
+                          />
+                        </div>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                        <div className="space-y-1">
+                          <label className="text-slate-300 block font-medium">
+                            E-mail de Login do Garçom *
+                          </label>
+                          <input
+                            type="email"
+                            value={newOpEmail}
+                            onChange={(e) => setNewOpEmail(e.target.value)}
+                            placeholder="Ex: rodrigo@bar.com"
+                            required
+                            className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100"
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <label className="text-slate-300 block font-medium">
+                            Senha do Garçom *
+                          </label>
+                          <input
+                            type="text"
+                            value={newOpPassword}
+                            onChange={(e) => setNewOpPassword(e.target.value)}
+                            placeholder="Mínimo 4 dígitos"
+                            required
+                            minLength={4}
+                            className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 font-mono"
+                          />
+                        </div>
+                      </div>
+
+                      {/* Optional Voice Sample Recording Steps */}
+                      <div className="p-3.5 bg-slate-950 border border-slate-800 rounded-lg space-y-2.5">
+                        <div className="flex items-center justify-between">
+                          <span className="font-semibold text-slate-200 flex items-center gap-1.5">
+                            <Fingerprint className="w-3.5 h-3.5 text-amber-400" />
+                            Treinamento Vocal Opcional ({trainingSamples.length}/3 amostras)
+                          </span>
+                          {trainingSamples.length > 0 && (
+                            <button
+                              type="button"
+                              onClick={() => setTrainingSamples([])}
+                              className="text-slate-400 hover:text-slate-200 underline cursor-pointer"
+                            >
+                              Limpar voz
+                            </button>
+                          )}
+                        </div>
+
+                        <p className="text-slate-400 text-[11px]">
+                          Opcional: grave a voz do garçom lendo:{' '}
+                          <strong className="text-amber-300 font-mono">
+                            &ldquo;{TRAINING_PHRASES[Math.min(trainingSamples.length, 2)]}&rdquo;
+                          </strong>
+                        </p>
+
                         <button
                           type="button"
-                          onClick={() => setTrainingSamples([])}
-                          className="text-slate-400 hover:text-slate-200 underline cursor-pointer"
+                          disabled={isRecordingSample || trainingSamples.length >= 3}
+                          onClick={handleRecordTrainingSample}
+                          className={`w-full py-2 rounded-lg font-semibold flex items-center justify-center gap-2 transition-colors cursor-pointer ${
+                            isRecordingSample
+                              ? 'bg-red-600 text-white'
+                              : trainingSamples.length >= 3
+                                ? 'bg-emerald-900/40 text-emerald-300 border border-emerald-700/50'
+                                : 'bg-slate-800 hover:bg-slate-700 text-slate-200'
+                          }`}
                         >
-                          Reiniciar
+                          <Mic className="w-3.5 h-3.5" />
+                          {isRecordingSample
+                            ? 'Gravando voz do garçom...'
+                            : trainingSamples.length >= 3
+                              ? '3 Amostras de Voz Gravadas!'
+                              : `Gravar Amostra de Voz (${trainingSamples.length}/3)`}
                         </button>
-                      )}
-                    </div>
+                      </div>
 
-                    <p className="text-slate-400">
-                      Peça ao garçom para ler a frase #{Math.min(trainingSamples.length + 1, 3)}:{' '}
-                      <strong className="text-amber-300 font-mono block mt-1">
-                        &ldquo;{TRAINING_PHRASES[Math.min(trainingSamples.length, 2)]}&rdquo;
-                      </strong>
-                    </p>
-
-                    <button
-                      type="button"
-                      disabled={isRecordingSample || trainingSamples.length >= 3}
-                      onClick={handleRecordTrainingSample}
-                      className={`w-full py-2.5 rounded-lg font-bold flex items-center justify-center gap-2 transition-colors cursor-pointer ${
-                        isRecordingSample
-                          ? 'bg-red-600 text-white'
-                          : trainingSamples.length >= 3
-                            ? 'bg-emerald-900/40 text-emerald-300 border border-emerald-700/50'
-                            : 'bg-slate-800 hover:bg-slate-700 text-amber-400'
-                      }`}
-                    >
-                      <Mic className="w-4 h-4" />
-                      {isRecordingSample
-                        ? 'Gravando voz do garçom (fale agora)...'
-                        : trainingSamples.length >= 3
-                          ? '3 Amostras de Voz Concluídas!'
-                          : `Gravar Amostra de Voz ${trainingSamples.length + 1} de 3`}
-                    </button>
+                      <button
+                        type="submit"
+                        disabled={
+                          registeringWaiter ||
+                          !newOpName.trim() ||
+                          !newOpEmail.trim() ||
+                          newOpPassword.trim().length < 4
+                        }
+                        className="w-full py-3 bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-slate-950 font-bold rounded-lg transition-colors cursor-pointer"
+                      >
+                        {registeringWaiter
+                          ? 'Cadastrando Garçom...'
+                          : `Cadastrar Garçom no Comércio (${currentStoreCode})`}
+                      </button>
+                    </form>
                   </div>
-
-                  <button
-                    type="submit"
-                    disabled={!newOpName.trim() || trainingSamples.length === 0}
-                    className="w-full py-2.5 bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-slate-950 font-bold rounded-lg transition-colors cursor-pointer"
-                  >
-                    Cadastrar Garçom no Comércio ({currentStoreCode})
-                  </button>
-                </form>
-              </div>
+                </>
+              ) : (
+                <div className="bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-3 text-xs">
+                  <div className="flex items-center gap-2 text-amber-400 font-bold text-sm">
+                    <Lock className="w-4 h-4" />
+                    Área Exclusiva do Administrador (ADM)
+                  </div>
+                  <p className="text-slate-300 leading-relaxed">
+                    Você está conectado como <strong>Garçom ({directSession?.userName})</strong> no
+                    comércio <strong>{currentStoreName}</strong>.
+                  </p>
+                  <p className="text-slate-400 leading-relaxed">
+                    • Sua conta tem permissão para <strong>adicionar pedidos</strong> nas comandas
+                    por voz ou toque rápido.
+                    <br />• Somente o <strong>ADM</strong> pode cadastrar/remover garçons, alterar o
+                    cardápio ou remover itens de comandas.
+                  </p>
+                </div>
+              )}
             </div>
 
             {/* Right Column: Registered Waiters & Store Attribution Table */}
@@ -3720,10 +4542,11 @@ function ComandaVozWorkspace() {
               <div className="flex items-center justify-between">
                 <div>
                   <h2 className="text-base font-bold text-slate-100">
-                    Usuários e Garçons Vinculados ao Comércio ({voiceOperators.length + 1})
+                    Equipe Cadastrada no Comércio ({voiceOperators.length + 1})
                   </h2>
                   <p className="text-xs text-slate-400">
-                    Comércio ativo: <strong className="text-amber-400">{currentStoreName}</strong> · Código: <strong className="font-mono text-slate-200">{currentStoreCode}</strong>
+                    Comércio: <strong className="text-amber-400">{currentStoreName}</strong> ·
+                    Código: <strong className="font-mono text-slate-200">{currentStoreCode}</strong>
                   </p>
                 </div>
               </div>
@@ -3733,9 +4556,9 @@ function ComandaVozWorkspace() {
                   <thead>
                     <tr className="bg-slate-950 border-b border-slate-800 text-slate-400">
                       <th className="py-2.5 px-4 font-medium">Usuário / Garçom</th>
-                      <th className="py-2.5 px-4 font-medium">Comércio Vinculado</th>
-                      <th className="py-2.5 px-4 font-medium">Assinatura de Voz</th>
-                      <th className="py-2.5 px-4 font-medium text-right">Itens Lançados</th>
+                      <th className="py-2.5 px-4 font-medium">E-mail de Login</th>
+                      <th className="py-2.5 px-4 font-medium">Permissão</th>
+                      <th className="py-2.5 px-4 font-medium text-right">Lançamentos</th>
                       <th className="py-2.5 px-4 font-medium text-right">Ação</th>
                     </tr>
                   </thead>
@@ -3743,44 +4566,41 @@ function ComandaVozWorkspace() {
                     {/* Logged-in Primary User Row */}
                     <tr className="bg-slate-900/50">
                       <td className="py-2.5 px-4 font-semibold text-slate-100">
-                        {userProfile?.userName || user.displayName || 'Operador Principal'}
+                        {userProfile?.userName || directSession?.userName || 'Operador'}
                         <span className="block text-[11px] text-amber-400 font-normal">
-                          {userProfile?.userRole || 'Proprietário'} (Conta Google Logada)
+                          Sessão Atual ({isAdmin ? 'ADM' : 'Garçom'})
                         </span>
                       </td>
-                      <td className="py-2.5 px-4 text-slate-300">
-                        {currentStoreName}
-                        <span className="block text-[11px] font-mono text-slate-400">
-                          {currentStoreCode}
+                      <td className="py-2.5 px-4 text-slate-300 font-mono">
+                        {directSession?.email || user.email || '—'}
+                      </td>
+                      <td className="py-2.5 px-4">
+                        <span
+                          className={`px-2 py-0.5 rounded text-[11px] font-semibold ${
+                            isAdmin
+                              ? 'bg-emerald-950 text-emerald-300 border border-emerald-700/50'
+                              : 'bg-amber-950 text-amber-300 border border-amber-700/50'
+                          }`}
+                        >
+                          {isAdmin ? 'ADM (Adiciona e Remove)' : 'Garçom (Somente Adiciona)'}
                         </span>
                       </td>
-                      <td className="py-2.5 px-4 text-slate-400">Titular da Conta</td>
                       <td className="py-2.5 px-4 text-right font-mono tabular-nums font-bold text-slate-200">
                         {
                           tabItems.filter((i) =>
                             (i.launchedByName || '').includes(
-                              userProfile?.userName || user.displayName || 'Operador'
+                              userProfile?.userName || directSession?.userName || 'Operador'
                             )
                           ).length
                         }{' '}
-                        lançamentos
+                        itens
                       </td>
                       <td className="py-2.5 px-4 text-right">
-                        <button
-                          type="button"
-                          onClick={() => setSelectedWaiterId('logged_user')}
-                          className={`px-2.5 py-1 rounded text-[11px] font-semibold cursor-pointer ${
-                            selectedWaiterId === 'logged_user'
-                              ? 'bg-amber-500 text-slate-950'
-                              : 'bg-slate-800 text-slate-300'
-                          }`}
-                        >
-                          {selectedWaiterId === 'logged_user' ? 'Ativo Agora' : 'Usar'}
-                        </button>
+                        <span className="text-[11px] text-emerald-400 font-semibold">Conectado</span>
                       </td>
                     </tr>
 
-                    {/* Enrolled Voice Waiters */}
+                    {/* Enrolled Waiters */}
                     {voiceOperators.map((op) => {
                       const launchedCount = tabItems.filter((i) =>
                         (i.launchedByName || '').includes(op.operatorName)
@@ -3795,38 +4615,41 @@ function ComandaVozWorkspace() {
                               {op.roleLabel} {op.voicePin ? `· PIN: ${op.voicePin}` : ''}
                             </span>
                           </td>
-                          <td className="py-2.5 px-4 text-slate-300">
-                            {op.storeName || currentStoreName}
-                            <span className="block text-[11px] font-mono text-slate-400">
-                              {op.storeCode || currentStoreCode}
+                          <td className="py-2.5 px-4 text-slate-300 font-mono">
+                            {op.email || 'Voz local'}
+                          </td>
+                          <td className="py-2.5 px-4">
+                            <span className="px-2 py-0.5 rounded text-[11px] bg-slate-900 border border-slate-700 text-slate-300">
+                              Somente Adicionar
                             </span>
                           </td>
-                          <td className="py-2.5 px-4 font-mono tabular-nums text-emerald-400">
-                            {op.pitchHz} Hz / {op.spectralCentroid} Hz
-                          </td>
                           <td className="py-2.5 px-4 text-right font-mono tabular-nums font-bold text-slate-200">
-                            {launchedCount} lançamentos
+                            {launchedCount} itens
                           </td>
                           <td className="py-2.5 px-4 text-right space-x-2">
-                            <button
-                              type="button"
-                              onClick={() => setSelectedWaiterId(op.id)}
-                              className={`px-2.5 py-1 rounded text-[11px] font-semibold cursor-pointer ${
-                                isActive
-                                  ? 'bg-amber-500 text-slate-950'
-                                  : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
-                              }`}
-                            >
-                              {isActive ? 'Ativo Agora' : 'Selecionar'}
-                            </button>
-                            <button
-                              type="button"
-                              onClick={() => handleDeleteOperator(op.id)}
-                              className="text-slate-500 hover:text-red-400 transition-colors cursor-pointer"
-                              title="Remover garçom"
-                            >
-                              <Trash2 className="w-3.5 h-3.5 inline" />
-                            </button>
+                            {isAdmin && (
+                              <>
+                                <button
+                                  type="button"
+                                  onClick={() => setSelectedWaiterId(op.id)}
+                                  className={`px-2.5 py-1 rounded text-[11px] font-semibold cursor-pointer ${
+                                    isActive
+                                      ? 'bg-amber-500 text-slate-950'
+                                      : 'bg-slate-800 text-slate-300 hover:bg-slate-700'
+                                  }`}
+                                >
+                                  {isActive ? 'Ativo' : 'Testar'}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => handleDeleteOperator(op.id)}
+                                  className="text-slate-500 hover:text-red-400 transition-colors cursor-pointer"
+                                  title="ADM: Remover garçom"
+                                >
+                                  <Trash2 className="w-3.5 h-3.5 inline" />
+                                </button>
+                              </>
+                            )}
                           </td>
                         </tr>
                       );
@@ -3920,130 +4743,226 @@ function ComandaVozWorkspace() {
           </div>
         )}
 
-        {/* SECTION 4: CARDÁPIO & PREÇOS DO BAR */}
+        {/* SECTION 4: CARDÁPIO & PREÇOS DO BAR (CRUD COMPLETO PARA O ADM) */}
         {activeSection === 'cardapio' && (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
             <div className="lg:col-span-4 bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
-              <div className="space-y-1">
-                <h2 className="text-base font-bold text-slate-100 flex items-center gap-2">
-                  <Utensils className="w-4 h-4 text-amber-400" />
-                  Cadastrar Produto no Cardápio
-                </h2>
-                <p className="text-xs text-slate-400">
-                  O Marcelo só marca produtos que existirem aqui no cardápio (evitando erros)
-                </p>
-              </div>
-
-              <form onSubmit={handleAddMenuItem} className="space-y-3 text-xs">
-                <div className="space-y-1">
-                  <label className="text-slate-300 block">Nome do Produto</label>
-                  <input
-                    type="text"
-                    value={newMenuName}
-                    onChange={(e) => setNewMenuName(e.target.value)}
-                    placeholder="Ex: Litrão Antarctica 1L"
-                    required
-                    maxLength={80}
-                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100"
-                  />
-                </div>
-
-                <div className="grid grid-cols-2 gap-3">
+              {isAdmin ? (
+                <>
                   <div className="space-y-1">
-                    <label className="text-slate-300 block">Categoria</label>
-                    <select
-                      value={newMenuCategory}
-                      onChange={(e) => setNewMenuCategory(e.target.value as ItemCategory)}
-                      className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100"
-                    >
-                      <option value="cervejas">Cervejas</option>
-                      <option value="doses">Doses & Drinks</option>
-                      <option value="porcoes">Porções & Espetos</option>
-                      <option value="sem_alcool">Sem Álcool</option>
-                      <option value="outros">Outros</option>
-                    </select>
+                    <h2 className="text-base font-bold text-slate-100 flex items-center gap-2">
+                      <Utensils className="w-4 h-4 text-amber-400" />
+                      {editingMenuId ? 'Editar Produto do Cardápio' : 'Criar Novo Produto no Cardápio'}
+                    </h2>
+                    <p className="text-xs text-slate-400">
+                      Adicione ou edite seus produtos. O Marcelo reconhece automaticamente pelo nome
+                      ou apelidos de voz.
+                    </p>
                   </div>
 
-                  <div className="space-y-1">
-                    <label className="text-slate-300 block">Preço (R$)</label>
-                    <input
-                      type="text"
-                      value={newMenuPrice}
-                      onChange={(e) => setNewMenuPrice(e.target.value)}
-                      placeholder="Ex: 18,00"
-                      required
-                      className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 font-mono tabular-nums"
-                    />
+                  <form onSubmit={handleAddOrUpdateMenuItem} className="space-y-3 text-xs">
+                    <div className="space-y-1">
+                      <label className="text-slate-300 block font-medium">Nome do Produto *</label>
+                      <input
+                        type="text"
+                        value={newMenuName}
+                        onChange={(e) => setNewMenuName(e.target.value)}
+                        placeholder="Ex: Litrão Antarctica 1L"
+                        required
+                        maxLength={80}
+                        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-amber-500"
+                      />
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-3">
+                      <div className="space-y-1">
+                        <label className="text-slate-300 block font-medium">Categoria</label>
+                        <select
+                          value={newMenuCategory}
+                          onChange={(e) => setNewMenuCategory(e.target.value as ItemCategory)}
+                          className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-slate-100"
+                        >
+                          <option value="cervejas">Cervejas</option>
+                          <option value="doses">Doses & Drinks</option>
+                          <option value="porcoes">Porções & Espetos</option>
+                          <option value="sem_alcool">Sem Álcool</option>
+                          <option value="outros">Outros</option>
+                        </select>
+                      </div>
+
+                      <div className="space-y-1">
+                        <label className="text-slate-300 block font-medium">Preço (R$) *</label>
+                        <input
+                          type="text"
+                          value={newMenuPrice}
+                          onChange={(e) => setNewMenuPrice(e.target.value)}
+                          placeholder="Ex: 18,00"
+                          required
+                          className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-slate-100 font-mono tabular-nums focus:outline-none focus:border-amber-500"
+                        />
+                      </div>
+                    </div>
+
+                    <div className="space-y-1">
+                      <label className="text-slate-300 block font-medium">
+                        Apelidos de Voz (opcional, separados por vírgula)
+                      </label>
+                      <input
+                        type="text"
+                        value={newMenuSynonyms}
+                        onChange={(e) => setNewMenuSynonyms(e.target.value)}
+                        placeholder="Ex: litrão, antarctica, litrão azul"
+                        maxLength={200}
+                        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-amber-500"
+                      />
+                    </div>
+
+                    <div className="flex items-center gap-2 pt-1">
+                      {editingMenuId && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setEditingMenuId(null);
+                            setNewMenuName('');
+                            setNewMenuPrice('');
+                            setNewMenuSynonyms('');
+                          }}
+                          className="px-3 py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-300 font-semibold rounded-lg transition-colors cursor-pointer"
+                        >
+                          Cancelar
+                        </button>
+                      )}
+                      <button
+                        type="submit"
+                        disabled={savingMenu}
+                        className="flex-1 py-2.5 bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-bold rounded-lg transition-colors cursor-pointer"
+                      >
+                        {savingMenu
+                          ? 'Salvando...'
+                          : editingMenuId
+                            ? 'Salvar Alterações do Produto'
+                            : 'Adicionar Produto ao Cardápio'}
+                      </button>
+                    </div>
+                  </form>
+                </>
+              ) : (
+                <div className="space-y-2 text-xs">
+                  <div className="flex items-center gap-2 text-amber-400 font-bold text-sm">
+                    <Lock className="w-4 h-4" />
+                    Cardápio Protegido pelo ADM
                   </div>
+                  <p className="text-slate-400 leading-relaxed">
+                    Somente o <strong>Administrador (ADM)</strong> pode criar, editar ou excluir
+                    produtos e preços do cardápio.
+                  </p>
                 </div>
-
-                <div className="space-y-1">
-                  <label className="text-slate-300 block">
-                    Apelidos de Voz (separados por vírgula)
-                  </label>
-                  <input
-                    type="text"
-                    value={newMenuSynonyms}
-                    onChange={(e) => setNewMenuSynonyms(e.target.value)}
-                    placeholder="Ex: antarctica, litrão azul, boa"
-                    maxLength={200}
-                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100"
-                  />
-                </div>
-
-                <button
-                  type="submit"
-                  className="w-full py-2.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-lg transition-colors cursor-pointer"
-                >
-                  Salvar Produto no Cardápio
-                </button>
-              </form>
+              )}
             </div>
 
             <div className="lg:col-span-8 bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
-              <div className="flex items-center justify-between">
-                <h2 className="text-base font-bold text-slate-100">
-                  Produtos Autorizados no Cardápio ({menuItems.length})
-                </h2>
+              <div className="flex flex-wrap items-center justify-between gap-3">
+                <div>
+                  <h2 className="text-base font-bold text-slate-100">
+                    Produtos no Cardápio ({menuItems.length})
+                  </h2>
+                  <p className="text-xs text-slate-400">
+                    {isAdmin
+                      ? 'Clique no ícone de lápis para editar ou na lixeira para deletar permanentemente'
+                      : 'Consulta de preços e apelidos de voz'}
+                  </p>
+                </div>
+
+                {isAdmin && (
+                  <div className="flex flex-wrap items-center gap-2 text-xs">
+                    {menuItems.length > 0 && (
+                      <button
+                        type="button"
+                        onClick={handleClearAllMenuItems}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-red-950/60 hover:bg-red-900/70 text-red-200 border border-red-800/70 rounded-lg transition-colors cursor-pointer"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                        Limpar Todo o Cardápio
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={handleRestoreDefaultMenu}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-lg transition-colors cursor-pointer"
+                    >
+                      <RotateCcw className="w-3.5 h-3.5" />
+                      Restaurar Cardápio Padrão
+                    </button>
+                  </div>
+                )}
               </div>
 
-              <div className="border border-slate-800 rounded-lg overflow-hidden">
-                <table className="w-full text-left border-collapse text-xs">
-                  <thead>
-                    <tr className="bg-slate-950 border-b border-slate-800 text-slate-400">
-                      <th className="py-2.5 px-4 font-medium">Produto</th>
-                      <th className="py-2.5 px-4 font-medium">Categoria</th>
-                      <th className="py-2.5 px-4 font-medium">Apelidos Reconhecidos</th>
-                      <th className="py-2.5 px-4 font-medium text-right">Preço</th>
-                      <th className="py-2.5 px-4 font-medium text-right">Ação</th>
-                    </tr>
-                  </thead>
-                  <tbody className="divide-y divide-slate-800/70 bg-slate-950/40">
-                    {menuItems.map((item) => (
-                      <tr key={item.id} className="hover:bg-slate-800/30">
-                        <td className="py-2.5 px-4 font-semibold text-slate-100">{item.name}</td>
-                        <td className="py-2.5 px-4 text-slate-400">
-                          {CATEGORY_LABELS[item.category]}
-                        </td>
-                        <td className="py-2.5 px-4 text-slate-400">{item.synonyms || '—'}</td>
-                        <td className="py-2.5 px-4 text-right font-mono tabular-nums font-bold text-amber-400">
-                          {formatBRL(item.price)}
-                        </td>
-                        <td className="py-2.5 px-4 text-right">
-                          <button
-                            type="button"
-                            onClick={() => handleDeleteMenuItem(item.id)}
-                            className="text-slate-500 hover:text-red-400 transition-colors cursor-pointer"
-                            title="Excluir item do cardápio"
-                          >
-                            <Trash2 className="w-3.5 h-3.5 inline" />
-                          </button>
-                        </td>
+              {menuItems.length === 0 ? (
+                <div className="p-8 text-center border border-dashed border-slate-800 rounded-lg space-y-3 text-xs">
+                  <p className="text-slate-300 font-semibold">
+                    Seu cardápio está vazio no momento.
+                  </p>
+                  <p className="text-slate-400">
+                    Cadastre seus produtos usando o formulário ao lado ou clique em &ldquo;Restaurar
+                    Cardápio Padrão&rdquo;.
+                  </p>
+                </div>
+              ) : (
+                <div className="border border-slate-800 rounded-lg overflow-hidden">
+                  <table className="w-full text-left border-collapse text-xs">
+                    <thead>
+                      <tr className="bg-slate-950 border-b border-slate-800 text-slate-400">
+                        <th className="py-2.5 px-4 font-medium">Produto</th>
+                        <th className="py-2.5 px-4 font-medium">Categoria</th>
+                        <th className="py-2.5 px-4 font-medium">Apelidos Reconhecidos</th>
+                        <th className="py-2.5 px-4 font-medium text-right">Preço</th>
+                        {isAdmin && (
+                          <th className="py-2.5 px-4 font-medium text-right">Ações (ADM)</th>
+                        )}
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </div>
+                    </thead>
+                    <tbody className="divide-y divide-slate-800/70 bg-slate-950/40">
+                      {menuItems.map((item) => (
+                        <tr
+                          key={item.id}
+                          className={`hover:bg-slate-800/30 ${
+                            editingMenuId === item.id ? 'bg-amber-500/10' : ''
+                          }`}
+                        >
+                          <td className="py-2.5 px-4 font-semibold text-slate-100">{item.name}</td>
+                          <td className="py-2.5 px-4 text-slate-400">
+                            {CATEGORY_LABELS[item.category]}
+                          </td>
+                          <td className="py-2.5 px-4 text-slate-400">{item.synonyms || '—'}</td>
+                          <td className="py-2.5 px-4 text-right font-mono tabular-nums font-bold text-amber-400">
+                            {formatBRL(item.price)}
+                          </td>
+                          {isAdmin && (
+                            <td className="py-2.5 px-4 text-right space-x-3 whitespace-nowrap">
+                              <button
+                                type="button"
+                                onClick={() => handleStartEditMenuItem(item)}
+                                className="text-slate-400 hover:text-amber-400 transition-colors cursor-pointer"
+                                title="Editar produto"
+                              >
+                                <Edit3 className="w-3.5 h-3.5 inline" />
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleDeleteMenuItem(item.id)}
+                                className="text-slate-400 hover:text-red-400 transition-colors cursor-pointer"
+                                title="Excluir produto do cardápio"
+                              >
+                                <Trash2 className="w-3.5 h-3.5 inline" />
+                              </button>
+                            </td>
+                          )}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
             </div>
           </div>
         )}

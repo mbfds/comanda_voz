@@ -6,11 +6,12 @@ export type TabStageStatus = 'open' | 'closing' | 'paid' | 'archived';
 
 export type MarceloIntent = 'MARCAR' | 'FECHAR' | 'BAIXA';
 
-export type UserRoleType = 'Proprietário' | 'Garçom' | 'Caixa' | 'Gerente';
+export type UserRoleType = 'ADM' | 'Proprietário' | 'Garçom' | 'Caixa' | 'Gerente';
 
 export interface UserProfile {
   id: string;
   ownerId: string;
+  email?: string;
   userName: string;
   userRole: UserRoleType;
   storeName: string;
@@ -66,6 +67,8 @@ export interface VoiceOperator {
   id: string;
   ownerId: string;
   operatorName: string;
+  email?: string;
+  passwordHash?: string;
   roleLabel: string;
   storeName?: string;
   storeCode?: string;

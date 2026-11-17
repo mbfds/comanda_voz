@@ -21,7 +21,7 @@
         "userRole": {
           "type": "string",
           "description": "Função no estabelecimento.",
-          "enum": ["Proprietário", "Garçom", "Caixa", "Gerente"]
+          "enum": ["ADM", "Proprietário", "Garçom", "Caixa", "Gerente"]
         },
         "storeName": {
           "type": "string",

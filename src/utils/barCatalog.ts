@@ -26,7 +26,7 @@ export const VALIDATION_LIMITS = {
   MAX_QTY: 500,
   VALID_CATEGORIES: ['cervejas', 'doses', 'porcoes', 'sem_alcool', 'outros'] as ItemCategory[],
   VALID_STATUSES: ['open', 'closing', 'paid', 'archived'] as TabStageStatus[],
-  VALID_ROLES: ['Proprietário', 'Garçom', 'Caixa', 'Gerente'] as UserRoleType[],
+  VALID_ROLES: ['ADM', 'Proprietário', 'Garçom', 'Caixa', 'Gerente'] as UserRoleType[],
 };
 
 export function sanitizeString(val: string, maxLen: number, fallback = ''): string {
