@@ -49,6 +49,7 @@ service cloud.firestore {
 
     function isValidUserRole(role) {
       return role is string && role.size() <= 20 && (
+        role == 'SUPERADMIN' ||
         role == 'ADM' ||
         role == 'Proprietário' ||
         role == 'Garçom' ||

@@ -6,7 +6,7 @@ export type TabStageStatus = 'open' | 'closing' | 'paid' | 'archived';
 
 export type MarceloIntent = 'MARCAR' | 'FECHAR' | 'BAIXA';
 
-export type UserRoleType = 'ADM' | 'Proprietário' | 'Garçom' | 'Caixa' | 'Gerente';
+export type UserRoleType = 'SUPERADMIN' | 'ADM' | 'Proprietário' | 'Garçom' | 'Caixa' | 'Gerente';
 
 export interface UserProfile {
   id: string;

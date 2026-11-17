@@ -28,12 +28,14 @@ interface CatalogItemInput {
   synonyms: string;
 }
 
+export type ServerAccountRole = 'SUPERADMIN' | 'ADM' | 'Garçom';
+
 interface StoredAccount {
   uid: string;
   email: string;
   passwordHash: string;
   userName: string;
-  userRole: 'ADM' | 'Garçom';
+  userRole: ServerAccountRole;
   storeName: string;
   storeCode: string;
   createdAtMs: number;
@@ -53,11 +55,17 @@ interface ServerStoreSnapshot {
 interface PersistedServerDatabase {
   stores: Record<string, ServerStoreSnapshot>;
   accounts: Record<string, StoredAccount>;
+  masterRecoveryKey?: string;
 }
+
+const DEFAULT_SUPERADMIN_EMAIL = 'superadmin@comandavoz.com';
+const DEFAULT_SUPERADMIN_PASSWORD = process.env.SUPERADMIN_PASSWORD || 'superadmin123';
+const DEFAULT_MASTER_RECOVERY_KEY = process.env.MASTER_RECOVERY_KEY || 'SUPER2026';
 
 const STORE_DATA_FILE = path.join(__dirname, '.render-bar-store.json');
 const storeMemoryMap = new Map<string, ServerStoreSnapshot>();
 const accountMemoryMap = new Map<string, StoredAccount>();
+let masterRecoveryKey = DEFAULT_MASTER_RECOVERY_KEY;
 
 function hashPassword(password: string): string {
   return crypto
@@ -66,10 +74,19 @@ function hashPassword(password: string): string {
     .digest('hex');
 }
 
-function normalizeEmail(email: string): string {
-  return String(email || '')
+function normalizeEmailOrUsername(rawInput: string): string {
+  const cleaned = String(rawInput || '')
     .trim()
     .toLowerCase();
+  if (
+    cleaned === 'superadmin' ||
+    cleaned === 'programador' ||
+    cleaned === 'dev' ||
+    cleaned === 'root'
+  ) {
+    return DEFAULT_SUPERADMIN_EMAIL;
+  }
+  return cleaned;
 }
 
 function cleanStoreCode(raw: string): string {
@@ -82,12 +99,35 @@ function cleanStoreCode(raw: string): string {
   );
 }
 
+function ensureDefaultSuperAdmin(): void {
+  const hasSuperAdmin = Array.from(accountMemoryMap.values()).some(
+    (acc) => acc.userRole === 'SUPERADMIN'
+  );
+  if (!hasSuperAdmin) {
+    const superAcc: StoredAccount = {
+      uid: 'superadmin_master_dev',
+      email: DEFAULT_SUPERADMIN_EMAIL,
+      passwordHash: hashPassword(DEFAULT_SUPERADMIN_PASSWORD),
+      userName: 'Programador (SUPERADMIN)',
+      userRole: 'SUPERADMIN',
+      storeName: 'Bar Central',
+      storeCode: 'BAR-01',
+      createdAtMs: Date.now(),
+    };
+    accountMemoryMap.set(DEFAULT_SUPERADMIN_EMAIL, superAcc);
+  }
+}
+
 function loadDatabaseFromDisk(): void {
   try {
     if (fs.existsSync(STORE_DATA_FILE)) {
       const raw = fs.readFileSync(STORE_DATA_FILE, 'utf-8');
-      const parsed = JSON.parse(raw) as PersistedServerDatabase & Record<string, ServerStoreSnapshot>;
+      const parsed = JSON.parse(raw) as PersistedServerDatabase &
+        Record<string, ServerStoreSnapshot>;
       if (parsed && typeof parsed === 'object') {
+        if (typeof parsed.masterRecoveryKey === 'string' && parsed.masterRecoveryKey.trim()) {
+          masterRecoveryKey = parsed.masterRecoveryKey.trim();
+        }
         if (parsed.stores && typeof parsed.stores === 'object') {
           for (const [k, v] of Object.entries(parsed.stores)) {
             if (v && typeof v === 'object') {
@@ -110,6 +150,7 @@ function loadDatabaseFromDisk(): void {
   } catch (err) {
     console.warn('Aviso ao carregar banco local do bar:', err);
   }
+  ensureDefaultSuperAdmin();
 }
 
 function saveDatabaseToDisk(): void {
@@ -125,6 +166,7 @@ function saveDatabaseToDisk(): void {
     const payload: PersistedServerDatabase = {
       stores: storesObj,
       accounts: accountsObj,
+      masterRecoveryKey,
     };
     fs.writeFileSync(STORE_DATA_FILE, JSON.stringify(payload), 'utf-8');
   } catch (err) {
@@ -133,6 +175,7 @@ function saveDatabaseToDisk(): void {
 }
 
 loadDatabaseFromDisk();
+saveDatabaseToDisk();
 
 async function startServer() {
   const app = express();
@@ -155,7 +198,7 @@ async function startServer() {
       initialMenuItems?: unknown[];
     };
 
-    const normEmail = normalizeEmail(email || '');
+    const normEmail = normalizeEmailOrUsername(email || '');
     if (!normEmail || !normEmail.includes('@')) {
       res.status(400).json({ error: 'Informe um e-mail válido para o Administrador.' });
       return;
@@ -168,14 +211,20 @@ async function startServer() {
     const existingAcc = accountMemoryMap.get(normEmail);
     if (existingAcc) {
       res.status(409).json({
-        error: 'Este e-mail já está cadastrado. Use a aba "Entrar" para fazer login.',
+        error: 'Este e-mail já está cadastrado. Use a aba "Entrar" ou "Recuperar Senha".',
       });
       return;
     }
 
     const code = cleanStoreCode(storeCode || 'BAR-01');
-    const cleanStore = String(storeName || 'Bar & Comércio Central').trim().slice(0, 80) || 'Bar & Comércio Central';
-    const cleanName = String(userName || 'Administrador').trim().slice(0, 60) || 'Administrador';
+    const cleanStore =
+      String(storeName || 'Bar & Comércio Central')
+        .trim()
+        .slice(0, 80) || 'Bar & Comércio Central';
+    const cleanName =
+      String(userName || 'Administrador')
+        .trim()
+        .slice(0, 60) || 'Administrador';
     const uid = `adm_${code.toLowerCase()}_${Date.now().toString(36)}`;
 
     const newAdmin: StoredAccount = {
@@ -222,25 +271,27 @@ async function startServer() {
     });
   });
 
-  // 2. Login with Email & Password (Works for both ADM and Garçom registered by ADM)
+  // 2. Login with Email/Username & Password (Works for SUPERADMIN, ADM, and Garçom)
   app.post('/api/auth/login', (req, res) => {
     const { email, password } = req.body as {
       email?: string;
       password?: string;
     };
 
-    const normEmail = normalizeEmail(email || '');
+    const normEmail = normalizeEmailOrUsername(email || '');
     if (!normEmail || !password) {
-      res.status(400).json({ error: 'Informe seu e-mail e sua senha.' });
+      res.status(400).json({ error: 'Informe seu usuário/e-mail e sua senha.' });
       return;
     }
 
+    ensureDefaultSuperAdmin();
     const acc = accountMemoryMap.get(normEmail);
     const inputHash = hashPassword(String(password));
 
     if (!acc || acc.passwordHash !== inputHash) {
       res.status(401).json({
-        error: 'E-mail ou senha incorretos. Se for Garçom, peça ao ADM para cadastrar seu acesso.',
+        error:
+          'Usuário/E-mail ou senha incorretos. Esqueceu a senha? Clique em "Recuperar Senha" abaixo.',
       });
       return;
     }
@@ -261,7 +312,98 @@ async function startServer() {
     });
   });
 
-  // 3. ADM Registers a Waiter (Garçom) with Email & Password
+  // 3. Password Recovery Endpoint (Works for SUPERADMIN, ADM, and Garçom)
+  app.post('/api/auth/recover-password', (req, res) => {
+    const { email, verification, newPassword } = req.body as {
+      email?: string;
+      verification?: string;
+      newPassword?: string;
+    };
+
+    const normEmail = normalizeEmailOrUsername(email || '');
+    const cleanVerif = String(verification || '').trim();
+    const cleanNewPass = String(newPassword || '').trim();
+
+    if (!normEmail) {
+      res.status(400).json({ error: 'Informe o e-mail ou usuário que deseja recuperar.' });
+      return;
+    }
+    if (!cleanVerif) {
+      res.status(400).json({
+        error:
+          'Informe o Código do Bar (ex: BAR-01), seu Nome cadastrado ou a Chave Mestre do Programador.',
+      });
+      return;
+    }
+    if (cleanNewPass.length < 4) {
+      res.status(400).json({ error: 'A nova senha precisa ter pelo menos 4 caracteres.' });
+      return;
+    }
+
+    ensureDefaultSuperAdmin();
+    const acc = accountMemoryMap.get(normEmail);
+    if (!acc) {
+      res.status(404).json({
+        error: 'Nenhuma conta encontrada com este e-mail/usuário.',
+      });
+      return;
+    }
+
+    const verifUpper = cleanVerif.toUpperCase();
+    const verifLower = cleanVerif.toLowerCase();
+    const matchesStoreCode = acc.storeCode.toUpperCase() === verifUpper;
+    const matchesUserName = acc.userName.trim().toLowerCase() === verifLower;
+    const matchesMasterKey =
+      verifUpper === masterRecoveryKey.toUpperCase() ||
+      verifUpper === DEFAULT_MASTER_RECOVERY_KEY.toUpperCase();
+
+    if (!matchesStoreCode && !matchesUserName && !matchesMasterKey) {
+      res.status(403).json({
+        error:
+          'Validação incorreta. Informe o Código do Bar correto (ex: BAR-01), seu Nome cadastrado ou a Chave Mestre.',
+      });
+      return;
+    }
+
+    const newHash = hashPassword(cleanNewPass);
+    acc.passwordHash = newHash;
+    accountMemoryMap.set(normEmail, acc);
+
+    // If this account is a Garçom, also update their passwordHash in the store's voiceOperators list
+    const storeSnap = storeMemoryMap.get(acc.storeCode);
+    if (storeSnap && Array.isArray(storeSnap.voiceOperators)) {
+      storeSnap.voiceOperators = storeSnap.voiceOperators.map((rawOp) => {
+        if (rawOp && typeof rawOp === 'object') {
+          const op = rawOp as { email?: string; passwordHash?: string };
+          if (op.email && normalizeEmailOrUsername(op.email) === normEmail) {
+            return { ...op, passwordHash: newHash };
+          }
+        }
+        return rawOp;
+      });
+      storeMemoryMap.set(acc.storeCode, storeSnap);
+    }
+
+    saveDatabaseToDisk();
+
+    const sessionPayload = {
+      uid: acc.uid,
+      email: acc.email,
+      userName: acc.userName,
+      userRole: acc.userRole,
+      storeName: acc.storeName,
+      storeCode: acc.storeCode,
+    };
+
+    res.json({
+      ok: true,
+      message: `Senha de ${acc.userName} (${acc.email}) redefinida com sucesso!`,
+      account: sessionPayload,
+      session: sessionPayload,
+    });
+  });
+
+  // 4. ADM or SUPERADMIN Registers a Waiter (Garçom) with Email & Password
   app.post('/api/auth/register-waiter', (req, res) => {
     const {
       callerRole,
@@ -289,14 +431,18 @@ async function startServer() {
       samplesCount?: number;
     };
 
-    if (callerRole !== 'ADM' && callerRole !== 'Proprietário') {
+    if (
+      callerRole !== 'SUPERADMIN' &&
+      callerRole !== 'ADM' &&
+      callerRole !== 'Proprietário'
+    ) {
       res.status(403).json({
-        error: 'Acesso negado: Somente o Administrador (ADM) pode cadastrar garçons.',
+        error: 'Acesso negado: Somente o ADM ou SUPERADMIN pode cadastrar garçons.',
       });
       return;
     }
 
-    const normEmail = normalizeEmail(email || '');
+    const normEmail = normalizeEmailOrUsername(email || '');
     if (!normEmail || !normEmail.includes('@')) {
       res.status(400).json({ error: 'Informe um e-mail válido para o login do Garçom.' });
       return;
@@ -307,8 +453,12 @@ async function startServer() {
     }
 
     const code = cleanStoreCode(storeCode || 'BAR-01');
-    const cleanStore = String(storeName || 'Bar Central').trim().slice(0, 80);
-    const cleanOpName = String(operatorName || 'Garçom').trim().slice(0, 60);
+    const cleanStore = String(storeName || 'Bar Central')
+      .trim()
+      .slice(0, 80);
+    const cleanOpName = String(operatorName || 'Garçom')
+      .trim()
+      .slice(0, 60);
     const opId = operatorId || `op_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     const passHash = hashPassword(String(password));
 
@@ -347,7 +497,227 @@ async function startServer() {
     });
   });
 
-  // 4. Re-hydrate accounts from client localStorage if container restarted
+  // 5. SUPERADMIN Control Panel Endpoints
+  app.get('/api/superadmin/overview', (_req, res) => {
+    ensureDefaultSuperAdmin();
+    const accountsList = Array.from(accountMemoryMap.values()).map((acc) => ({
+      uid: acc.uid,
+      email: acc.email,
+      userName: acc.userName,
+      userRole: acc.userRole,
+      storeName: acc.storeName,
+      storeCode: acc.storeCode,
+      createdAtMs: acc.createdAtMs,
+    }));
+
+    const storesList = Array.from(storeMemoryMap.values()).map((st) => {
+      const tabsArr = Array.isArray(st.tabs)
+        ? (st.tabs as Array<{ status?: string; totalAmount?: number; paidAmount?: number }>)
+        : [];
+      const activeTabs = tabsArr.filter((t) => t && t.status !== 'archived');
+      const totalConsumed = activeTabs.reduce(
+        (acc, t) => acc + (Number(t.totalAmount) || 0),
+        0
+      );
+      return {
+        storeCode: st.storeCode,
+        storeName: st.storeName,
+        tabsCount: activeTabs.length,
+        totalConsumed: Number(totalConsumed.toFixed(2)),
+        menuCount: Array.isArray(st.menuItems) ? st.menuItems.length : 0,
+        operatorsCount: Array.isArray(st.voiceOperators) ? st.voiceOperators.length : 0,
+        updatedAtMs: st.updatedAtMs,
+      };
+    });
+
+    res.json({
+      ok: true,
+      masterRecoveryKey,
+      accounts: accountsList,
+      stores: storesList,
+    });
+  });
+
+  app.post('/api/superadmin/save-account', (req, res) => {
+    const {
+      callerRole,
+      email,
+      newPassword,
+      userName,
+      userRole,
+      storeName,
+      storeCode,
+    } = req.body as {
+      callerRole?: string;
+      email?: string;
+      newPassword?: string;
+      userName?: string;
+      userRole?: ServerAccountRole;
+      storeName?: string;
+      storeCode?: string;
+    };
+
+    if (callerRole !== 'SUPERADMIN' && callerRole !== 'ADM') {
+      res.status(403).json({ error: 'Apenas SUPERADMIN ou ADM pode gerenciar contas.' });
+      return;
+    }
+
+    const normEmail = normalizeEmailOrUsername(email || '');
+    if (!normEmail || !normEmail.includes('@')) {
+      res.status(400).json({ error: 'Informe um e-mail válido.' });
+      return;
+    }
+
+    const existing = accountMemoryMap.get(normEmail);
+    if (!existing && (!newPassword || String(newPassword).trim().length < 4)) {
+      res.status(400).json({
+        error: 'Para criar uma nova conta, informe uma senha de pelo menos 4 caracteres.',
+      });
+      return;
+    }
+
+    const validRole: ServerAccountRole =
+      callerRole === 'SUPERADMIN' &&
+      (userRole === 'SUPERADMIN' || userRole === 'ADM' || userRole === 'Garçom')
+        ? userRole
+        : existing?.userRole || 'Garçom';
+
+    const code = cleanStoreCode(storeCode || existing?.storeCode || 'BAR-01');
+    const cleanStore =
+      String(storeName || existing?.storeName || 'Bar Central')
+        .trim()
+        .slice(0, 80) || 'Bar Central';
+    const cleanName =
+      String(userName || existing?.userName || 'Usuário')
+        .trim()
+        .slice(0, 60) || 'Usuário';
+
+    const nextPassHash =
+      newPassword && String(newPassword).trim().length >= 4
+        ? hashPassword(String(newPassword))
+        : existing!.passwordHash;
+
+    const updatedAcc: StoredAccount = {
+      uid: existing?.uid || `usr_${code.toLowerCase()}_${Date.now().toString(36)}`,
+      email: normEmail,
+      passwordHash: nextPassHash,
+      userName: cleanName,
+      userRole: validRole,
+      storeName: cleanStore,
+      storeCode: code,
+      createdAtMs: existing?.createdAtMs || Date.now(),
+    };
+
+    accountMemoryMap.set(normEmail, updatedAcc);
+
+    if (!storeMemoryMap.has(code)) {
+      storeMemoryMap.set(code, {
+        storeCode: code,
+        storeName: cleanStore,
+        catalogInitialized: false,
+        menuItems: [],
+        tabs: [],
+        tabItems: [],
+        voiceOperators: [],
+        updatedAtMs: Date.now(),
+      });
+    }
+
+    saveDatabaseToDisk();
+
+    res.json({
+      ok: true,
+      account: {
+        uid: updatedAcc.uid,
+        email: updatedAcc.email,
+        userName: updatedAcc.userName,
+        userRole: updatedAcc.userRole,
+        storeName: updatedAcc.storeName,
+        storeCode: updatedAcc.storeCode,
+      },
+    });
+  });
+
+  app.post('/api/superadmin/delete-account', (req, res) => {
+    const { callerRole, email } = req.body as {
+      callerRole?: string;
+      email?: string;
+    };
+
+    if (callerRole !== 'SUPERADMIN') {
+      res.status(403).json({ error: 'Somente o SUPERADMIN pode remover qualquer conta.' });
+      return;
+    }
+
+    const normEmail = normalizeEmailOrUsername(email || '');
+    const target = accountMemoryMap.get(normEmail);
+    if (!target) {
+      res.status(404).json({ error: 'Conta não encontrada.' });
+      return;
+    }
+
+    accountMemoryMap.delete(normEmail);
+    ensureDefaultSuperAdmin();
+    saveDatabaseToDisk();
+
+    res.json({ ok: true });
+  });
+
+  app.post('/api/superadmin/store-action', (req, res) => {
+    const { callerRole, action, storeCode, newMasterKey } = req.body as {
+      callerRole?: string;
+      action?: 'clear_tabs' | 'delete_store' | 'update_master_key';
+      storeCode?: string;
+      newMasterKey?: string;
+    };
+
+    if (callerRole !== 'SUPERADMIN') {
+      res.status(403).json({ error: 'Somente o SUPERADMIN pode executar esta ação.' });
+      return;
+    }
+
+    if (action === 'update_master_key') {
+      const cleanKey = String(newMasterKey || '').trim();
+      if (cleanKey.length < 4) {
+        res.status(400).json({ error: 'A Chave Mestre deve ter pelo menos 4 caracteres.' });
+        return;
+      }
+      masterRecoveryKey = cleanKey;
+      saveDatabaseToDisk();
+      res.json({ ok: true, masterRecoveryKey });
+      return;
+    }
+
+    const code = cleanStoreCode(storeCode || '');
+    const current = storeMemoryMap.get(code);
+    if (!current) {
+      res.status(404).json({ error: 'Bar não encontrado.' });
+      return;
+    }
+
+    if (action === 'clear_tabs') {
+      storeMemoryMap.set(code, {
+        ...current,
+        tabs: [],
+        tabItems: [],
+        updatedAtMs: Date.now(),
+      });
+      saveDatabaseToDisk();
+      res.json({ ok: true });
+      return;
+    }
+
+    if (action === 'delete_store') {
+      storeMemoryMap.delete(code);
+      saveDatabaseToDisk();
+      res.json({ ok: true });
+      return;
+    }
+
+    res.status(400).json({ error: 'Ação inválida.' });
+  });
+
+  // 6. Re-hydrate accounts from client localStorage if container restarted
   app.post('/api/auth/rehydrate', (req, res) => {
     const { accounts } = req.body as {
       accounts?: Array<{
@@ -355,7 +725,7 @@ async function startServer() {
         email: string;
         passwordHash: string;
         userName: string;
-        userRole: 'ADM' | 'Garçom';
+        userRole: ServerAccountRole;
         storeName: string;
         storeCode: string;
       }>;
@@ -363,14 +733,19 @@ async function startServer() {
     if (Array.isArray(accounts)) {
       for (const acc of accounts) {
         if (acc && acc.email && acc.passwordHash) {
-          const norm = normalizeEmail(acc.email);
+          const norm = normalizeEmailOrUsername(acc.email);
           if (!accountMemoryMap.has(norm)) {
             accountMemoryMap.set(norm, {
               uid: acc.uid,
               email: norm,
               passwordHash: acc.passwordHash,
               userName: acc.userName,
-              userRole: acc.userRole === 'ADM' ? 'ADM' : 'Garçom',
+              userRole:
+                acc.userRole === 'SUPERADMIN'
+                  ? 'SUPERADMIN'
+                  : acc.userRole === 'ADM'
+                    ? 'ADM'
+                    : 'Garçom',
               storeName: acc.storeName,
               storeCode: cleanStoreCode(acc.storeCode),
               createdAtMs: Date.now(),
@@ -383,7 +758,7 @@ async function startServer() {
     res.json({ ok: true });
   });
 
-  // 5. Real-time store sync with RBAC & catalogInitialized protection
+  // 7. Real-time store sync with RBAC & catalogInitialized protection
   app.get('/api/store/:storeCode', (req, res) => {
     const code = cleanStoreCode(req.params.storeCode);
     const existing = storeMemoryMap.get(code);
@@ -404,7 +779,8 @@ async function startServer() {
     // Enforce RBAC on the server: Garçom can NEVER perform a 'remove' action
     if (body.callerRole === 'Garçom' && body.actionType === 'remove') {
       res.status(403).json({
-        error: 'Acesso restrito: Garçom pode apenas adicionar. Somente o Administrador (ADM) pode remover.',
+        error:
+          'Acesso restrito: Garçom pode apenas adicionar. Somente o ADM ou SUPERADMIN pode remover.',
       });
       return;
     }
@@ -447,17 +823,20 @@ async function startServer() {
             storeCode?: string;
           };
           if (op.email && op.passwordHash) {
-            const norm = normalizeEmail(op.email);
-            accountMemoryMap.set(norm, {
-              uid: op.id || `op_${Date.now()}`,
-              email: norm,
-              passwordHash: op.passwordHash,
-              userName: op.operatorName || 'Garçom',
-              userRole: 'Garçom',
-              storeName: op.storeName || nextSnapshot.storeName,
-              storeCode: code,
-              createdAtMs: Date.now(),
-            });
+            const norm = normalizeEmailOrUsername(op.email);
+            const existingAcc = accountMemoryMap.get(norm);
+            if (!existingAcc || existingAcc.userRole === 'Garçom') {
+              accountMemoryMap.set(norm, {
+                uid: op.id || existingAcc?.uid || `op_${Date.now()}`,
+                email: norm,
+                passwordHash: existingAcc?.passwordHash || op.passwordHash,
+                userName: op.operatorName || existingAcc?.userName || 'Garçom',
+                userRole: 'Garçom',
+                storeName: op.storeName || nextSnapshot.storeName,
+                storeCode: code,
+                createdAtMs: existingAcc?.createdAtMs || Date.now(),
+              });
+            }
           }
         }
       }
@@ -504,14 +883,17 @@ O garçom ou dono do bar fala comandos direcionados a você, muitas vezes na cor
 AS 3 AÇÕES PRINCIPAIS QUE VOCÊ DEVE COMPREENDER PERFEITAMENTE:
 1. "MARCAR": Adicionar produtos do cardápio na comanda do cliente.
    Exemplos: "marca 1 litrão para Thiago", "marque 2 espetinhos pro Tiago", "coloca 1 original na conta do Jonas".
+   ATENÇÃO CRÍTICA A TAMANHOS E EMBALAGENS:
+   - Nunca confunda "coca lata" / "350ml" com "coca cola 2 litros" / "2L", nem "long neck" com "600ml" ou "litrão"!
+   - Se o usuário disser uma escolha com "ou" (ex: "coca lata ou coca cola 2 litros"), ou se disser algo ambíguo que serve para dois produtos de tamanhos diferentes (ex: apenas "coca" quando existem Lata e 2 Litros no cardápio), NÃO chute! Retorne "understood": false explicando que ficou ambíguo.
 2. "FECHAR": Fechar a conta OU responder quanto ficou / quanto deu a conta do cliente.
    Exemplos: "feche a conta do Thiago", "fechar conta do Tiago", "quanto ficou a conta do Thiago?", "quando ficou a conta do Tiago?" (o microfone muitas vezes transcreve "quanto ficou" como "quando ficou" — entenda ambos como FECHAR!), "quanto deu a conta do Tiago?", "qual o valor da conta do Tiago?".
 3. "BAIXA": Dar baixa total ou parcial no pagamento da conta do cliente.
-   Exemplos: "dar baixa na conta do Thiago", "dê baixa na conta do Tiago", "baixa de 20 reais na conta do Tiago e continua consumindo", "Tiago pagou a conta".
+   Exemplos: "dar baixa na conta do Thiago", "dê baixa na conta do Tiago", "dar uma baixa na conta do Tiago", "fazer baixa no Thiago", "baixa de 20 reais na conta do Tiago e continua consumindo", "Tiago pagou a conta", "quitar conta do Thiago".
 
 REGRA DE OURO DE SEGURANÇA ("SE NÃO ENTENDEU, NÃO FAÇA NADA"):
-- Se for um comando de MARCAR e o produto pedido NÃO existir no Cardápio do Bar listado abaixo, ou não tiver nome de cliente, retorne "understood": false.
-- Nomes com grafia fonética igual (ex: "Thiago" e "Tiago" sem H, "Matheus" e "Mateus") DEVEM ser reconhecidos normalmente e unificados com o nome da comanda ativa se já existir!
+- Se for um comando de MARCAR e o produto pedido NÃO existir no Cardápio do Bar listado abaixo, estiver ambíguo entre dois itens, ou não tiver nome de cliente, retorne "understood": false.
+- Nomes com grafia fonética igual (ex: "Thiago" e "Tiago" sem H, "Marcelo" e "Marcelle", "Matheus" e "Mateus") DEVEM ser reconhecidos normalmente e unificados com o nome da comanda ativa se já existir!
 
 Cardápio do Bar (ÚNICOS PRODUTOS VÁLIDOS):
 ${catalogSummary}

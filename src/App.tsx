@@ -49,11 +49,8 @@ import {
 } from 'lucide-react';
 import {
   auth,
-  checkGoogleRedirectResult,
   db,
   handleFirestoreError,
-  loginWithGoogle,
-  loginWithGoogleRedirect,
   logoutUser,
   OperationType,
 } from './firebase';
@@ -114,7 +111,7 @@ interface SpeechRecognitionInstance extends EventTarget {
   onend: (() => void) | null;
 }
 
-type ActiveSection = 'comandas' | 'cardapio' | 'equipe_comercio';
+type ActiveSection = 'comandas' | 'cardapio' | 'equipe_comercio' | 'superadmin';
 
 interface DirectBarSession {
   uid: string;
@@ -130,9 +127,29 @@ interface LocalAccountBackup {
   email: string;
   passwordPlainOrHash: string;
   userName: string;
-  userRole: 'ADM' | 'Garçom';
+  userRole: 'SUPERADMIN' | 'ADM' | 'Garçom';
   storeName: string;
   storeCode: string;
+}
+
+interface SuperAdminAccountSummary {
+  uid: string;
+  email: string;
+  userName: string;
+  userRole: 'SUPERADMIN' | 'ADM' | 'Garçom';
+  storeName: string;
+  storeCode: string;
+  createdAtMs: number;
+}
+
+interface SuperAdminStoreSummary {
+  storeCode: string;
+  storeName: string;
+  tabsCount: number;
+  totalConsumed: number;
+  menuCount: number;
+  operatorsCount: number;
+  updatedAtMs: number;
 }
 
 interface TabSnapshotUndoState {
@@ -269,13 +286,14 @@ function ComandaVozWorkspace() {
   const [authReady, setAuthReady] = useState(false);
   const [activeSection, setActiveSection] = useState<ActiveSection>('comandas');
 
-  // Email & Password Auth State (Login Tab vs Register ADM Tab)
-  const [authTab, setAuthTab] = useState<'login' | 'register_adm'>('login');
+  // Email & Password Auth State (Login vs Register ADM vs Recover Password)
+  const [authTab, setAuthTab] = useState<'login' | 'register_adm' | 'recover_password'>('login');
   const [loginEmail, setLoginEmail] = useState('');
   const [loginPassword, setLoginPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
   const [authBusy, setAuthBusy] = useState(false);
   const [authFormError, setAuthFormError] = useState<string | null>(null);
+  const [authSuccessMsg, setAuthSuccessMsg] = useState<string | null>(null);
 
   // Register ADM Form State
   const [regAdmName, setRegAdmName] = useState('');
@@ -284,14 +302,14 @@ function ComandaVozWorkspace() {
   const [regStoreName, setRegStoreName] = useState('Bar Central');
   const [regStoreCode, setRegStoreCode] = useState('BAR-01');
 
-  // Google Auth State
-  const [googleLoginBusy, setGoogleLoginBusy] = useState(false);
-  const [googleAuthError, setGoogleAuthError] = useState<string | null>(null);
+  // Password Recovery Form State
+  const [recEmail, setRecEmail] = useState('');
+  const [recVerification, setRecVerification] = useState('');
+  const [recNewPassword, setRecNewPassword] = useState('');
 
-  // Unified user accessor
-  const isDirectSession = !firebaseUser && Boolean(directSession);
+  // Unified user accessor (prioritize direct Email/Password session)
+  const isDirectSession = Boolean(directSession);
   const user = useMemo(() => {
-    if (firebaseUser) return firebaseUser;
     if (directSession) {
       return {
         uid: directSession.uid,
@@ -299,6 +317,7 @@ function ComandaVozWorkspace() {
         email: directSession.email || `${directSession.storeCode.toLowerCase()}@comandavoz.bar`,
       } as User;
     }
+    if (firebaseUser) return firebaseUser;
     return null;
   }, [firebaseUser, directSession]);
 
@@ -322,7 +341,8 @@ function ComandaVozWorkspace() {
   const [savingProfile, setSavingProfile] = useState(false);
 
   // Strict Role-Based Access Control (RBAC):
-  // ADM ('ADM' or 'Proprietário') has full control.
+  // SUPERADMIN (Programador) controls everything across all stores and users.
+  // ADM ('ADM' or 'Proprietário') has full control over their store.
   // Garçom ('Garçom') can ONLY add items, NEVER remove anything or manage Cardápio/Garçons.
   const currentUserRole: UserRoleType = useMemo(() => {
     if (directSession?.userRole) return directSession.userRole;
@@ -330,9 +350,14 @@ function ComandaVozWorkspace() {
     return 'ADM';
   }, [directSession, userProfile]);
 
+  const isSuperAdmin = useMemo(() => currentUserRole === 'SUPERADMIN', [currentUserRole]);
+
   const isAdmin = useMemo(
-    () => currentUserRole === 'ADM' || currentUserRole === 'Proprietário',
-    [currentUserRole]
+    () =>
+      isSuperAdmin ||
+      currentUserRole === 'ADM' ||
+      currentUserRole === 'Proprietário',
+    [isSuperAdmin, currentUserRole]
   );
 
   // Marcelo Assistant State
@@ -379,6 +404,20 @@ function ComandaVozWorkspace() {
   const [newMenuPrice, setNewMenuPrice] = useState('');
   const [newMenuSynonyms, setNewMenuSynonyms] = useState('');
   const [savingMenu, setSavingMenu] = useState(false);
+
+  // SUPERADMIN State (All Accounts, All Stores, Master Recovery Key)
+  const [superAccounts, setSuperAccounts] = useState<SuperAdminAccountSummary[]>([]);
+  const [superStores, setSuperStores] = useState<SuperAdminStoreSummary[]>([]);
+  const [masterRecoveryKeyState, setMasterRecoveryKeyState] = useState('SUPER2026');
+  const [saUserEmail, setSaUserEmail] = useState('');
+  const [saUserName, setSaUserName] = useState('');
+  const [saUserPassword, setSaUserPassword] = useState('');
+  const [saUserRole, setSaUserRole] = useState<'SUPERADMIN' | 'ADM' | 'Garçom'>('ADM');
+  const [saStoreName, setSaStoreName] = useState('Bar Central');
+  const [saStoreCode, setSaStoreCode] = useState('BAR-01');
+  const [saSaving, setSaSaving] = useState(false);
+  const [resettingAccountEmail, setResettingAccountEmail] = useState<string | null>(null);
+  const [inlineNewPassword, setInlineNewPassword] = useState('');
 
   const recognitionRef = useRef<SpeechRecognitionInstance | null>(null);
 
@@ -441,15 +480,20 @@ function ComandaVozWorkspace() {
     }
   };
 
-  // Email & Password Login Handler (For both ADM and Garçom registered by ADM)
+  // Email/Username & Password Login Handler (Works for SUPERADMIN, ADM, and Garçom)
   const handleEmailPasswordLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthFormError(null);
-    const cleanEmail = loginEmail.trim().toLowerCase();
+    setAuthSuccessMsg(null);
+    const rawLogin = loginEmail.trim().toLowerCase();
+    const cleanEmail =
+      rawLogin === 'superadmin' || rawLogin === 'programador'
+        ? 'superadmin@comandavoz.com'
+        : rawLogin;
     const cleanPass = loginPassword.trim();
 
     if (!cleanEmail || !cleanPass) {
-      setAuthFormError('Informe seu e-mail e senha para entrar.');
+      setAuthFormError('Informe seu usuário/e-mail e senha para entrar.');
       return;
     }
 
@@ -483,7 +527,12 @@ function ComandaVozWorkspace() {
             email: session.email,
             passwordPlainOrHash: cleanPass,
             userName: session.userName,
-            userRole: session.userRole === 'Garçom' ? 'Garçom' : 'ADM',
+            userRole:
+              session.userRole === 'SUPERADMIN'
+                ? 'SUPERADMIN'
+                : session.userRole === 'Garçom'
+                  ? 'Garçom'
+                  : 'ADM',
             storeName: session.storeName,
             storeCode: session.storeCode,
           });
@@ -493,26 +542,13 @@ function ComandaVozWorkspace() {
         }
       }
 
-      // Check local backup in case Render free-tier container restarted
+      // Check local backup in case container restarted
       const backupMatch = loadLocalAccountsBackup().find(
         (acc) =>
           acc.email.toLowerCase() === cleanEmail && acc.passwordPlainOrHash === cleanPass
       );
 
       if (backupMatch) {
-        if (backupMatch.userRole === 'ADM') {
-          await fetch('/api/auth/register-admin', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-              userName: backupMatch.userName,
-              email: backupMatch.email,
-              password: cleanPass,
-              storeName: backupMatch.storeName,
-              storeCode: backupMatch.storeCode,
-            }),
-          }).catch(() => {});
-        }
         const session: DirectBarSession = {
           uid: backupMatch.uid,
           email: backupMatch.email,
@@ -530,10 +566,121 @@ function ComandaVozWorkspace() {
       const errData = (await response.json().catch(() => ({}))) as { error?: string };
       setAuthFormError(
         errData.error ||
-          'E-mail ou senha incorretos. Se for seu primeiro acesso como dono do bar, clique em "Criar Conta ADM".'
+          'Usuário/E-mail ou senha incorretos. Esqueceu sua senha? Clique em "Recuperar Senha".'
       );
     } catch {
       setAuthFormError('Erro de conexão ao validar login. Tente novamente.');
+    } finally {
+      setAuthBusy(false);
+    }
+  };
+
+  // Password Recovery Handler (Works for SUPERADMIN, ADM, and Garçom)
+  const handleRecoverPassword = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthFormError(null);
+    setAuthSuccessMsg(null);
+
+    const rawEmail = recEmail.trim().toLowerCase();
+    const cleanEmail =
+      rawEmail === 'superadmin' || rawEmail === 'programador'
+        ? 'superadmin@comandavoz.com'
+        : rawEmail;
+    const cleanVerif = recVerification.trim();
+    const cleanNewPass = recNewPassword.trim();
+
+    if (!cleanEmail || !cleanVerif || cleanNewPass.length < 4) {
+      setAuthFormError(
+        'Preencha o e-mail/usuário, o código de validação (Código do Bar, Nome ou Chave Mestre) e a nova senha (mín. 4 caracteres).'
+      );
+      return;
+    }
+
+    setAuthBusy(true);
+    try {
+      const response = await fetch('/api/auth/recover-password', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          email: cleanEmail,
+          verification: cleanVerif,
+          newPassword: cleanNewPass,
+        }),
+      });
+
+      const data = (await response.json().catch(() => ({}))) as {
+        ok?: boolean;
+        error?: string;
+        message?: string;
+        account?: DirectBarSession;
+        session?: DirectBarSession;
+      };
+
+      const acc = data.account || data.session;
+      if (response.ok && data.ok && acc) {
+        const session: DirectBarSession = {
+          uid: acc.uid,
+          email: acc.email,
+          userName: acc.userName,
+          userRole: acc.userRole,
+          storeName: acc.storeName,
+          storeCode: acc.storeCode,
+        };
+        localStorage.setItem(DIRECT_SESSION_STORAGE_KEY, JSON.stringify(session));
+        saveAccountToLocalBackup({
+          uid: session.uid,
+          email: session.email,
+          passwordPlainOrHash: cleanNewPass,
+          userName: session.userName,
+          userRole:
+            session.userRole === 'SUPERADMIN'
+              ? 'SUPERADMIN'
+              : session.userRole === 'Garçom'
+                ? 'Garçom'
+                : 'ADM',
+          storeName: session.storeName,
+          storeCode: session.storeCode,
+        });
+        setRecNewPassword('');
+        setRecVerification('');
+        setDirectSession(session);
+        return;
+      }
+
+      // Also check localStorage backup if offline or container restarted
+      const localMatch = loadLocalAccountsBackup().find(
+        (b) =>
+          b.email.toLowerCase() === cleanEmail &&
+          (b.storeCode.toUpperCase() === cleanVerif.toUpperCase() ||
+            b.userName.toLowerCase() === cleanVerif.toLowerCase() ||
+            cleanVerif.toUpperCase() === 'SUPER2026')
+      );
+
+      if (localMatch) {
+        const updatedBackup: LocalAccountBackup = {
+          ...localMatch,
+          passwordPlainOrHash: cleanNewPass,
+        };
+        saveAccountToLocalBackup(updatedBackup);
+        const session: DirectBarSession = {
+          uid: updatedBackup.uid,
+          email: updatedBackup.email,
+          userName: updatedBackup.userName,
+          userRole: updatedBackup.userRole,
+          storeName: updatedBackup.storeName,
+          storeCode: updatedBackup.storeCode,
+        };
+        localStorage.setItem(DIRECT_SESSION_STORAGE_KEY, JSON.stringify(session));
+        setDirectSession(session);
+        return;
+      }
+
+      setAuthFormError(
+        data.error ||
+          'Não foi possível validar a recuperação. Confira o e-mail e o Código do Bar (ou Chave Mestre).'
+      );
+    } catch {
+      setAuthFormError('Erro ao redefinir a senha. Verifique sua conexão.');
     } finally {
       setAuthBusy(false);
     }
@@ -611,43 +758,6 @@ function ComandaVozWorkspace() {
     }
   };
 
-  // Google Login Handler
-  const handleGoogleSignIn = async () => {
-    setGoogleLoginBusy(true);
-    setGoogleAuthError(null);
-    const currentDomain = window.location.hostname || 'seu-app.onrender.com';
-    try {
-      await loginWithGoogle();
-    } catch (err: unknown) {
-      const code =
-        err && typeof err === 'object' && 'code' in err
-          ? String((err as { code?: string }).code)
-          : 'auth/unknown';
-      const msg = err instanceof Error ? err.message : String(err);
-
-      if (code === 'auth/popup-blocked' || code === 'auth/cancelled-popup-request') {
-        try {
-          await loginWithGoogleRedirect();
-          return;
-        } catch {
-          // continue
-        }
-      }
-
-      if (code === 'auth/unauthorized-domain' || msg.includes('unauthorized-domain')) {
-        setGoogleAuthError(
-          `O domínio "${currentDomain}" não está liberado para pop-up do Google. Use o Login com E-mail e Senha ao lado.`
-        );
-      } else if (code !== 'auth/popup-closed-by-user') {
-        setGoogleAuthError(
-          `Não foi possível abrir o Google (${code}). Use o Login com E-mail e Senha ao lado.`
-        );
-      }
-    } finally {
-      setGoogleLoginBusy(false);
-    }
-  };
-
   const handleSignOutAll = async () => {
     try {
       localStorage.removeItem(DIRECT_SESSION_STORAGE_KEY);
@@ -662,7 +772,6 @@ function ComandaVozWorkspace() {
 
   // 1. Auth Listener
   useEffect(() => {
-    checkGoogleRedirectResult().catch(() => {});
     const unsub = onAuthStateChanged(auth, (currentUser) => {
       setFirebaseUser(currentUser);
       setAuthReady(true);
@@ -1418,11 +1527,13 @@ function ComandaVozWorkspace() {
   ) => {
     if (!user) return;
     const qPhon = normalizePhoneticPt(customerQueryName);
-    const targetTab = activeStageTabs.find(
-      (t) =>
-        areCustomerNamesEquivalent(t.customerName, customerQueryName) ||
-        (qPhon.length >= 2 && normalizePhoneticPt(t.customerName).includes(qPhon))
-    );
+    const matchesCustomer = (t: BarTab) =>
+      areCustomerNamesEquivalent(t.customerName, customerQueryName) ||
+      (qPhon.length >= 2 && normalizePhoneticPt(t.customerName).includes(qPhon));
+
+    const targetTab =
+      activeStageTabs.find((t) => matchesCustomer(t) && t.status !== 'paid') ||
+      activeStageTabs.find(matchesCustomer);
 
     if (!targetTab) {
       const msg = `Não encontrei comanda aberta para "${customerQueryName}".`;
@@ -1503,30 +1614,116 @@ function ComandaVozWorkspace() {
     waiterNameAttr: string
   ) => {
     if (!user) return;
-    const qPhon = normalizePhoneticPt(customerQueryName);
-    const targetTab = activeStageTabs.find(
-      (t) =>
-        areCustomerNamesEquivalent(t.customerName, customerQueryName) ||
-        (qPhon.length >= 2 && normalizePhoneticPt(t.customerName).includes(qPhon))
-    );
+    const cleanQuery = customerQueryName
+      .trim()
+      .replace(/^(?:o|a|os|as|do|da|dos|das|de|no|na|pro|pra|para)\s+/i, '')
+      .replace(/[.!,?;:]+$/g, '')
+      .trim();
+    const qNorm = normalizeText(cleanQuery);
+    const qPhon = normalizePhoneticPt(cleanQuery);
+
+    const isCustomerTabMatch = (t: BarTab): boolean => {
+      const tabNorm = normalizeText(t.customerName);
+      const tabPhon = normalizePhoneticPt(t.customerName);
+      if (!tabNorm || !qNorm) return false;
+      if (tabNorm === qNorm) return true;
+      if (qPhon && tabPhon && tabPhon === qPhon) return true;
+      if (areCustomerNamesEquivalent(t.customerName, cleanQuery)) return true;
+      if (qPhon.length >= 2 && tabPhon.includes(qPhon)) return true;
+      if (qNorm.length >= 2 && tabNorm.includes(qNorm)) return true;
+      return false;
+    };
+
+    const matchingTabs = activeStageTabs.filter(isCustomerTabMatch);
+
+    console.info('[DarBaixa:Verificacao]', {
+      queryOriginal: customerQueryName,
+      queryNormalizada: qNorm,
+      queryFonetica: qPhon,
+      totalComandasAtivas: activeStageTabs.length,
+      comandasDisponiveis: activeStageTabs.map((t) => ({
+        id: t.id,
+        customerName: t.customerName,
+        normalizado: normalizeText(t.customerName),
+        fonetico: normalizePhoneticPt(t.customerName),
+        status: t.status,
+        totalAmount: t.totalAmount,
+        paidAmount: t.paidAmount,
+      })),
+      comandasFiltradasCount: matchingTabs.length,
+      comandasFiltradasIds: matchingTabs.map((t) => t.id),
+    });
+
+    // Prefer exact normalized match with remaining balance, then open/closing tabs, then any match
+    const targetTab =
+      matchingTabs.find(
+        (t) =>
+          normalizeText(t.customerName) === qNorm &&
+          t.status !== 'paid' &&
+          getRemainingBalance(t) > 0
+      ) ||
+      matchingTabs.find((t) => t.status !== 'paid' && getRemainingBalance(t) > 0) ||
+      matchingTabs.find((t) => t.status !== 'paid') ||
+      matchingTabs[0];
 
     if (!targetTab) {
+      const archivedMatches = tabs.filter(
+        (t) => t.status === 'archived' && isCustomerTabMatch(t)
+      );
+      console.warn('[DarBaixa:FalhaBusca]', {
+        motivo: 'Nenhuma comanda ativa correspondente encontrada.',
+        queryOriginal: customerQueryName,
+        queryNormalizada: qNorm,
+        comandasArquivadasCorrespondentes: archivedMatches.map((t) => ({
+          id: t.id,
+          customerName: t.customerName,
+          status: t.status,
+        })),
+      });
       const msg = `Não encontrei a comanda de "${customerQueryName}" para dar baixa.`;
       setFeedbackBanner({ type: 'error', message: msg });
       speakAsMarcelo(msg, marceloVoiceReplyEnabled);
       return;
     }
 
+    if (
+      targetTab.status === 'paid' &&
+      getRemainingBalance(targetTab) <= 0 &&
+      (!customPaymentAmount || customPaymentAmount <= 0)
+    ) {
+      console.info('[DarBaixa:JaPaga]', {
+        tabId: targetTab.id,
+        customerName: targetTab.customerName,
+        status: targetTab.status,
+        totalAmount: targetTab.totalAmount,
+        paidAmount: targetTab.paidAmount,
+      });
+      setSelectedTabId(targetTab.id);
+      const alreadyPaidMsg = `A conta de ${targetTab.customerName} já está paga e zerada (${formatBRL(targetTab.totalAmount)}).`;
+      setFeedbackBanner({ type: 'success', message: alreadyPaidMsg });
+      speakAsMarcelo(alreadyPaidMsg, marceloVoiceReplyEnabled);
+      return;
+    }
+
+    isMutatingRef.current = true;
+    lastMutationMsRef.current = Date.now();
+
     const currentRemaining = getRemainingBalance(targetTab);
     const amountBeingPaid =
       customPaymentAmount && customPaymentAmount > 0
         ? Math.min(customPaymentAmount, VALIDATION_LIMITS.MAX_TOTAL)
-        : currentRemaining;
+        : currentRemaining > 0
+          ? currentRemaining
+          : targetTab.totalAmount;
 
-    const nextPaidAmount = Math.min(
-      Number((targetTab.paidAmount + amountBeingPaid).toFixed(2)),
-      VALIDATION_LIMITS.MAX_TOTAL
-    );
+    const nextPaidAmount =
+      currentRemaining > 0
+        ? Math.min(
+            Number((targetTab.paidAmount + amountBeingPaid).toFixed(2)),
+            VALIDATION_LIMITS.MAX_TOTAL
+          )
+        : targetTab.totalAmount;
+
     const nextRemaining = Math.max(
       0,
       Number((targetTab.totalAmount - nextPaidAmount).toFixed(2))
@@ -1534,6 +1731,16 @@ function ComandaVozWorkspace() {
 
     const nextStatus: TabStageStatus =
       nextRemaining > 0 || keepOpenToConsume ? 'open' : 'paid';
+
+    console.info('[DarBaixa:AtualizandoTab]', {
+      tabId: targetTab.id,
+      customerName: targetTab.customerName,
+      statusAnterior: targetTab.status,
+      statusNovo: nextStatus,
+      paidAmountNovo: nextPaidAmount,
+      remainingNovo: nextRemaining,
+      modo: isDirectSession ? 'directSession' : 'firestore',
+    });
 
     try {
       if (isDirectSession) {
@@ -1562,6 +1769,9 @@ function ComandaVozWorkspace() {
         });
       }
 
+      if (stageFilter === 'open' || stageFilter === 'closing') {
+        setStageFilter('all');
+      }
       setSelectedTabId(targetTab.id);
       setShowBaixaDrawer(false);
 
@@ -1572,8 +1782,8 @@ function ComandaVozWorkspace() {
 
       const spokenSummary =
         nextStatus === 'open'
-          ? `Baixa de ${formatBRL(amountBeingPaid)} registrada para ${targetTab.customerName}. Falta pagar: ${formatBRL(nextRemaining)}.`
-          : `Baixa concluída! Conta de ${targetTab.customerName} paga (${formatBRL(nextPaidAmount)} via ${paymentMethod}).`;
+          ? `Baixa parcial de ${formatBRL(amountBeingPaid)} registrada na conta de ${targetTab.customerName}. Falta pagar: ${formatBRL(nextRemaining)}.`
+          : `Baixa realizada com sucesso! A conta de ${targetTab.customerName} (${formatBRL(targetTab.totalAmount)}) foi paga e zerada.`;
 
       setMarceloReport({
         intent: 'BAIXA',
@@ -1595,6 +1805,40 @@ function ComandaVozWorkspace() {
       speakAsMarcelo(spokenSummary, marceloVoiceReplyEnabled);
     } catch (err) {
       handleFirestoreError(err, OperationType.UPDATE, `tabs/${targetTab.id}`);
+    } finally {
+      lastMutationMsRef.current = Date.now();
+      isMutatingRef.current = false;
+    }
+  };
+
+  // Archive / Close Paid Tab (removes from active list when customer leaves)
+  const handleArchivePaidTab = async (tab: BarTab) => {
+    if (!user || !isAdmin) return;
+    isMutatingRef.current = true;
+    lastMutationMsRef.current = Date.now();
+    try {
+      if (isDirectSession) {
+        const localTs = makeLocalTimestamp();
+        const nextTabs = tabs.map((t) =>
+          t.id === tab.id ? { ...t, status: 'archived' as TabStageStatus, updatedAt: localTs } : t
+        );
+        setTabs(nextTabs);
+        await syncDirectStoreSnapshot({ tabs: nextTabs, actionType: 'remove' });
+      } else {
+        await updateDoc(doc(db, 'tabs', tab.id), {
+          status: 'archived',
+          updatedAt: serverTimestamp(),
+        });
+      }
+      setFeedbackBanner({
+        type: 'success',
+        message: `Comanda de ${tab.customerName} encerrada e arquivada.`,
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `tabs/${tab.id}`);
+    } finally {
+      lastMutationMsRef.current = Date.now();
+      isMutatingRef.current = false;
     }
   };
 
@@ -1617,13 +1861,18 @@ function ComandaVozWorkspace() {
       const localStrict = parseVoiceOrderLocally(
         cleanPhrase,
         menuItems,
-        activeStageTabs.map((t) => t.customerName)
+        activeStageTabs.map((t) => t.customerName),
+        selectedTab?.customerName
       );
 
       let finalParsed: ParsedVoiceOrder = localStrict;
 
-      // 2. Fallback to Gemini on server if phrase has complex natural wording
-      if (!localStrict.understood) {
+      const isExplicitAmbiguityAbort =
+        !localStrict.understood &&
+        /^(?:Ficou ambíguo|Você disse duas opções)/i.test(localStrict.unrecognizedReason || '');
+
+      // 2. Fallback to Gemini on server if phrase has complex natural wording (but never override explicit ambiguity aborts)
+      if (!localStrict.understood && !isExplicitAmbiguityAbort) {
         const response = await fetch('/api/parse-order', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -1662,7 +1911,9 @@ function ComandaVozWorkspace() {
           message: reason,
         });
         speakAsMarcelo(
-          'Não entendi com segurança. Nada foi marcado. Por favor, repita.',
+          isExplicitAmbiguityAbort
+            ? reason
+            : 'Não entendi com segurança. Nada foi marcado. Por favor, repita.',
           marceloVoiceReplyEnabled
         );
         return;
@@ -2586,6 +2837,199 @@ function ComandaVozWorkspace() {
     }
   };
 
+  // SUPERADMIN: Load Overview of all Accounts & Stores
+  const fetchSuperAdminOverview = async () => {
+    if (!isSuperAdmin) return;
+    try {
+      const res = await fetch('/api/superadmin/overview');
+      if (res.ok) {
+        const data = (await res.json()) as {
+          ok?: boolean;
+          masterRecoveryKey?: string;
+          accounts?: SuperAdminAccountSummary[];
+          stores?: SuperAdminStoreSummary[];
+        };
+        if (data.ok) {
+          if (data.masterRecoveryKey) setMasterRecoveryKeyState(data.masterRecoveryKey);
+          setSuperAccounts(Array.isArray(data.accounts) ? data.accounts : []);
+          setSuperStores(Array.isArray(data.stores) ? data.stores : []);
+        }
+      }
+    } catch {
+      // ignore network error
+    }
+  };
+
+  useEffect(() => {
+    if (isSuperAdmin && activeSection === 'superadmin') {
+      fetchSuperAdminOverview();
+    }
+  }, [isSuperAdmin, activeSection, tabs, menuItems, voiceOperators]);
+
+  const handleSuperAdminSaveAccount = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!isSuperAdmin) return;
+    setSaSaving(true);
+    try {
+      const res = await fetch('/api/superadmin/save-account', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          callerRole: 'SUPERADMIN',
+          email: saUserEmail.trim(),
+          newPassword: saUserPassword.trim() || undefined,
+          userName: saUserName.trim(),
+          userRole: saUserRole,
+          storeName: saStoreName.trim(),
+          storeCode: saStoreCode.trim(),
+        }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        ok?: boolean;
+        error?: string;
+        account?: SuperAdminAccountSummary;
+      };
+      if (!res.ok || !data.ok) {
+        setFeedbackBanner({
+          type: 'error',
+          message: data.error || 'Erro ao salvar conta.',
+        });
+        return;
+      }
+      if (data.account && saUserPassword.trim()) {
+        saveAccountToLocalBackup({
+          uid: data.account.uid,
+          email: data.account.email,
+          passwordPlainOrHash: saUserPassword.trim(),
+          userName: data.account.userName,
+          userRole: data.account.userRole,
+          storeName: data.account.storeName,
+          storeCode: data.account.storeCode,
+        });
+      }
+      setSaUserEmail('');
+      setSaUserName('');
+      setSaUserPassword('');
+      await fetchSuperAdminOverview();
+      setFeedbackBanner({
+        type: 'success',
+        message: 'Conta salva/atualizada com sucesso pelo SUPERADMIN!',
+      });
+    } finally {
+      setSaSaving(false);
+    }
+  };
+
+  const handleQuickResetUserPassword = async (targetEmail: string, targetName: string) => {
+    if (!isAdmin || !inlineNewPassword.trim() || inlineNewPassword.trim().length < 4) {
+      setFeedbackBanner({
+        type: 'error',
+        message: 'Informe uma nova senha de pelo menos 4 caracteres.',
+      });
+      return;
+    }
+    try {
+      const res = await fetch('/api/superadmin/save-account', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          callerRole: isSuperAdmin ? 'SUPERADMIN' : 'ADM',
+          email: targetEmail,
+          newPassword: inlineNewPassword.trim(),
+          userName: targetName,
+        }),
+      });
+      if (res.ok) {
+        setResettingAccountEmail(null);
+        setInlineNewPassword('');
+        if (isSuperAdmin) await fetchSuperAdminOverview();
+        setFeedbackBanner({
+          type: 'success',
+          message: `Nova senha definida para ${targetName} (${targetEmail})!`,
+        });
+      }
+    } catch {
+      setFeedbackBanner({
+        type: 'error',
+        message: 'Erro ao redefinir a senha do usuário.',
+      });
+    }
+  };
+
+  const handleSuperAdminDeleteAccount = async (targetEmail: string) => {
+    if (!isSuperAdmin) return;
+    try {
+      const res = await fetch('/api/superadmin/delete-account', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ callerRole: 'SUPERADMIN', email: targetEmail }),
+      });
+      if (res.ok) {
+        removeAccountFromLocalBackup(targetEmail);
+        await fetchSuperAdminOverview();
+        setFeedbackBanner({
+          type: 'success',
+          message: `Conta ${targetEmail} removida pelo SUPERADMIN.`,
+        });
+      }
+    } catch {
+      // ignore
+    }
+  };
+
+  const handleSuperAdminSwitchStore = (targetCode: string, targetName: string) => {
+    if (!isSuperAdmin || !directSession) return;
+    const nextSession: DirectBarSession = {
+      ...directSession,
+      storeCode: sanitizeStoreCode(targetCode),
+      storeName: sanitizeString(targetName, VALIDATION_LIMITS.STORE_NAME_MAX_LEN, 'Bar Central'),
+    };
+    localStorage.setItem(DIRECT_SESSION_STORAGE_KEY, JSON.stringify(nextSession));
+    setDirectSession(nextSession);
+    setActiveSection('comandas');
+    setFeedbackBanner({
+      type: 'success',
+      message: `SUPERADMIN agora controlando o bar: ${nextSession.storeName} (${nextSession.storeCode})`,
+    });
+  };
+
+  const handleSuperAdminStoreAction = async (
+    action: 'clear_tabs' | 'delete_store' | 'update_master_key',
+    storeCode?: string
+  ) => {
+    if (!isSuperAdmin) return;
+    try {
+      const res = await fetch('/api/superadmin/store-action', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          callerRole: 'SUPERADMIN',
+          action,
+          storeCode,
+          newMasterKey: masterRecoveryKeyState,
+        }),
+      });
+      if (res.ok) {
+        await fetchSuperAdminOverview();
+        if (action === 'clear_tabs' && storeCode === currentStoreCode) {
+          setTabs([]);
+          setTabItems([]);
+        }
+        setFeedbackBanner({
+          type: 'success',
+          message:
+            action === 'update_master_key'
+              ? `Chave Mestre atualizada para "${masterRecoveryKeyState}"!`
+              : action === 'clear_tabs'
+                ? `Comandas do bar ${storeCode} zeradas pelo SUPERADMIN.`
+                : `Bar ${storeCode} removido.`,
+        });
+      }
+    } catch {
+      // ignore
+    }
+  };
+
   if (!authReady) {
     return (
       <div className="min-h-screen bg-slate-950 text-slate-100 flex items-center justify-center p-6">
@@ -2594,7 +3038,7 @@ function ComandaVozWorkspace() {
     );
   }
 
-  // LOGIN SCREEN (CLEAN & SIMPLE)
+  // LOGIN SCREEN (CLEAN & SIMPLE WITH PASSWORD RECOVERY + SUPERADMIN)
   if (!user) {
     return (
       <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col justify-between">
@@ -2602,17 +3046,33 @@ function ComandaVozWorkspace() {
           <span className="text-lg font-bold tracking-tight text-slate-100">
             Comanda Voz · Marcelo
           </span>
-          <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2.5">
             <button
               type="button"
-              onClick={() => setAuthTab('register_adm')}
+              onClick={() => {
+                setAuthTab('recover_password');
+                setAuthFormError(null);
+              }}
+              className="px-3 py-2 text-xs font-medium text-slate-300 hover:text-amber-400 transition-colors cursor-pointer"
+            >
+              Recuperar Senha
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setAuthTab('register_adm');
+                setAuthFormError(null);
+              }}
               className="px-3.5 py-2 text-xs font-semibold bg-slate-800 text-amber-400 rounded-lg hover:bg-slate-700 transition-colors cursor-pointer"
             >
               Criar Conta ADM
             </button>
             <button
               type="button"
-              onClick={() => setAuthTab('login')}
+              onClick={() => {
+                setAuthTab('login');
+                setAuthFormError(null);
+              }}
               className="px-4 py-2 text-xs font-semibold bg-amber-500 text-slate-950 rounded-lg hover:bg-amber-400 transition-colors cursor-pointer"
             >
               Entrar
@@ -2647,36 +3107,53 @@ function ComandaVozWorkspace() {
             </div>
           </div>
 
-          {/* Right Column: Clean Login / Register Box */}
+          {/* Right Column: Clean Login / Register / Password Recovery Box */}
           <div className="lg:col-span-6 bg-slate-900 border border-slate-800 rounded-xl p-6 space-y-5 text-xs">
-            <div className="grid grid-cols-2 gap-1.5 p-1 bg-slate-950 border border-slate-800 rounded-lg">
+            <div className="grid grid-cols-3 gap-1 p-1 bg-slate-950 border border-slate-800 rounded-lg">
               <button
                 type="button"
                 onClick={() => {
                   setAuthTab('login');
                   setAuthFormError(null);
+                  setAuthSuccessMsg(null);
                 }}
-                className={`py-2.5 px-3 rounded-md font-bold transition-colors cursor-pointer ${
+                className={`py-2.5 px-2 rounded-md font-bold transition-colors cursor-pointer ${
                   authTab === 'login'
                     ? 'bg-amber-500 text-slate-950'
                     : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
-                Entrar (ADM ou Garçom)
+                Entrar
               </button>
               <button
                 type="button"
                 onClick={() => {
                   setAuthTab('register_adm');
                   setAuthFormError(null);
+                  setAuthSuccessMsg(null);
                 }}
-                className={`py-2.5 px-3 rounded-md font-bold transition-colors cursor-pointer ${
+                className={`py-2.5 px-2 rounded-md font-bold transition-colors cursor-pointer ${
                   authTab === 'register_adm'
                     ? 'bg-amber-500 text-slate-950'
                     : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
                 Criar Conta ADM
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setAuthTab('recover_password');
+                  setAuthFormError(null);
+                  setAuthSuccessMsg(null);
+                }}
+                className={`py-2.5 px-2 rounded-md font-bold transition-colors cursor-pointer ${
+                  authTab === 'recover_password'
+                    ? 'bg-amber-500 text-slate-950'
+                    : 'text-slate-400 hover:text-slate-200'
+                }`}
+              >
+                Recuperar Senha
               </button>
             </div>
 
@@ -2687,28 +3164,48 @@ function ComandaVozWorkspace() {
               </div>
             )}
 
-            {authTab === 'login' ? (
+            {authSuccessMsg && (
+              <div className="p-3 bg-emerald-950/60 border border-emerald-800/80 rounded-lg text-emerald-200 flex items-start gap-2">
+                <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0 mt-0.5" />
+                <span>{authSuccessMsg}</span>
+              </div>
+            )}
+
+            {authTab === 'login' && (
               <form onSubmit={handleEmailPasswordLogin} className="space-y-4">
                 <div className="space-y-1.5">
                   <label className="text-slate-300 font-medium flex items-center gap-1.5">
                     <Mail className="w-3.5 h-3.5 text-amber-400" />
-                    E-mail
+                    E-mail ou Usuário
                   </label>
                   <input
-                    type="email"
+                    type="text"
                     value={loginEmail}
                     onChange={(e) => setLoginEmail(e.target.value)}
-                    placeholder="Seu e-mail cadastrado"
+                    placeholder="Seu e-mail (ou digite superadmin)"
                     required
                     className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3.5 py-2.5 text-slate-100 focus:outline-none focus:border-amber-500"
                   />
                 </div>
 
                 <div className="space-y-1.5">
-                  <label className="text-slate-300 font-medium flex items-center gap-1.5">
-                    <KeyRound className="w-3.5 h-3.5 text-amber-400" />
-                    Senha
-                  </label>
+                  <div className="flex items-center justify-between">
+                    <label className="text-slate-300 font-medium flex items-center gap-1.5">
+                      <KeyRound className="w-3.5 h-3.5 text-amber-400" />
+                      Senha
+                    </label>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setRecEmail(loginEmail);
+                        setAuthTab('recover_password');
+                        setAuthFormError(null);
+                      }}
+                      className="text-amber-400 hover:underline font-medium cursor-pointer"
+                    >
+                      Esqueci minha senha
+                    </button>
+                  </div>
                   <div className="relative">
                     <input
                       type={showPassword ? 'text' : 'password'}
@@ -2736,34 +3233,33 @@ function ComandaVozWorkspace() {
                   {authBusy ? 'Entrando...' : 'Entrar no Sistema'}
                 </button>
 
-                <div className="pt-2 border-t border-slate-800 flex items-center justify-between">
+                <div className="pt-2 border-t border-slate-800 flex flex-wrap items-center justify-between gap-2">
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setLoginEmail('superadmin@comandavoz.com');
+                      setLoginPassword('superadmin123');
+                      setAuthFormError(null);
+                    }}
+                    className="text-amber-400 font-semibold hover:underline cursor-pointer"
+                  >
+                    Preencher Programador (SUPERADMIN)
+                  </button>
                   <button
                     type="button"
                     onClick={() => {
                       setAuthTab('register_adm');
                       setAuthFormError(null);
                     }}
-                    className="text-amber-400 font-semibold hover:underline cursor-pointer"
-                  >
-                    Primeiro acesso? Criar Conta ADM
-                  </button>
-                  <button
-                    type="button"
-                    onClick={handleGoogleSignIn}
-                    disabled={googleLoginBusy}
                     className="text-slate-400 hover:text-slate-200 cursor-pointer"
                   >
-                    {googleLoginBusy ? 'Abrindo...' : 'Entrar com Google'}
+                    Criar Conta ADM
                   </button>
                 </div>
-
-                {googleAuthError && (
-                  <p className="text-[11px] text-amber-300 bg-slate-950 p-2.5 rounded border border-slate-800">
-                    {googleAuthError}
-                  </p>
-                )}
               </form>
-            ) : (
+            )}
+
+            {authTab === 'register_adm' && (
               <form onSubmit={handleRegisterAdminAccount} className="space-y-3.5">
                 <div className="space-y-1">
                   <label className="text-slate-300 block font-medium">Seu Nome (ADM)</label>
@@ -2840,6 +3336,68 @@ function ComandaVozWorkspace() {
                 </button>
               </form>
             )}
+
+            {authTab === 'recover_password' && (
+              <form onSubmit={handleRecoverPassword} className="space-y-3.5">
+                <div className="p-3 bg-slate-950 border border-slate-800 rounded-lg text-slate-300 leading-relaxed">
+                  Informe seu <strong>E-mail/Usuário</strong> e valide com o{' '}
+                  <strong className="text-amber-400">Código do Bar</strong> (ex: BAR-01), seu{' '}
+                  <strong className="text-amber-400">Nome cadastrado</strong> ou a{' '}
+                  <strong className="text-amber-400">Chave Mestre do Programador</strong> para criar
+                  uma nova senha na hora.
+                </div>
+
+                <div className="space-y-1">
+                  <label className="text-slate-300 block font-medium">
+                    E-mail ou Usuário a recuperar *
+                  </label>
+                  <input
+                    type="text"
+                    value={recEmail}
+                    onChange={(e) => setRecEmail(e.target.value)}
+                    placeholder="Ex: adm@bar.com ou superadmin"
+                    required
+                    className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-amber-500"
+                  />
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  <div className="space-y-1">
+                    <label className="text-slate-300 block font-medium">
+                      Código do Bar / Nome / Chave Mestre *
+                    </label>
+                    <input
+                      type="text"
+                      value={recVerification}
+                      onChange={(e) => setRecVerification(e.target.value)}
+                      placeholder="Ex: BAR-01 ou SUPER2026"
+                      required
+                      className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-slate-100 font-mono focus:outline-none focus:border-amber-500"
+                    />
+                  </div>
+                  <div className="space-y-1">
+                    <label className="text-slate-300 block font-medium">Nova Senha *</label>
+                    <input
+                      type={showPassword ? 'text' : 'password'}
+                      value={recNewPassword}
+                      onChange={(e) => setRecNewPassword(e.target.value)}
+                      placeholder="Mín. 4 caracteres"
+                      required
+                      minLength={4}
+                      className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-amber-500"
+                    />
+                  </div>
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={authBusy}
+                  className="w-full py-3 bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-bold text-sm rounded-lg transition-colors cursor-pointer"
+                >
+                  {authBusy ? 'Redefinindo...' : 'Redefinir Senha e Entrar'}
+                </button>
+              </form>
+            )}
           </div>
         </main>
 
@@ -2863,8 +3421,8 @@ function ComandaVozWorkspace() {
           {currentStoreName} · <span className="text-amber-400">Marcelo</span>
         </button>
 
-        {/* Clean 3-Tab Navigation */}
-        <nav className="flex items-center gap-5 text-sm font-medium text-slate-400">
+        {/* Clean Top Navigation */}
+        <nav className="flex items-center gap-5 text-sm font-medium text-slate-400 overflow-x-auto">
           <button
             type="button"
             onClick={() => setActiveSection('comandas')}
@@ -2900,12 +3458,25 @@ function ComandaVozWorkspace() {
               Garçons ({voiceOperators.length})
             </button>
           )}
+          {isSuperAdmin && (
+            <button
+              type="button"
+              onClick={() => setActiveSection('superadmin')}
+              className={`py-1 transition-colors whitespace-nowrap cursor-pointer ${
+                activeSection === 'superadmin'
+                  ? 'text-emerald-400 font-bold underline underline-offset-8 decoration-2'
+                  : 'text-emerald-400/80 hover:text-emerald-300'
+              }`}
+            >
+              SUPERADMIN
+            </button>
+          )}
         </nav>
 
         {/* User Role & Sign Out */}
         <div className="flex items-center gap-3 shrink-0 text-xs">
           <span className="hidden sm:inline text-slate-400">
-            {isAdmin ? 'ADM:' : 'Garçom:'}{' '}
+            {isSuperAdmin ? 'SUPERADMIN:' : isAdmin ? 'ADM:' : 'Garçom:'}{' '}
             <strong className="text-slate-100">
               {userProfile?.userName || directSession?.userName}
             </strong>
@@ -3356,13 +3927,29 @@ function ComandaVozWorkspace() {
 
                       <button
                         type="button"
+                        onClick={() =>
+                          executeStage3Baixa(
+                            selectedTab.customerName,
+                            undefined,
+                            'PIX',
+                            false,
+                            activeWaiterDisplay.name
+                          )
+                        }
+                        className="px-4 py-2.5 text-xs font-bold bg-emerald-500 hover:bg-emerald-400 text-slate-950 rounded-lg transition-colors cursor-pointer"
+                      >
+                        Dar Baixa Total
+                      </button>
+
+                      <button
+                        type="button"
                         onClick={() => {
                           setBaixaAmountInput(getRemainingBalance(selectedTab).toFixed(2));
                           setShowBaixaDrawer((v) => !v);
                         }}
-                        className="px-4 py-2.5 text-xs font-bold bg-emerald-500 hover:bg-emerald-400 text-slate-950 rounded-lg transition-colors cursor-pointer"
+                        className="px-3 py-2.5 text-xs font-semibold bg-slate-800 hover:bg-slate-700 text-emerald-300 rounded-lg transition-colors cursor-pointer"
                       >
-                        Dar Baixa
+                        Baixa Parcial
                       </button>
 
                       <button
@@ -3379,6 +3966,29 @@ function ComandaVozWorkspace() {
                       </button>
                     </div>
                   </div>
+
+                  {/* Banner when account is PAID / BAIXADA */}
+                  {selectedTab.status === 'paid' && (
+                    <div className="p-3.5 bg-emerald-950/60 border border-emerald-600/60 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs">
+                      <div className="flex items-center gap-2 text-emerald-200">
+                        <CheckCircle2 className="w-4 h-4 text-emerald-400 shrink-0" />
+                        <span>
+                          <strong>CONTA BAIXADA / PAGA:</strong> Total pago{' '}
+                          {formatBRL(selectedTab.paidAmount)}. Se o cliente pedir mais itens, basta
+                          marcar normalmente!
+                        </span>
+                      </div>
+                      {isAdmin && (
+                        <button
+                          type="button"
+                          onClick={() => handleArchivePaidTab(selectedTab)}
+                          className="px-3 py-1.5 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold rounded-lg transition-colors cursor-pointer"
+                        >
+                          Arquivar / Remover da Lista
+                        </button>
+                      )}
+                    </div>
+                  )}
 
                   {/* STAGE 3 DRAWER: DAR BAIXA */}
                   {showBaixaDrawer && (
@@ -3623,13 +4233,13 @@ function ComandaVozWorkspace() {
 
                     <div className="space-y-1">
                       <label className="text-slate-300 block font-medium">
-                        Como você fala no microfone (separado por vírgula)
+                        Palavras-chave específicas de voz (separe por vírgula)
                       </label>
                       <input
                         type="text"
                         value={newMenuSynonyms}
                         onChange={(e) => setNewMenuSynonyms(e.target.value)}
-                        placeholder="Ex: litrão, brahma, litrão de cerveja"
+                        placeholder="Ex: coca 2l, coca 2 litros (evite palavras genéricas repetidas)"
                         maxLength={200}
                         className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-slate-100 focus:outline-none focus:border-amber-500"
                       />
@@ -3902,8 +4512,8 @@ function ComandaVozWorkspace() {
                       <tr className="bg-slate-950 border-b border-slate-800 text-slate-400">
                         <th className="py-2.5 px-4 font-medium">Nome</th>
                         <th className="py-2.5 px-4 font-medium">E-mail de Login</th>
-                        <th className="py-2.5 px-4 font-medium">Permissão</th>
-                        <th className="py-2.5 px-4 font-medium text-right">Remover</th>
+                        <th className="py-2.5 px-4 font-medium">Senha / Permissão</th>
+                        <th className="py-2.5 px-4 font-medium text-right">Ações</th>
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-800/70 bg-slate-950/40">
@@ -3915,8 +4525,54 @@ function ComandaVozWorkspace() {
                           <td className="py-2.5 px-4 text-slate-300 font-mono">
                             {op.email || '—'}
                           </td>
-                          <td className="py-2.5 px-4 text-amber-400">Somente Adicionar</td>
-                          <td className="py-2.5 px-4 text-right">
+                          <td className="py-2.5 px-4">
+                            {resettingAccountEmail === op.email && op.email ? (
+                              <div className="flex items-center gap-1.5">
+                                <input
+                                  type="text"
+                                  value={inlineNewPassword}
+                                  onChange={(e) => setInlineNewPassword(e.target.value)}
+                                  placeholder="Nova senha"
+                                  className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-100 w-28"
+                                />
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleQuickResetUserPassword(op.email!, op.operatorName)
+                                  }
+                                  className="px-2 py-1 bg-emerald-500 text-slate-950 font-bold rounded cursor-pointer"
+                                >
+                                  Salvar
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setResettingAccountEmail(null);
+                                    setInlineNewPassword('');
+                                  }}
+                                  className="text-slate-400 hover:text-slate-200 px-1 cursor-pointer"
+                                >
+                                  ✕
+                                </button>
+                              </div>
+                            ) : (
+                              <span className="text-amber-400">Somente Adicionar</span>
+                            )}
+                          </td>
+                          <td className="py-2.5 px-4 text-right space-x-3 whitespace-nowrap">
+                            {op.email && (
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  setResettingAccountEmail(op.email!);
+                                  setInlineNewPassword('');
+                                }}
+                                className="text-sky-400 hover:underline font-medium cursor-pointer"
+                                title="Redefinir senha do garçom"
+                              >
+                                Trocar Senha
+                              </button>
+                            )}
                             <button
                               type="button"
                               onClick={() => handleDeleteOperator(op.id)}
@@ -3932,6 +4588,336 @@ function ComandaVozWorkspace() {
                   </table>
                 </div>
               )}
+            </div>
+          </div>
+        )}
+
+        {/* SECTION 4: SUPERADMIN (PROGRAMADOR - CONTROLE TOTAL DE BARES, USUÁRIOS E SENHAS) */}
+        {activeSection === 'superadmin' && isSuperAdmin && (
+          <div className="space-y-6">
+            {/* Top Bar: Master Recovery Key & Programmer Status */}
+            <div className="bg-slate-900 border border-emerald-500/40 rounded-xl p-5 flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+              <div className="space-y-1">
+                <h2 className="text-base font-bold text-emerald-400 flex items-center gap-2">
+                  <ShieldCheck className="w-5 h-5" />
+                  Painel do Programador (SUPERADMIN) — Controle Total
+                </h2>
+                <p className="text-xs text-slate-300">
+                  Você pode acessar qualquer bar em tempo real, criar/editar contas, trocar senhas e
+                  definir a Chave Mestre de recuperação.
+                </p>
+              </div>
+
+              <div className="flex items-center gap-2 text-xs">
+                <div className="space-y-1">
+                  <label className="text-slate-400 block">Chave Mestre de Recuperação</label>
+                  <div className="flex items-center gap-2">
+                    <input
+                      type="text"
+                      value={masterRecoveryKeyState}
+                      onChange={(e) => setMasterRecoveryKeyState(e.target.value)}
+                      className="bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 font-mono font-bold w-36"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => handleSuperAdminStoreAction('update_master_key')}
+                      className="px-3.5 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold rounded-lg transition-colors cursor-pointer"
+                    >
+                      Salvar Chave
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+              {/* Left Column: Create or Update Any Account (SUPERADMIN, ADM, Garçom) */}
+              <div className="lg:col-span-4 bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
+                <div className="space-y-1">
+                  <h3 className="text-sm font-bold text-slate-100">
+                    Criar ou Editar Qualquer Usuário
+                  </h3>
+                  <p className="text-xs text-slate-400">
+                    Crie novos ADMs, Garçons ou altere a senha do seu próprio usuário SUPERADMIN.
+                  </p>
+                </div>
+
+                <form onSubmit={handleSuperAdminSaveAccount} className="space-y-3 text-xs">
+                  <div className="space-y-1">
+                    <label className="text-slate-300 block font-medium">Nome *</label>
+                    <input
+                      type="text"
+                      value={saUserName}
+                      onChange={(e) => setSaUserName(e.target.value)}
+                      placeholder="Ex: Programador ou Dono do Bar"
+                      required
+                      className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100"
+                    />
+                  </div>
+
+                  <div className="space-y-1">
+                    <label className="text-slate-300 block font-medium">E-mail de Login *</label>
+                    <input
+                      type="email"
+                      value={saUserEmail}
+                      onChange={(e) => setSaUserEmail(e.target.value)}
+                      placeholder="Ex: superadmin@comandavoz.com"
+                      required
+                      className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 font-mono"
+                    />
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2.5">
+                    <div className="space-y-1">
+                      <label className="text-slate-300 block font-medium">Cargo</label>
+                      <select
+                        value={saUserRole}
+                        onChange={(e) =>
+                          setSaUserRole(e.target.value as 'SUPERADMIN' | 'ADM' | 'Garçom')
+                        }
+                        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100"
+                      >
+                        <option value="ADM">ADM (Dono do Bar)</option>
+                        <option value="Garçom">Garçom (Só Adiciona)</option>
+                        <option value="SUPERADMIN">SUPERADMIN (Programador)</option>
+                      </select>
+                    </div>
+
+                    <div className="space-y-1">
+                      <label className="text-slate-300 block font-medium">Senha *</label>
+                      <input
+                        type="text"
+                        value={saUserPassword}
+                        onChange={(e) => setSaUserPassword(e.target.value)}
+                        placeholder="Mín. 4 dígitos"
+                        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 font-mono"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-2.5">
+                    <div className="space-y-1">
+                      <label className="text-slate-300 block font-medium">Nome do Bar</label>
+                      <input
+                        type="text"
+                        value={saStoreName}
+                        onChange={(e) => setSaStoreName(e.target.value)}
+                        placeholder="Ex: Bar Central"
+                        required
+                        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100"
+                      />
+                    </div>
+
+                    <div className="space-y-1">
+                      <label className="text-slate-300 block font-medium">Código do Bar</label>
+                      <input
+                        type="text"
+                        value={saStoreCode}
+                        onChange={(e) => setSaStoreCode(e.target.value)}
+                        placeholder="Ex: BAR-01"
+                        required
+                        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 font-mono"
+                      />
+                    </div>
+                  </div>
+
+                  <button
+                    type="submit"
+                    disabled={saSaving}
+                    className="w-full py-2.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-lg transition-colors cursor-pointer"
+                  >
+                    {saSaving ? 'Salvando...' : 'Salvar Conta / Redefinir Senha'}
+                  </button>
+                </form>
+              </div>
+
+              {/* Right Column: All Users & All Stores Tables */}
+              <div className="lg:col-span-8 space-y-6">
+                {/* Stores List */}
+                <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-3">
+                  <h3 className="text-sm font-bold text-slate-100">
+                    Todos os Bares Cadastrados ({superStores.length})
+                  </h3>
+
+                  {superStores.length === 0 ? (
+                    <p className="text-xs text-slate-400">Nenhum bar registrado ainda.</p>
+                  ) : (
+                    <div className="border border-slate-800 rounded-lg overflow-hidden">
+                      <table className="w-full text-left border-collapse text-xs">
+                        <thead>
+                          <tr className="bg-slate-950 border-b border-slate-800 text-slate-400">
+                            <th className="py-2.5 px-3 font-medium">Bar / Código</th>
+                            <th className="py-2.5 px-3 font-medium">Comandas</th>
+                            <th className="py-2.5 px-3 font-medium">Cardápio</th>
+                            <th className="py-2.5 px-3 font-medium text-right">Controle</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-800/70 bg-slate-950/40">
+                          {superStores.map((st) => {
+                            const isCurrent = st.storeCode === currentStoreCode;
+                            return (
+                              <tr key={st.storeCode} className="hover:bg-slate-800/30">
+                                <td className="py-2.5 px-3 font-semibold text-slate-100">
+                                  {st.storeName}{' '}
+                                  <span className="font-mono text-amber-400">({st.storeCode})</span>
+                                </td>
+                                <td className="py-2.5 px-3 font-mono text-slate-300">
+                                  {st.tabsCount} ativas · {formatBRL(st.totalConsumed)}
+                                </td>
+                                <td className="py-2.5 px-3 text-slate-400">
+                                  {st.menuCount} itens · {st.operatorsCount} garçons
+                                </td>
+                                <td className="py-2.5 px-3 text-right space-x-2 whitespace-nowrap">
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      handleSuperAdminSwitchStore(st.storeCode, st.storeName)
+                                    }
+                                    className={`px-2.5 py-1 rounded font-bold cursor-pointer ${
+                                      isCurrent
+                                        ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                                        : 'bg-amber-500 text-slate-950 hover:bg-amber-400'
+                                    }`}
+                                  >
+                                    {isCurrent ? 'Bar Ativo' : 'Acessar Bar'}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      handleSuperAdminStoreAction('clear_tabs', st.storeCode)
+                                    }
+                                    className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded cursor-pointer"
+                                  >
+                                    Zerar Comandas
+                                  </button>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </div>
+
+                {/* All Accounts List */}
+                <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-3">
+                  <h3 className="text-sm font-bold text-slate-100">
+                    Todos os Usuários e Senhas ({superAccounts.length})
+                  </h3>
+
+                  <div className="border border-slate-800 rounded-lg overflow-hidden">
+                    <table className="w-full text-left border-collapse text-xs">
+                      <thead>
+                        <tr className="bg-slate-950 border-b border-slate-800 text-slate-400">
+                          <th className="py-2.5 px-3 font-medium">Usuário / E-mail</th>
+                          <th className="py-2.5 px-3 font-medium">Cargo</th>
+                          <th className="py-2.5 px-3 font-medium">Bar</th>
+                          <th className="py-2.5 px-3 font-medium text-right">Ações</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800/70 bg-slate-950/40">
+                        {superAccounts.map((acc) => (
+                          <tr key={acc.email} className="hover:bg-slate-800/30">
+                            <td className="py-2.5 px-3">
+                              <div className="font-semibold text-slate-100">{acc.userName}</div>
+                              <div className="font-mono text-[11px] text-slate-400">
+                                {acc.email}
+                              </div>
+                            </td>
+                            <td className="py-2.5 px-3">
+                              <span
+                                className={
+                                  acc.userRole === 'SUPERADMIN'
+                                    ? 'text-emerald-400 font-bold'
+                                    : acc.userRole === 'ADM'
+                                      ? 'text-amber-400 font-bold'
+                                      : 'text-slate-300'
+                                }
+                              >
+                                {acc.userRole}
+                              </span>
+                            </td>
+                            <td className="py-2.5 px-3 text-slate-300">
+                              {acc.storeName}{' '}
+                              <span className="font-mono text-slate-400">({acc.storeCode})</span>
+                            </td>
+                            <td className="py-2.5 px-3 text-right space-x-2 whitespace-nowrap">
+                              {resettingAccountEmail === acc.email ? (
+                                <span className="inline-flex items-center gap-1">
+                                  <input
+                                    type="text"
+                                    value={inlineNewPassword}
+                                    onChange={(e) => setInlineNewPassword(e.target.value)}
+                                    placeholder="Nova senha"
+                                    className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-100 w-24"
+                                  />
+                                  <button
+                                    type="button"
+                                    onClick={() =>
+                                      handleQuickResetUserPassword(acc.email, acc.userName)
+                                    }
+                                    className="px-2 py-1 bg-emerald-500 text-slate-950 font-bold rounded cursor-pointer"
+                                  >
+                                    OK
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setResettingAccountEmail(null);
+                                      setInlineNewPassword('');
+                                    }}
+                                    className="text-slate-400 px-1 cursor-pointer"
+                                  >
+                                    ✕
+                                  </button>
+                                </span>
+                              ) : (
+                                <>
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setResettingAccountEmail(acc.email);
+                                      setInlineNewPassword('');
+                                    }}
+                                    className="text-sky-400 hover:underline font-medium cursor-pointer"
+                                  >
+                                    Trocar Senha
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => {
+                                      setSaUserName(acc.userName);
+                                      setSaUserEmail(acc.email);
+                                      setSaUserRole(acc.userRole);
+                                      setSaStoreName(acc.storeName);
+                                      setSaStoreCode(acc.storeCode);
+                                      setSaUserPassword('');
+                                    }}
+                                    className="text-amber-400 hover:underline font-medium cursor-pointer"
+                                  >
+                                    Editar
+                                  </button>
+                                  {acc.userRole !== 'SUPERADMIN' && (
+                                    <button
+                                      type="button"
+                                      onClick={() => handleSuperAdminDeleteAccount(acc.email)}
+                                      className="text-slate-400 hover:text-red-400 cursor-pointer"
+                                      title="Excluir usuário"
+                                    >
+                                      <Trash2 className="w-3.5 h-3.5 inline" />
+                                    </button>
+                                  )}
+                                </>
+                              )}
+                            </td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
         )}
