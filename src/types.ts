@@ -76,6 +76,7 @@ export interface VoiceOperator {
   spectralCentroid: number;
   voicePin: string;
   samplesCount: number;
+  accessBlocked?: boolean;
   createdAt: Timestamp | null;
   updatedAt: Timestamp | null;
 }

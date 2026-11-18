@@ -43,6 +43,7 @@ interface StoredAccount {
   subscriptionStatus?: SubscriptionStatusType;
   billingDueDate?: string;
   lastPaymentAtMs?: number;
+  accessBlocked?: boolean;
   createdAtMs: number;
 }
 
@@ -306,6 +307,13 @@ async function startServer() {
     }
 
     if (acc.userRole !== 'SUPERADMIN') {
+      if (acc.accessBlocked) {
+        res.status(403).json({
+          error:
+            'Acesso bloqueado pelo ADM deste bar. Solicite a liberação ao administrador para fazer lançamentos.',
+        });
+        return;
+      }
       const storeAdminBlocked = Array.from(accountMemoryMap.values()).some(
         (other) =>
           other.storeCode === acc.storeCode &&
@@ -513,12 +521,80 @@ async function startServer() {
       spectralCentroid: Number(spectralCentroid) || 1600,
       voicePin: String(voicePin || '').slice(0, 20),
       samplesCount: Number(samplesCount) || 1,
+      accessBlocked: false,
     };
 
     res.json({
       ok: true,
       operator: opPayload,
       waiterAccount: opPayload,
+    });
+  });
+
+  // 4c. ADM or SUPERADMIN Instantly Blocks/Unblocks a Waiter's Access
+  app.post('/api/auth/toggle-waiter-access', (req, res) => {
+    const { callerRole, storeCode, operatorId, email, accessBlocked } = req.body as {
+      callerRole?: string;
+      storeCode?: string;
+      operatorId?: string;
+      email?: string;
+      accessBlocked?: boolean;
+    };
+
+    if (
+      callerRole !== 'SUPERADMIN' &&
+      callerRole !== 'ADM' &&
+      callerRole !== 'Proprietário'
+    ) {
+      res.status(403).json({
+        error: 'Acesso negado: somente o ADM ou SUPERADMIN pode bloquear/liberar garçons.',
+      });
+      return;
+    }
+
+    const code = cleanStoreCode(storeCode || 'BAR-01');
+    const normEmail = email ? normalizeEmailOrUsername(email) : '';
+    const nextBlocked = Boolean(accessBlocked);
+
+    // Update accountMemoryMap (prevent future logins & server-side writes)
+    for (const [accKey, acc] of accountMemoryMap.entries()) {
+      const matchMail = normEmail && acc.email === normEmail;
+      const matchId = operatorId && acc.uid === operatorId;
+      if (
+        acc.userRole === 'Garçom' &&
+        acc.storeCode === code &&
+        (matchMail || matchId)
+      ) {
+        accountMemoryMap.set(accKey, { ...acc, accessBlocked: nextBlocked });
+      }
+    }
+
+    // Update voiceOperators inside the store snapshot
+    const storeSnap = storeMemoryMap.get(code);
+    if (storeSnap && Array.isArray(storeSnap.voiceOperators)) {
+      storeSnap.voiceOperators = storeSnap.voiceOperators.map((rawOp) => {
+        if (rawOp && typeof rawOp === 'object') {
+          const op = rawOp as { id?: string; email?: string; accessBlocked?: boolean };
+          const matchesId = operatorId && op.id === operatorId;
+          const matchesMail =
+            normEmail && op.email && normalizeEmailOrUsername(op.email) === normEmail;
+          if (matchesId || matchesMail) {
+            return { ...op, accessBlocked: nextBlocked };
+          }
+        }
+        return rawOp;
+      });
+      storeSnap.updatedAtMs = Date.now();
+      storeMemoryMap.set(code, storeSnap);
+    }
+
+    saveDatabaseToDisk();
+
+    res.json({
+      ok: true,
+      operatorId: operatorId || '',
+      email: normEmail,
+      accessBlocked: nextBlocked,
     });
   });
 
@@ -964,6 +1040,9 @@ async function startServer() {
     const code = cleanStoreCode(req.params.storeCode);
     const body = req.body as Partial<ServerStoreSnapshot> & {
       callerRole?: string;
+      callerEmail?: string;
+      callerUid?: string;
+      callerName?: string;
       actionType?: 'add' | 'remove' | 'sync' | 'catalog';
     };
 
@@ -977,6 +1056,42 @@ async function startServer() {
     }
 
     const current = storeMemoryMap.get(code);
+
+    // Instant block check for Garçom performing any mutation / launch
+    if (body.callerRole === 'Garçom') {
+      const callerNormEmail = body.callerEmail ? normalizeEmailOrUsername(body.callerEmail) : '';
+      const callerAcc = callerNormEmail ? accountMemoryMap.get(callerNormEmail) : undefined;
+      const callerNormName = String(body.callerName || '').trim().toLowerCase();
+
+      const blockedInStore = Array.isArray(current?.voiceOperators)
+        ? current!.voiceOperators.some((rawOp) => {
+            if (!rawOp || typeof rawOp !== 'object') return false;
+            const op = rawOp as {
+              id?: string;
+              email?: string;
+              operatorName?: string;
+              accessBlocked?: boolean;
+            };
+            if (!op.accessBlocked) return false;
+            const matchUid = body.callerUid && op.id === body.callerUid;
+            const matchEmail =
+              callerNormEmail && op.email && normalizeEmailOrUsername(op.email) === callerNormEmail;
+            const matchName =
+              callerNormName &&
+              op.operatorName &&
+              op.operatorName.trim().toLowerCase() === callerNormName;
+            return Boolean(matchUid || matchEmail || matchName);
+          })
+        : false;
+
+      if (callerAcc?.accessBlocked || blockedInStore) {
+        res.status(403).json({
+          error:
+            'Acesso bloqueado pelo ADM: você está impedido de realizar novos lançamentos.',
+        });
+        return;
+      }
+    }
 
     const nextSnapshot: ServerStoreSnapshot = {
       storeCode: code,
@@ -1012,19 +1127,24 @@ async function startServer() {
             operatorName?: string;
             storeName?: string;
             storeCode?: string;
+            accessBlocked?: boolean;
           };
-          if (op.email && op.passwordHash) {
+          if (op.email && (op.passwordHash || accountMemoryMap.has(normalizeEmailOrUsername(op.email)))) {
             const norm = normalizeEmailOrUsername(op.email);
             const existingAcc = accountMemoryMap.get(norm);
             if (!existingAcc || existingAcc.userRole === 'Garçom') {
               accountMemoryMap.set(norm, {
                 uid: op.id || existingAcc?.uid || `op_${Date.now()}`,
                 email: norm,
-                passwordHash: existingAcc?.passwordHash || op.passwordHash,
+                passwordHash: existingAcc?.passwordHash || op.passwordHash || '',
                 userName: op.operatorName || existingAcc?.userName || 'Garçom',
                 userRole: 'Garçom',
                 storeName: op.storeName || nextSnapshot.storeName,
                 storeCode: code,
+                accessBlocked:
+                  typeof op.accessBlocked === 'boolean'
+                    ? op.accessBlocked
+                    : existingAcc?.accessBlocked ?? false,
                 createdAtMs: existingAcc?.createdAtMs || Date.now(),
               });
             }

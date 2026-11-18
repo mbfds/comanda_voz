@@ -11,6 +11,76 @@ export interface AudioInputDeviceOption {
   isBluetooth: boolean;
 }
 
+export interface AcousticCaptureResult extends AcousticSample {
+  framesCaptured: number;
+  maxRms: number;
+}
+
+export function isInsideEmbeddedIframe(): boolean {
+  if (typeof window === 'undefined') return false;
+  try {
+    return window.self !== window.top;
+  } catch {
+    return true;
+  }
+}
+
+export function describeVoiceCaptureError(err: unknown): string {
+  if (typeof window !== 'undefined' && !window.isSecureContext) {
+    return 'O microfone exige conexão segura (HTTPS) ou localhost. Acesse o sistema via HTTPS para capturar a voz.';
+  }
+
+  const domErr = err as { name?: string; message?: string } | null;
+  const name = domErr?.name || '';
+  const message = (domErr?.message || '').toLowerCase();
+  const inIframe = isInsideEmbeddedIframe();
+
+  if (
+    name === 'NotAllowedError' ||
+    name === 'PermissionDeniedError' ||
+    name === 'SecurityError' ||
+    message.includes('permission') ||
+    message.includes('not allowed') ||
+    message.includes('denied')
+  ) {
+    if (inIframe) {
+      return 'Permissão de microfone bloqueada dentro desta janela incorporada (iframe). Clique em "Abrir em Nova Aba" ou libere o microfone no cadeado do navegador.';
+    }
+    return 'Permissão de microfone negada. Clique no ícone de cadeado na barra de endereço do navegador e permita o uso do microfone.';
+  }
+
+  if (
+    name === 'NotFoundError' ||
+    name === 'DevicesNotFoundError' ||
+    message.includes('requested device not found')
+  ) {
+    return 'Nenhum microfone encontrado. Verifique se o fone Bluetooth ou microfone está conectado e selecionado.';
+  }
+
+  if (
+    name === 'NotReadableError' ||
+    name === 'TrackStartError' ||
+    message.includes('could not start audio source') ||
+    message.includes('device in use')
+  ) {
+    return 'O microfone está ocupado ou travado por outro app/chamada/aba. Feche outros apps que usam áudio ou reconecte o fone Bluetooth.';
+  }
+
+  if (name === 'OverconstrainedError' || name === 'ConstraintNotSatisfiedError') {
+    return 'O dispositivo de microfone selecionado não suportou os parâmetros de áudio. Selecione "Microfone Padrão / Automático" e tente novamente.';
+  }
+
+  if (name === 'AbortError') {
+    return 'A captura de áudio foi interrompida pelo sistema operacional. Tente novamente.';
+  }
+
+  if (err instanceof Error && err.message.trim()) {
+    return `Erro ao acessar o microfone: ${err.message}`;
+  }
+
+  return 'Não foi possível capturar o áudio do microfone. Verifique a conexão e a permissão do navegador.';
+}
+
 const BLUETOOTH_LABEL_REGEX =
   /\b(bluetooth|airpods|buds|galaxy\s*buds|redmi|qcy|jbl|sony|tws|headset|hands-free|handsfree|hfp|wireless|sem\s+fio|lapela|bt[\s_-]|earbuds|fone)\b/i;
 
@@ -74,16 +144,20 @@ export function speakAsMarcelo(text: string, enabled = true) {
   }
 }
 
+function computeRms(buffer: Float32Array): number {
+  let sum = 0;
+  for (let i = 0; i < buffer.length; i++) {
+    sum += buffer[i] * buffer[i];
+  }
+  return Math.sqrt(sum / Math.max(buffer.length, 1));
+}
+
 /**
  * Estimates fundamental frequency (pitch in Hz) from time-domain PCM float buffer via autocorrelation
  */
 function estimatePitchHz(buffer: Float32Array, sampleRate: number): number | null {
-  let rms = 0;
-  for (let i = 0; i < buffer.length; i++) {
-    rms += buffer[i] * buffer[i];
-  }
-  rms = Math.sqrt(rms / buffer.length);
-  if (rms < 0.012) return null; // Silence / low background noise
+  const rms = computeRms(buffer);
+  if (rms < 0.0025) return null; // Silence / dead mic
 
   const minFreq = 70;
   const maxFreq = 400;
@@ -130,28 +204,77 @@ function estimateSpectralCentroid(
     totalMagnitude += mag;
   }
 
-  if (totalMagnitude < 400) return null;
+  if (totalMagnitude < 80) return null;
   return weightedSum / totalMagnitude;
 }
 
-function buildAudioConstraints(deviceId?: string): MediaStreamConstraints {
+function buildConstraintCandidates(deviceId?: string): MediaStreamConstraints[] {
+  const candidates: MediaStreamConstraints[] = [];
   if (deviceId && deviceId !== 'default') {
-    return {
+    candidates.push({
       audio: {
         deviceId: { ideal: deviceId },
         echoCancellation: true,
         noiseSuppression: true,
         autoGainControl: true,
       },
-    };
+    });
+    candidates.push({
+      audio: {
+        deviceId: { ideal: deviceId },
+      },
+    });
   }
-  return {
+  candidates.push({
     audio: {
       echoCancellation: true,
       noiseSuppression: true,
       autoGainControl: true,
     },
-  };
+  });
+  candidates.push({ audio: true });
+  return candidates;
+}
+
+async function acquireMicrophoneStream(deviceId?: string): Promise<MediaStream> {
+  if (typeof window !== 'undefined' && !window.isSecureContext) {
+    throw new Error('Contexto inseguro (HTTP): microfone requer HTTPS ou localhost.');
+  }
+  if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
+    throw new Error('Seu navegador não disponibilizou a API de microfone (getUserMedia).');
+  }
+
+  const candidates = buildConstraintCandidates(deviceId);
+  let lastError: unknown = null;
+
+  for (const constraints of candidates) {
+    try {
+      return await navigator.mediaDevices.getUserMedia(constraints);
+    } catch (err) {
+      lastError = err;
+      const errName = (err as { name?: string } | null)?.name || '';
+      // If permission was explicitly denied by user/policy, don't loop further
+      if (errName === 'NotAllowedError' || errName === 'PermissionDeniedError' || errName === 'SecurityError') {
+        throw err;
+      }
+    }
+  }
+
+  throw lastError || new Error('Falha ao abrir o microfone.');
+}
+
+async function createResumedAudioContext(): Promise<AudioContext> {
+  const AudioCtx =
+    window.AudioContext ||
+    (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+  if (!AudioCtx) {
+    throw new Error('AudioContext não suportado neste navegador.');
+  }
+  const audioCtx = new AudioCtx();
+  if (audioCtx.state === 'suspended') {
+    await audioCtx.resume().catch(() => {});
+  }
+  return audioCtx;
 }
 
 /**
@@ -160,68 +283,84 @@ function buildAudioConstraints(deviceId?: string): MediaStreamConstraints {
 export async function captureVoiceBiometricSample(
   durationMs = 2400,
   deviceId?: string
-): Promise<AcousticSample & { framesCaptured: number }> {
-  if (typeof navigator === 'undefined' || !navigator.mediaDevices?.getUserMedia) {
-    return { pitchHz: 138, spectralCentroid: 1520, framesCaptured: 10 };
-  }
+): Promise<AcousticCaptureResult> {
+  const stream = await acquireMicrophoneStream(deviceId);
+  let audioCtx: AudioContext | null = null;
+  let intervalId: ReturnType<typeof setInterval> | null = null;
 
-  const stream = await navigator.mediaDevices.getUserMedia(buildAudioConstraints(deviceId));
-  const AudioCtx =
-    window.AudioContext ||
-    (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-  const audioCtx = new AudioCtx();
-  const source = audioCtx.createMediaStreamSource(stream);
-  const analyser = audioCtx.createAnalyser();
-  analyser.fftSize = 2048;
-  source.connect(analyser);
+  try {
+    audioCtx = await createResumedAudioContext();
+    const source = audioCtx.createMediaStreamSource(stream);
+    const analyser = audioCtx.createAnalyser();
+    analyser.fftSize = 2048;
+    source.connect(analyser);
 
-  const timeBuffer = new Float32Array(analyser.fftSize);
-  const freqBuffer = new Uint8Array(analyser.frequencyBinCount);
+    const timeBuffer = new Float32Array(analyser.fftSize);
+    const freqBuffer = new Uint8Array(analyser.frequencyBinCount);
 
-  const pitches: number[] = [];
-  const centroids: number[] = [];
+    const pitches: number[] = [];
+    const centroids: number[] = [];
+    let energyFrames = 0;
+    let maxRms = 0;
 
-  const start = Date.now();
-  await new Promise<void>((resolve) => {
-    const interval = setInterval(() => {
-      analyser.getFloatTimeDomainData(timeBuffer);
-      analyser.getByteFrequencyData(freqBuffer);
+    const start = Date.now();
+    await new Promise<void>((resolve) => {
+      intervalId = setInterval(() => {
+        if (!audioCtx) return;
+        analyser.getFloatTimeDomainData(timeBuffer);
+        analyser.getByteFrequencyData(freqBuffer);
 
-      const p = estimatePitchHz(timeBuffer, audioCtx.sampleRate);
-      const c = estimateSpectralCentroid(freqBuffer, audioCtx.sampleRate, analyser.fftSize);
-      if (p !== null) pitches.push(p);
-      if (c !== null) centroids.push(c);
+        const rms = computeRms(timeBuffer);
+        if (rms > maxRms) maxRms = rms;
+        if (rms >= 0.0025) energyFrames += 1;
 
-      if (Date.now() - start >= durationMs) {
-        clearInterval(interval);
-        resolve();
+        const p = estimatePitchHz(timeBuffer, audioCtx.sampleRate);
+        const c = estimateSpectralCentroid(freqBuffer, audioCtx.sampleRate, analyser.fftSize);
+        if (p !== null) pitches.push(p);
+        if (c !== null) centroids.push(c);
+
+        if (Date.now() - start >= durationMs) {
+          if (intervalId) clearInterval(intervalId);
+          intervalId = null;
+          resolve();
+        }
+      }, 55);
+    });
+
+    const sortedPitches = [...pitches].sort((a, b) => a - b);
+    const trimmedPitches =
+      sortedPitches.length >= 6
+        ? sortedPitches.slice(1, sortedPitches.length - 1)
+        : sortedPitches;
+
+    const avgPitch =
+      trimmedPitches.length > 0
+        ? trimmedPitches.reduce((a, b) => a + b, 0) / trimmedPitches.length
+        : 138;
+    const avgCentroid =
+      centroids.length > 0
+        ? centroids.reduce((a, b) => a + b, 0) / centroids.length
+        : 1520;
+
+    return {
+      pitchHz: Math.min(Math.max(Number(avgPitch.toFixed(1)), 50), 500),
+      spectralCentroid: Math.min(Math.max(Number(avgCentroid.toFixed(1)), 200), 8000),
+      framesCaptured: Math.max(pitches.length, energyFrames),
+      maxRms: Number(maxRms.toFixed(4)),
+    };
+  } finally {
+    if (intervalId) clearInterval(intervalId);
+    stream.getTracks().forEach((t) => {
+      try {
+        t.stop();
+      } catch {
+        // ignore
       }
-    }, 55);
-  });
-
-  stream.getTracks().forEach((t) => t.stop());
-  await audioCtx.close().catch(() => {});
-
-  const sortedPitches = [...pitches].sort((a, b) => a - b);
-  const trimmedPitches =
-    sortedPitches.length >= 6
-      ? sortedPitches.slice(1, sortedPitches.length - 1)
-      : sortedPitches;
-
-  const avgPitch =
-    trimmedPitches.length > 0
-      ? trimmedPitches.reduce((a, b) => a + b, 0) / trimmedPitches.length
-      : 138;
-  const avgCentroid =
-    centroids.length > 0
-      ? centroids.reduce((a, b) => a + b, 0) / centroids.length
-      : 1520;
-
-  return {
-    pitchHz: Math.min(Math.max(Number(avgPitch.toFixed(1)), 50), 500),
-    spectralCentroid: Math.min(Math.max(Number(avgCentroid.toFixed(1)), 200), 8000),
-    framesCaptured: pitches.length,
-  };
+    });
+    if (audioCtx) {
+      await audioCtx.close().catch(() => {});
+    }
+  }
 }
 
 export interface LiveAcousticTracker {
@@ -240,12 +379,11 @@ export async function startLiveAcousticTracker(
     return null;
   }
 
+  let stream: MediaStream | null = null;
+  let audioCtx: AudioContext | null = null;
   try {
-    const stream = await navigator.mediaDevices.getUserMedia(buildAudioConstraints(deviceId));
-    const AudioCtx =
-      window.AudioContext ||
-      (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-    const audioCtx = new AudioCtx();
+    stream = await acquireMicrophoneStream(deviceId);
+    audioCtx = await createResumedAudioContext();
     const source = audioCtx.createMediaStreamSource(stream);
     const analyser = audioCtx.createAnalyser();
     analyser.fftSize = 2048;
@@ -256,8 +394,10 @@ export async function startLiveAcousticTracker(
 
     const recentPitches: number[] = [];
     const recentCentroids: number[] = [];
+    let stopped = false;
 
     const interval = setInterval(() => {
+      if (stopped || !audioCtx) return;
       analyser.getFloatTimeDomainData(timeBuffer);
       analyser.getByteFrequencyData(freqBuffer);
 
@@ -287,12 +427,21 @@ export async function startLiveAcousticTracker(
         };
       },
       stop: () => {
+        stopped = true;
         clearInterval(interval);
-        stream.getTracks().forEach((t) => t.stop());
-        audioCtx.close().catch(() => {});
+        stream?.getTracks().forEach((t) => {
+          try {
+            t.stop();
+          } catch {
+            // ignore
+          }
+        });
+        audioCtx?.close().catch(() => {});
       },
     };
   } catch {
+    stream?.getTracks().forEach((t) => t.stop());
+    audioCtx?.close().catch(() => {});
     return null;
   }
 }

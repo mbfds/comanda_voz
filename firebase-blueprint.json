@@ -327,6 +327,10 @@
           "type": "number",
           "description": "Quantidade de amostras de voz gravadas no treinamento."
         },
+        "accessBlocked": {
+          "type": "boolean",
+          "description": "Indica se o garçom teve seu acesso bloqueado instantaneamente pelo ADM."
+        },
         "createdAt": {
           "type": "string",
           "format": "date-time",

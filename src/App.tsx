@@ -50,6 +50,10 @@ import {
   Radio,
   AudioLines,
   Users,
+  Ban,
+  Unlock,
+  BarChart3,
+  Award,
 } from 'lucide-react';
 import {
   auth,
@@ -90,17 +94,19 @@ import {
   AcousticSample,
   AudioInputDeviceOption,
   captureVoiceBiometricSample,
+  describeVoiceCaptureError,
+  isInsideEmbeddedIframe,
   LiveAcousticTracker,
   listAudioInputDevices,
   matchSpeakerAgainstOperators,
   speakAsMarcelo,
-  startLiveAcousticTracker,
 } from './utils/voiceBiometrics';
 import { ErrorBoundary } from './components/ErrorBoundary';
 import { SalesDashboard } from './components/SalesDashboard';
 
 // Web Speech API Type Declarations
 interface SpeechRecognitionEvent extends Event {
+  resultIndex?: number;
   results: {
     [index: number]: {
       [index: number]: {
@@ -122,6 +128,8 @@ interface SpeechRecognitionInstance extends EventTarget {
   interimResults: boolean;
   start: () => void;
   stop: () => void;
+  abort?: () => void;
+  onstart: (() => void) | null;
   onresult: ((event: SpeechRecognitionEvent) => void) | null;
   onerror: ((event: SpeechRecognitionErrorEvent) => void) | null;
   onend: (() => void) | null;
@@ -449,6 +457,7 @@ function ComandaVozWorkspace() {
   const [newOpVoiceSample, setNewOpVoiceSample] = useState<AcousticSample | null>(null);
   const [capturingNewOpVoice, setCapturingNewOpVoice] = useState(false);
   const [calibratingOpId, setCalibratingOpId] = useState<string | null>(null);
+  const [togglingAccessOpId, setTogglingAccessOpId] = useState<string | null>(null);
   const [testingCompatibility, setTestingCompatibility] = useState(false);
   const [registeringWaiter, setRegisteringWaiter] = useState(false);
 
@@ -484,6 +493,8 @@ function ComandaVozWorkspace() {
   const marceloAwakeUntilMsRef = useRef(0);
   const liveAcousticTrackerRef = useRef<LiveAcousticTracker | null>(null);
   const openMicWakeWordModeRef = useRef(openMicWakeWordMode);
+  const consecutiveSpeechErrorsRef = useRef(0);
+  const restartSpeechTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     openMicWakeWordModeRef.current = openMicWakeWordMode;
@@ -554,6 +565,9 @@ function ComandaVozWorkspace() {
       tabItems: updatedTabItems,
       voiceOperators: updatedOperators,
       callerRole: isAdmin ? 'ADM' : 'Garçom',
+      callerEmail: directSession?.email || user?.email || '',
+      callerUid: directSession?.uid || user?.uid || '',
+      callerName: userProfile?.userName || directSession?.userName || '',
       actionType: nextData.actionType || 'add',
       updatedAtMs: Date.now(),
     };
@@ -1221,6 +1235,33 @@ function ComandaVozWorkspace() {
     };
   }, [isAdmin, userProfile, directSession, user, currentStoreName]);
 
+  // Real-time check: did the ADM block this logged-in waiter from making new launches?
+  const isCurrentWaiterBlocked = useMemo(() => {
+    if (isAdmin || currentUserRole !== 'Garçom') return false;
+    const myEmail = (directSession?.email || user?.email || '').trim().toLowerCase();
+    const myUid = directSession?.uid || user?.uid || '';
+    const myName = normalizeText(userProfile?.userName || directSession?.userName || '');
+    return voiceOperators.some((op) => {
+      if (!op.accessBlocked) return false;
+      const matchUid = myUid && op.id === myUid;
+      const matchEmail = myEmail && (op.email || '').trim().toLowerCase() === myEmail;
+      const matchName = myName && normalizeText(op.operatorName) === myName;
+      return Boolean(matchUid || matchEmail || matchName);
+    });
+  }, [isAdmin, currentUserRole, voiceOperators, directSession, user, userProfile]);
+
+  useEffect(() => {
+    if (isCurrentWaiterBlocked && isListening) {
+      shouldKeepListeningRef.current = false;
+      marceloAwakeUntilMsRef.current = 0;
+      setMarceloAwakeWindowActive(false);
+      recognitionRef.current?.stop();
+      liveAcousticTrackerRef.current?.stop();
+      liveAcousticTrackerRef.current = null;
+      setIsListening(false);
+    }
+  }, [isCurrentWaiterBlocked, isListening]);
+
   const activeStageTabs = useMemo(
     () => tabs.filter((t) => t.status !== 'archived'),
     [tabs]
@@ -1316,6 +1357,14 @@ function ComandaVozWorkspace() {
     storeNameAttr: string
   ) => {
     if (!user || marcarCommands.length === 0) return;
+    if (isCurrentWaiterBlocked) {
+      setFeedbackBanner({
+        type: 'error',
+        message:
+          'Acesso bloqueado pelo ADM: você está impedido de realizar novos lançamentos.',
+      });
+      return;
+    }
 
     const cleanTranscript = sanitizeString(
       rawTranscript,
@@ -2011,6 +2060,13 @@ function ComandaVozWorkspace() {
   ) => {
     const cleanPhrase = phrase.trim();
     if (!cleanPhrase || !user) return;
+    if (isCurrentWaiterBlocked) {
+      const blockedMsg =
+        'Acesso bloqueado pelo ADM: você não tem permissão para realizar novos lançamentos.';
+      setFeedbackBanner({ type: 'error', message: blockedMsg });
+      speakAsMarcelo(blockedMsg, marceloVoiceReplyEnabled);
+      return;
+    }
 
     let waiterAttr = activeWaiterDisplay.name;
     const storeAttr = activeWaiterDisplay.storeName;
@@ -2025,6 +2081,12 @@ function ComandaVozWorkspace() {
           directSession?.email || user?.email || undefined
         );
         if (match.matchedOperator && match.confidence >= 60) {
+          if (match.matchedOperator.accessBlocked && !isAdmin) {
+            const blockedVoiceMsg = `Acesso de ${match.matchedOperator.operatorName} está bloqueado pelo ADM para novos lançamentos.`;
+            setFeedbackBanner({ type: 'error', message: blockedVoiceMsg });
+            speakAsMarcelo(blockedVoiceMsg, marceloVoiceReplyEnabled);
+            return;
+          }
           setLastVoiceCompatibility({
             operatorName: match.matchedOperator.operatorName,
             confidence: match.confidence,
@@ -2157,16 +2219,70 @@ function ComandaVozWorkspace() {
     }
   };
 
-  // Start / Stop Web Speech API Microphone Recognition (Supports Open-Mic "MARCELO" Wake-Word + Bluetooth Mic)
-  const toggleVoiceRecognition = async () => {
-    if (isListening) {
+  // Release any active SpeechRecognition or live tracker stream so AudioContext biometric capture won't hit NotReadableError
+  const releaseActiveMicForBiometrics = async () => {
+    let hadActiveMic = false;
+    if (restartSpeechTimerRef.current) {
+      clearTimeout(restartSpeechTimerRef.current);
+      restartSpeechTimerRef.current = null;
+    }
+    if (shouldKeepListeningRef.current || recognitionRef.current || isListening) {
+      hadActiveMic = true;
       shouldKeepListeningRef.current = false;
       marceloAwakeUntilMsRef.current = 0;
       setMarceloAwakeWindowActive(false);
-      recognitionRef.current?.stop();
+      try {
+        recognitionRef.current?.stop();
+      } catch {
+        // ignore
+      }
+      setIsListening(false);
+    }
+    if (liveAcousticTrackerRef.current) {
+      hadActiveMic = true;
+      liveAcousticTrackerRef.current.stop();
+      liveAcousticTrackerRef.current = null;
+    }
+    if (hadActiveMic) {
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+  };
+
+  // Start / Stop Web Speech API Microphone Recognition (Supports Open-Mic "MARCELO" Wake-Word)
+  const toggleVoiceRecognition = () => {
+    if (isCurrentWaiterBlocked) {
+      setFeedbackBanner({
+        type: 'error',
+        message: 'Acesso bloqueado pelo ADM: não é possível ativar o microfone para lançamentos.',
+      });
+      return;
+    }
+    if (isListening) {
+      if (restartSpeechTimerRef.current) {
+        clearTimeout(restartSpeechTimerRef.current);
+        restartSpeechTimerRef.current = null;
+      }
+      shouldKeepListeningRef.current = false;
+      marceloAwakeUntilMsRef.current = 0;
+      setMarceloAwakeWindowActive(false);
+      setInterimTranscript('');
+      try {
+        recognitionRef.current?.stop();
+      } catch {
+        // ignore
+      }
       liveAcousticTrackerRef.current?.stop();
       liveAcousticTrackerRef.current = null;
       setIsListening(false);
+      return;
+    }
+
+    if (typeof window !== 'undefined' && !window.isSecureContext) {
+      setFeedbackBanner({
+        type: 'error',
+        message:
+          'O microfone exige conexão HTTPS (ou localhost). Acesse o sistema via HTTPS para usar comandos de voz.',
+      });
       return;
     }
 
@@ -2180,119 +2296,215 @@ function ComandaVozWorkspace() {
       setFeedbackBanner({
         type: 'error',
         message:
-          'Seu navegador não suporta microfone nativo. Use o Chrome ou digite o comando no campo ao lado.',
+          'Seu navegador não suporta reconhecimento de voz nativo. Use Google Chrome / Edge ou digite o comando no campo ao lado.',
       });
       return;
     }
 
-    // Warm up Bluetooth / selected microphone and start live voice compatibility tracker
-    await refreshAudioDevices(true);
+    if (restartSpeechTimerRef.current) {
+      clearTimeout(restartSpeechTimerRef.current);
+      restartSpeechTimerRef.current = null;
+    }
     liveAcousticTrackerRef.current?.stop();
-    liveAcousticTrackerRef.current = await startLiveAcousticTracker(selectedMicDeviceId);
+    liveAcousticTrackerRef.current = null;
 
-    const recognition = new SpeechRecognitionCtor();
-    recognition.lang = 'pt-BR';
-    recognition.continuous = openMicWakeWordModeRef.current;
-    recognition.interimResults = true;
+    const createAndWireRecognition = (): SpeechRecognitionInstance => {
+      const recognition = new SpeechRecognitionCtor();
+      recognition.lang = 'pt-BR';
+      recognition.continuous = openMicWakeWordModeRef.current;
+      recognition.interimResults = true;
 
-    recognition.onresult = (event: SpeechRecognitionEvent) => {
-      let interim = '';
-      for (let i = event.results.length - 1; i < event.results.length; i++) {
-        const res = event.results[i];
-        if (res.isFinal) {
-          const finalPhrase = res[0].transcript.trim();
-          setInterimTranscript('');
-          if (!finalPhrase) continue;
+      recognition.onstart = () => {
+        if (recognitionRef.current !== recognition) return;
+        consecutiveSpeechErrorsRef.current = 0;
+      };
 
-          if (openMicWakeWordModeRef.current) {
-            const wakeInfo = extractCommandAfterMarceloWakeWord(finalPhrase);
-            const nowMs = Date.now();
+      recognition.onresult = (event: SpeechRecognitionEvent) => {
+        if (recognitionRef.current !== recognition) return;
+        consecutiveSpeechErrorsRef.current = 0;
+        let interim = '';
+        const startIdx =
+          typeof event.resultIndex === 'number'
+            ? Math.max(0, event.resultIndex)
+            : Math.max(0, event.results.length - 1);
 
-            if (wakeInfo.hasWakeWord) {
-              setLastIgnoredOpenMicPhrase('');
-              if (wakeInfo.isOnlyWakeWord) {
-                // Waiter said "Marcelo" / "Oi Marcelo": open a 12-second active window for the command
-                marceloAwakeUntilMsRef.current = nowMs + 12000;
-                setMarceloAwakeWindowActive(true);
-                setFeedbackBanner({
-                  type: 'success',
-                  message:
-                    'Marcelo na escuta! Pode falar o comando agora (ex: "marca 1 litrão para Tiago").',
-                });
-                speakAsMarcelo('Pode falar!', marceloVoiceReplyEnabled);
-              } else if (wakeInfo.commandTranscript) {
+        for (let i = startIdx; i < event.results.length; i++) {
+          const res = event.results[i];
+          if (!res || !res[0]) continue;
+          if (res.isFinal) {
+            const finalPhrase = res[0].transcript.trim();
+            setInterimTranscript('');
+            if (!finalPhrase) continue;
+
+            if (openMicWakeWordModeRef.current) {
+              const wakeInfo = extractCommandAfterMarceloWakeWord(finalPhrase);
+              const nowMs = Date.now();
+
+              if (wakeInfo.hasWakeWord) {
+                setLastIgnoredOpenMicPhrase('');
+                if (wakeInfo.isOnlyWakeWord) {
+                  // Waiter said "Marcelo" / "Oi Marcelo": open a 12-second active window for the command
+                  marceloAwakeUntilMsRef.current = nowMs + 12000;
+                  setMarceloAwakeWindowActive(true);
+                  setFeedbackBanner({
+                    type: 'success',
+                    message:
+                      'Marcelo na escuta! Pode falar o comando agora (ex: "marca 1 litrão para Tiago").',
+                  });
+                  speakAsMarcelo('Pode falar!', marceloVoiceReplyEnabled);
+                } else if (wakeInfo.commandTranscript) {
+                  marceloAwakeUntilMsRef.current = 0;
+                  setMarceloAwakeWindowActive(false);
+                  processOrderPhrase(wakeInfo.commandTranscript, 'voz');
+                }
+              } else if (nowMs < marceloAwakeUntilMsRef.current) {
+                // Spoken within 12 seconds after saying "Marcelo"
                 marceloAwakeUntilMsRef.current = 0;
                 setMarceloAwakeWindowActive(false);
-                processOrderPhrase(wakeInfo.commandTranscript, 'voz');
+                setLastIgnoredOpenMicPhrase('');
+                processOrderPhrase(finalPhrase, 'voz');
+              } else {
+                // Casual conversation with open microphone: ignore silently without interrupting the waiter!
+                setMarceloAwakeWindowActive(false);
+                setLastIgnoredOpenMicPhrase(finalPhrase);
               }
-            } else if (nowMs < marceloAwakeUntilMsRef.current) {
-              // Spoken within 12 seconds after saying "Marcelo"
-              marceloAwakeUntilMsRef.current = 0;
-              setMarceloAwakeWindowActive(false);
-              setLastIgnoredOpenMicPhrase('');
-              processOrderPhrase(finalPhrase, 'voz');
             } else {
-              // Casual conversation with open microphone: ignore silently without interrupting the waiter!
-              setMarceloAwakeWindowActive(false);
-              setLastIgnoredOpenMicPhrase(finalPhrase);
+              processOrderPhrase(finalPhrase, 'voz');
             }
           } else {
-            processOrderPhrase(finalPhrase, 'voz');
+            interim += res[0].transcript;
           }
-        } else {
-          interim += res[0].transcript;
         }
-      }
-      if (interim) {
-        setInterimTranscript(interim);
-      }
-    };
+        setInterimTranscript(interim.trim());
+      };
 
-    recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
-      if (event.error === 'not-allowed' || event.error === 'service-not-allowed') {
-        shouldKeepListeningRef.current = false;
-        liveAcousticTrackerRef.current?.stop();
-        liveAcousticTrackerRef.current = null;
-        setFeedbackBanner({
-          type: 'error',
-          message: `Permissão de microfone negada (${event.error}): libere o microfone no navegador.`,
-        });
-        setIsListening(false);
-      }
-    };
+      recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
+        if (recognitionRef.current !== recognition) return;
+        const errCode = event.error || 'unknown';
 
-    recognition.onend = () => {
-      // If Open-Mic Wake-Word mode is active and user didn't click stop, automatically keep listening
-      if (shouldKeepListeningRef.current && openMicWakeWordModeRef.current) {
-        setTimeout(() => {
-          if (shouldKeepListeningRef.current && recognitionRef.current) {
-            try {
-              recognitionRef.current.start();
-              return;
-            } catch {
-              // ignore if already started
-            }
+        if (errCode === 'not-allowed' || errCode === 'service-not-allowed') {
+          shouldKeepListeningRef.current = false;
+          setInterimTranscript('');
+          setFeedbackBanner({
+            type: 'error',
+            message: isInsideEmbeddedIframe()
+              ? `Permissão de microfone bloqueada nesta janela incorporada (${errCode}). Clique em "Abrir em Nova Aba" ou libere o microfone no navegador.`
+              : `Permissão de microfone negada (${errCode}): clique no cadeado da barra de endereço e libere o microfone.`,
+          });
+          setIsListening(false);
+          return;
+        }
+
+        if (errCode === 'audio-capture') {
+          shouldKeepListeningRef.current = false;
+          setInterimTranscript('');
+          setFeedbackBanner({
+            type: 'error',
+            message:
+              'Falha ao capturar áudio (audio-capture). Verifique se o microfone/fone Bluetooth está conectado e não está ocupado por outro app.',
+          });
+          setIsListening(false);
+          return;
+        }
+
+        if (errCode === 'network') {
+          shouldKeepListeningRef.current = false;
+          setInterimTranscript('');
+          setFeedbackBanner({
+            type: 'error',
+            message:
+              'Erro de rede no reconhecimento de voz do navegador (network). Verifique sua internet ou digite o comando.',
+          });
+          setIsListening(false);
+          return;
+        }
+
+        if (errCode === 'no-speech') {
+          if (!openMicWakeWordModeRef.current) {
+            shouldKeepListeningRef.current = false;
+            setInterimTranscript('');
+            setFeedbackBanner({
+              type: 'error',
+              message: 'Nenhuma fala detectada. Clique em "Falar com Marcelo" e fale logo em seguida.',
+            });
+            setIsListening(false);
           }
-        }, 220);
-        return;
-      }
-      liveAcousticTrackerRef.current?.stop();
-      liveAcousticTrackerRef.current = null;
-      setIsListening(false);
+          return;
+        }
+
+        consecutiveSpeechErrorsRef.current += 1;
+        if (consecutiveSpeechErrorsRef.current >= 3) {
+          shouldKeepListeningRef.current = false;
+          setInterimTranscript('');
+          setFeedbackBanner({
+            type: 'error',
+            message: `Erro contínuo ao capturar voz (${errCode}). Tente recarregar a página ou verificar o microfone.`,
+          });
+          setIsListening(false);
+        }
+      };
+
+      recognition.onend = () => {
+        if (recognitionRef.current !== recognition) return;
+        setInterimTranscript('');
+        // If Open-Mic Wake-Word mode is active and user didn't click stop, automatically keep listening
+        if (
+          shouldKeepListeningRef.current &&
+          openMicWakeWordModeRef.current &&
+          consecutiveSpeechErrorsRef.current < 3
+        ) {
+          if (restartSpeechTimerRef.current) clearTimeout(restartSpeechTimerRef.current);
+          restartSpeechTimerRef.current = setTimeout(() => {
+            if (shouldKeepListeningRef.current) {
+              try {
+                const nextRec = createAndWireRecognition();
+                recognitionRef.current = nextRec;
+                nextRec.start();
+                return;
+              } catch {
+                // ignore if busy
+              }
+            }
+          }, 260);
+          return;
+        }
+        setIsListening(false);
+      };
+
+      return recognition;
     };
 
+    const recognition = createAndWireRecognition();
+    consecutiveSpeechErrorsRef.current = 0;
     shouldKeepListeningRef.current = true;
     recognitionRef.current = recognition;
     setInterimTranscript('');
     setLastIgnoredOpenMicPhrase('');
+    setFeedbackBanner(null);
     setIsListening(true);
-    recognition.start();
+
+    try {
+      // Call synchronously inside user click handler to preserve browser microphone gesture activation
+      recognition.start();
+    } catch (err) {
+      shouldKeepListeningRef.current = false;
+      setIsListening(false);
+      setFeedbackBanner({
+        type: 'error',
+        message: describeVoiceCaptureError(err),
+      });
+    }
   };
 
   useEffect(() => {
     return () => {
       shouldKeepListeningRef.current = false;
-      recognitionRef.current?.stop();
+      if (restartSpeechTimerRef.current) clearTimeout(restartSpeechTimerRef.current);
+      try {
+        recognitionRef.current?.stop();
+      } catch {
+        // ignore
+      }
       liveAcousticTrackerRef.current?.stop();
     };
   }, []);
@@ -2300,8 +2512,18 @@ function ComandaVozWorkspace() {
   // Capture 2.4s voice sample when registering a new Waiter
   const handleCaptureVoiceForNewWaiter = async () => {
     setCapturingNewOpVoice(true);
+    setFeedbackBanner(null);
     try {
+      await releaseActiveMicForBiometrics();
       const sample = await captureVoiceBiometricSample(2400, selectedMicDeviceId);
+      if (sample.framesCaptured === 0) {
+        setFeedbackBanner({
+          type: 'error',
+          message:
+            'Microfone abriu, mas nenhum áudio foi detectado (pode estar no mudo ou com volume zerado). Fale por 2 a 3 segundos perto do microfone.',
+        });
+        return;
+      }
       setNewOpVoiceSample({
         pitchHz: sample.pitchHz,
         spectralCentroid: sample.spectralCentroid,
@@ -2310,10 +2532,11 @@ function ComandaVozWorkspace() {
         type: 'success',
         message: `Voz do garçom capturada com sucesso (${sample.pitchHz} Hz · Timbre ${Math.round(sample.spectralCentroid)} Hz)!`,
       });
-    } catch {
+    } catch (err) {
+      console.error('[VoiceCapture] New waiter sample failed:', err);
       setFeedbackBanner({
         type: 'error',
-        message: 'Não foi possível capturar o áudio do microfone. Verifique a permissão.',
+        message: describeVoiceCaptureError(err),
       });
     } finally {
       setCapturingNewOpVoice(false);
@@ -2324,8 +2547,18 @@ function ComandaVozWorkspace() {
   const handleCalibrateExistingWaiterVoice = async (targetOp: VoiceOperator) => {
     if (!user) return;
     setCalibratingOpId(targetOp.id);
+    setFeedbackBanner(null);
     try {
+      await releaseActiveMicForBiometrics();
       const sample = await captureVoiceBiometricSample(2500, selectedMicDeviceId);
+      if (sample.framesCaptured === 0) {
+        setFeedbackBanner({
+          type: 'error',
+          message:
+            'Microfone abriu, mas o áudio veio silencioso. Fale continuamente por 3 segundos perto do microfone ou verifique se não está no mudo.',
+        });
+        return;
+      }
       const prevSamples = Math.max(targetOp.samplesCount || 1, 1);
       const blendedPitch =
         prevSamples > 1
@@ -2396,10 +2629,11 @@ function ComandaVozWorkspace() {
         type: 'success',
         message: `Voz de ${targetOp.operatorName} cadastrada/calibrada (${blendedPitch} Hz · ${nextSamplesCount} amostras)!`,
       });
-    } catch {
+    } catch (err) {
+      console.error('[VoiceCapture] Calibration failed:', err);
       setFeedbackBanner({
         type: 'error',
-        message: 'Erro ao gravar amostra de voz do garçom.',
+        message: describeVoiceCaptureError(err),
       });
     } finally {
       setCalibratingOpId(null);
@@ -2416,8 +2650,18 @@ function ComandaVozWorkspace() {
       return;
     }
     setTestingCompatibility(true);
+    setFeedbackBanner(null);
     try {
+      await releaseActiveMicForBiometrics();
       const sample = await captureVoiceBiometricSample(2400, selectedMicDeviceId);
+      if (sample.framesCaptured === 0) {
+        setFeedbackBanner({
+          type: 'error',
+          message:
+            'Microfone abriu, mas nenhum som foi captado. Fale durante os 2,5 segundos do teste.',
+        });
+        return;
+      }
       const match = matchSpeakerAgainstOperators(
         sample,
         voiceOperators,
@@ -2433,11 +2677,17 @@ function ComandaVozWorkspace() {
           type: 'success',
           message: `Compatibilidade de Voz: ${match.confidence}% com o garçom ${match.matchedOperator.operatorName} (Tom medido: ${sample.pitchHz} Hz).`,
         });
+      } else {
+        setFeedbackBanner({
+          type: 'error',
+          message: 'Nenhum garçom calibrado encontrado para comparar a voz.',
+        });
       }
-    } catch {
+    } catch (err) {
+      console.error('[VoiceCapture] Compatibility test failed:', err);
       setFeedbackBanner({
         type: 'error',
-        message: 'Não foi possível medir a voz no microfone.',
+        message: describeVoiceCaptureError(err),
       });
     } finally {
       setTestingCompatibility(false);
@@ -2658,6 +2908,62 @@ function ComandaVozWorkspace() {
     }
   };
 
+  // ADM Instantly Blocks or Unblocks a Waiter's Access to Prevent New Launches
+  const handleToggleWaiterAccess = async (targetOp: VoiceOperator) => {
+    if (!user || !isAdmin) return;
+    const nextBlocked = !Boolean(targetOp.accessBlocked);
+    setTogglingAccessOpId(targetOp.id);
+    try {
+      const apiRes = await fetch('/api/auth/toggle-waiter-access', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          callerRole: currentUserRole === 'SUPERADMIN' ? 'SUPERADMIN' : 'ADM',
+          storeCode: currentStoreCode,
+          operatorId: targetOp.id,
+          email: targetOp.email || '',
+          accessBlocked: nextBlocked,
+        }),
+      });
+      if (!apiRes.ok) {
+        const errData = (await apiRes.json().catch(() => ({}))) as { error?: string };
+        setFeedbackBanner({
+          type: 'error',
+          message: errData.error || 'Não foi possível alterar o bloqueio deste garçom.',
+        });
+        return;
+      }
+
+      const localTs = makeLocalTimestamp();
+      const nextOps = voiceOperators.map((op) =>
+        op.id === targetOp.id
+          ? { ...op, accessBlocked: nextBlocked, updatedAt: localTs }
+          : op
+      );
+      setVoiceOperators(nextOps);
+
+      if (isDirectSession) {
+        await syncDirectStoreSnapshot({ voiceOperators: nextOps, actionType: 'add' });
+      } else {
+        await updateDoc(doc(db, 'voiceOperators', targetOp.id), {
+          accessBlocked: nextBlocked,
+          updatedAt: serverTimestamp(),
+        });
+      }
+
+      setFeedbackBanner({
+        type: 'success',
+        message: nextBlocked
+          ? `Acesso de ${targetOp.operatorName} bloqueado instantaneamente! Novos lançamentos impedidos.`
+          : `Acesso de ${targetOp.operatorName} liberado! O garçom já pode fazer lançamentos novamente.`,
+      });
+    } catch (err) {
+      handleFirestoreError(err, OperationType.UPDATE, `voiceOperators/${targetOp.id}`);
+    } finally {
+      setTogglingAccessOpId(null);
+    }
+  };
+
   // Undo last launch (STRICTLY ADM ONLY)
   const handleUndoLastLaunch = async () => {
     if (!lastUndo || !user || !isAdmin) return;
@@ -2732,6 +3038,13 @@ function ComandaVozWorkspace() {
   // Quick 1-Tap Add Menu Item to Selected Tab
   const handleQuickAddMenuItem = async (menuItem: MenuItem) => {
     if (!user || !selectedTab) return;
+    if (isCurrentWaiterBlocked) {
+      setFeedbackBanner({
+        type: 'error',
+        message: 'Acesso bloqueado pelo ADM: novos lançamentos estão impedidos para o seu usuário.',
+      });
+      return;
+    }
 
     const itemId = `item_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
     const newTotal = Math.min(
@@ -2833,6 +3146,13 @@ function ComandaVozWorkspace() {
   // STRICT RULE: Garçom can ONLY add (delta > 0). Only ADM can decrease or delete (delta < 0).
   const handleAdjustTabItemQty = async (item: TabItem, delta: number) => {
     if (!user) return;
+    if (isCurrentWaiterBlocked) {
+      setFeedbackBanner({
+        type: 'error',
+        message: 'Acesso bloqueado pelo ADM: novos lançamentos estão impedidos para o seu usuário.',
+      });
+      return;
+    }
     if (delta < 0 && !isAdmin) {
       setFeedbackBanner({
         type: 'error',
@@ -2925,6 +3245,13 @@ function ComandaVozWorkspace() {
   const handleCreateManualTab = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!user || !newCustomerName.trim()) return;
+    if (isCurrentWaiterBlocked) {
+      setFeedbackBanner({
+        type: 'error',
+        message: 'Acesso bloqueado pelo ADM: você não pode abrir novas comandas.',
+      });
+      return;
+    }
 
     const cleanName = sanitizeString(newCustomerName, VALIDATION_LIMITS.NAME_MAX_LEN);
     const cleanTable = sanitizeString(newTableLabel, VALIDATION_LIMITS.TABLE_MAX_LEN);
@@ -3970,13 +4297,27 @@ function ComandaVozWorkspace() {
       </header>
 
       <main className="max-w-[1320px] w-full mx-auto px-4 sm:px-6 py-5 space-y-5 flex-1">
+        {/* INSTANT ACCESS BLOCK BANNER FOR BLOCKED WAITERS */}
+        {isCurrentWaiterBlocked && (
+          <div className="bg-red-950/70 border border-red-600/70 rounded-xl p-4 flex items-center gap-3 text-xs sm:text-sm text-red-100">
+            <Ban className="w-5 h-5 text-red-400 shrink-0" />
+            <div>
+              <strong className="font-bold text-red-300">
+                Acesso bloqueado pelo Administrador:
+              </strong>{' '}
+              Novos lançamentos por voz, toque rápido ou abertura de comandas estão suspensos
+              para sua conta no momento.
+            </div>
+          </div>
+        )}
+
         {/* ULTRA-CLEAN MARCELO VOICE BAR (Supports Open-Mic "MARCELO" Wake-Word + Bluetooth Mic + Voice Compatibility) */}
         {activeSection === 'comandas' && (
           <section className="bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3">
             <form
               onSubmit={(e) => {
                 e.preventDefault();
-                if (commandInput.trim()) {
+                if (commandInput.trim() && !isCurrentWaiterBlocked) {
                   processOrderPhrase(commandInput, 'manual');
                 }
               }}
@@ -3985,8 +4326,8 @@ function ComandaVozWorkspace() {
               <button
                 type="button"
                 onClick={toggleVoiceRecognition}
-                disabled={isProcessingCommand}
-                className={`inline-flex items-center justify-center gap-2 px-5 py-3.5 rounded-lg text-sm font-bold transition-colors whitespace-nowrap shrink-0 cursor-pointer ${
+                disabled={isProcessingCommand || isCurrentWaiterBlocked}
+                className={`inline-flex items-center justify-center gap-2 px-5 py-3.5 rounded-lg text-sm font-bold transition-colors whitespace-nowrap shrink-0 cursor-pointer disabled:opacity-40 ${
                   isListening
                     ? marceloAwakeWindowActive
                       ? 'bg-emerald-500 text-slate-950 hover:bg-emerald-400'
@@ -4021,8 +4362,8 @@ function ComandaVozWorkspace() {
                   }
                   onChange={(e) => setCommandInput(e.target.value)}
                   placeholder='Com microfone aberto, diga: "Marcelo, marca 1 litrão para Tiago" ou "Marcelo, dar baixa no Tiago"'
-                  disabled={isProcessingCommand}
-                  className="w-full bg-slate-950 border border-slate-700 focus:border-amber-500 rounded-lg px-4 py-3.5 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none"
+                  disabled={isProcessingCommand || isCurrentWaiterBlocked}
+                  className="w-full bg-slate-950 border border-slate-700 focus:border-amber-500 rounded-lg px-4 py-3.5 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none disabled:opacity-50"
                 />
                 {isProcessingCommand && (
                   <span className="absolute right-3 top-1/2 -translate-y-1/2 text-xs text-amber-400 font-mono">
@@ -4033,7 +4374,7 @@ function ComandaVozWorkspace() {
 
               <button
                 type="submit"
-                disabled={isProcessingCommand || !commandInput.trim()}
+                disabled={isProcessingCommand || isCurrentWaiterBlocked || !commandInput.trim()}
                 className="inline-flex items-center justify-center gap-2 px-5 py-3.5 bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-100 text-sm font-semibold rounded-lg transition-colors whitespace-nowrap shrink-0 cursor-pointer"
               >
                 <Send className="w-4 h-4" />
@@ -4098,8 +4439,17 @@ function ComandaVozWorkspace() {
                 )}
 
                 {isListening && openMicWakeWordMode && lastIgnoredOpenMicPhrase && (
-                  <span className="text-slate-500 truncate max-w-xs">
-                    Conversa ignorada (sem &ldquo;Marcelo&rdquo;): &ldquo;{lastIgnoredOpenMicPhrase}&rdquo;
+                  <span className="text-amber-300/90 truncate max-w-md">
+                    Ouvi: &ldquo;{lastIgnoredOpenMicPhrase}&rdquo; (para executar, comece com &ldquo;Marcelo&rdquo;)
+                  </span>
+                )}
+                {isListening && !lastIgnoredOpenMicPhrase && (
+                  <span className="text-emerald-400 font-medium">
+                    {interimTranscript
+                      ? `Transcrevendo: "${interimTranscript}"`
+                      : openMicWakeWordMode
+                      ? 'Escutando... Diga "Marcelo" + pedido (ex: "Marcelo marca 1 cerveja pro Tiago")'
+                      : 'Escutando... Fale o pedido diretamente'}
                   </span>
                 )}
               </div>
@@ -4228,6 +4578,20 @@ function ComandaVozWorkspace() {
                 </div>
 
                 <div className="flex items-center gap-2">
+                  {feedbackBanner?.type === 'error' &&
+                    isInsideEmbeddedIframe() &&
+                    /microfone|permissão|iframe|not-allowed|service-not-allowed/i.test(
+                      feedbackBanner.message
+                    ) && (
+                      <a
+                        href={typeof window !== 'undefined' ? window.location.href : '#'}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="px-2.5 py-1 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded cursor-pointer whitespace-nowrap"
+                      >
+                        Abrir em Nova Aba
+                      </a>
+                    )}
                   {marceloReport && (
                     <button
                       type="button"
@@ -4266,20 +4630,36 @@ function ComandaVozWorkspace() {
         {/* Global Feedback Banner when on Cardápio or Garçons tab */}
         {activeSection !== 'comandas' && feedbackBanner && (
           <div
-            className={`flex items-center justify-between gap-3 px-4 py-3 rounded-lg border text-xs ${
+            className={`flex flex-wrap items-center justify-between gap-3 px-4 py-3 rounded-lg border text-xs ${
               feedbackBanner.type === 'success'
                 ? 'bg-emerald-950/50 border-emerald-800/70 text-emerald-200'
                 : 'bg-red-950/50 border-red-800/70 text-red-200'
             }`}
           >
             <span>{feedbackBanner.message}</span>
-            <button
-              type="button"
-              onClick={() => setFeedbackBanner(null)}
-              className="text-slate-400 hover:text-slate-200 cursor-pointer"
-            >
-              ✕
-            </button>
+            <div className="flex items-center gap-2">
+              {feedbackBanner.type === 'error' &&
+                isInsideEmbeddedIframe() &&
+                /microfone|permissão|iframe|not-allowed|service-not-allowed/i.test(
+                  feedbackBanner.message
+                ) && (
+                  <a
+                    href={typeof window !== 'undefined' ? window.location.href : '#'}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="px-2.5 py-1 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded cursor-pointer whitespace-nowrap"
+                  >
+                    Abrir em Nova Aba
+                  </a>
+                )}
+              <button
+                type="button"
+                onClick={() => setFeedbackBanner(null)}
+                className="text-slate-400 hover:text-slate-200 cursor-pointer"
+              >
+                ✕
+              </button>
+            </div>
           </div>
         )}
 
@@ -4294,8 +4674,9 @@ function ComandaVozWorkspace() {
                 </h2>
                 <button
                   type="button"
+                  disabled={isCurrentWaiterBlocked}
                   onClick={() => setShowNewTabForm((prev) => !prev)}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-amber-500 hover:bg-amber-400 text-slate-950 rounded-lg transition-colors cursor-pointer"
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-slate-950 rounded-lg transition-colors cursor-pointer"
                 >
                   <UserPlus className="w-3.5 h-3.5" />
                   Nova Comanda
@@ -4737,8 +5118,9 @@ function ComandaVozWorkspace() {
                                   </span>
                                   <button
                                     type="button"
+                                    disabled={isCurrentWaiterBlocked}
                                     onClick={() => handleAdjustTabItemQty(latestEntry, 1)}
-                                    className="w-7 h-7 rounded bg-slate-800 hover:bg-slate-700 text-amber-400 flex items-center justify-center cursor-pointer"
+                                    className="w-7 h-7 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-amber-400 flex items-center justify-center cursor-pointer"
                                     title="Adicionar +1"
                                   >
                                     <Plus className="w-3.5 h-3.5" />
@@ -4766,8 +5148,9 @@ function ComandaVozWorkspace() {
                         <button
                           key={item.id}
                           type="button"
+                          disabled={isCurrentWaiterBlocked}
                           onClick={() => handleQuickAddMenuItem(item)}
-                          className="p-2.5 bg-slate-950 hover:bg-slate-800 border border-slate-800 rounded-lg text-left transition-colors flex items-center justify-between gap-2 cursor-pointer"
+                          className="p-2.5 bg-slate-950 hover:bg-slate-800 disabled:opacity-40 border border-slate-800 rounded-lg text-left transition-colors flex items-center justify-between gap-2 cursor-pointer"
                         >
                           <div className="min-w-0">
                             <div className="text-xs font-medium text-slate-200 truncate">
@@ -5008,295 +5391,587 @@ function ComandaVozWorkspace() {
           />
         )}
 
-        {/* SECTION 4: GARÇONS, BIOMETRIA DE VOZ & BAR (ADM ONLY) */}
-        {activeSection === 'equipe_comercio' && isAdmin && (
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
-            <div className="lg:col-span-5 space-y-5">
-              {/* ADM Register Waiter Form + Voice Print */}
-              <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
-                <div className="space-y-1">
-                  <h2 className="text-base font-bold text-slate-100 flex items-center gap-2">
-                    <UserPlus className="w-5 h-5 text-amber-400" />
-                    Cadastrar Garçom (Login + Voz Compatível)
-                  </h2>
-                  <p className="text-xs text-slate-400">
-                    O garçom entra com e-mail e senha, usa microfone Bluetooth e só pode adicionar
-                    pedidos (não remove nada).
-                  </p>
-                </div>
+        {/* SECTION 4: GARÇONS, BIOMETRIA DE VOZ, BLOQUEIO DE ACESSO & RELATÓRIO DE PERFORMANCE (ADM ONLY) */}
+        {activeSection === 'equipe_comercio' && isAdmin && (() => {
+          const now = new Date();
+          const sevenDaysStartMs = new Date(
+            now.getFullYear(),
+            now.getMonth(),
+            now.getDate() - 6
+          ).getTime();
 
-                <form onSubmit={handleSaveTrainedOperator} className="space-y-3 text-xs">
-                  <div className="space-y-1">
-                    <label className="text-slate-300 block font-medium">Nome do Garçom *</label>
-                    <input
-                      type="text"
-                      value={newOpName}
-                      onChange={(e) => setNewOpName(e.target.value)}
-                      placeholder="Ex: Rodrigo"
-                      required
-                      maxLength={60}
-                      className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-slate-100"
-                    />
+          const tabsById = new Map<string, BarTab>();
+          for (const t of tabs) {
+            tabsById.set(t.id, t);
+          }
+
+          const extractWaiterBaseName = (rawAttr?: string): string => {
+            return (rawAttr || '')
+              .replace(/\s*\((?:Garçom|ADM|Proprietário|SUPERADMIN|Voz\s+\d+%)\)\s*$/i, '')
+              .trim();
+          };
+
+          const recentItems = tabItems.filter(
+            (item) => getTimestampMillis(item.createdAt) >= sevenDaysStartMs
+          );
+
+          const waiterPerfRows = voiceOperators.map((op) => {
+            const opNorm = normalizeText(op.operatorName);
+            let itemsCount = 0;
+            let launchesCount = 0;
+            let itemsTotalValue = 0;
+            const associatedTabIds = new Set<string>();
+
+            for (const item of recentItems) {
+              const launcherBase = extractWaiterBaseName(item.launchedByName);
+              const launcherNorm = normalizeText(launcherBase);
+              if (!launcherNorm || !opNorm) continue;
+
+              const matchesOperator =
+                launcherNorm === opNorm ||
+                areCustomerNamesEquivalent(launcherBase, op.operatorName);
+
+              if (matchesOperator) {
+                const qty = Number(item.quantity);
+                const val = Number(item.totalPrice);
+                itemsCount += Number.isFinite(qty) && qty > 0 ? qty : 1;
+                launchesCount += 1;
+                itemsTotalValue += Number.isFinite(val) && val > 0 ? val : 0;
+                if (item.tabId) {
+                  associatedTabIds.add(item.tabId);
+                }
+              }
+            }
+
+            let associatedTabsTotalValue = 0;
+            for (const tId of associatedTabIds) {
+              const foundTab = tabsById.get(tId);
+              if (foundTab) {
+                associatedTabsTotalValue += Number(foundTab.totalAmount) || 0;
+              }
+            }
+
+            return {
+              operator: op,
+              itemsCount,
+              launchesCount,
+              itemsTotalValue: Number(itemsTotalValue.toFixed(2)),
+              associatedTabsCount: associatedTabIds.size,
+              associatedTabsTotalValue: Number(associatedTabsTotalValue.toFixed(2)),
+            };
+          });
+
+          waiterPerfRows.sort(
+            (a, b) =>
+              b.itemsCount - a.itemsCount ||
+              b.associatedTabsTotalValue - a.associatedTabsTotalValue
+          );
+
+          const totalWaiterItemsWeek = waiterPerfRows.reduce((acc, r) => acc + r.itemsCount, 0);
+          const allWaiterTabIds = new Set<string>();
+          for (const item of recentItems) {
+            const launcherBase = extractWaiterBaseName(item.launchedByName);
+            const belongsToAnyWaiter = voiceOperators.some((op) => {
+              const opNorm = normalizeText(op.operatorName);
+              const launcherNorm = normalizeText(launcherBase);
+              return (
+                launcherNorm === opNorm ||
+                areCustomerNamesEquivalent(launcherBase, op.operatorName)
+              );
+            });
+            if (belongsToAnyWaiter && item.tabId) {
+              allWaiterTabIds.add(item.tabId);
+            }
+          }
+          const uniqueTeamTabsValue = Array.from(allWaiterTabIds).reduce(
+            (sum, tid) => sum + (Number(tabsById.get(tid)?.totalAmount) || 0),
+            0
+          );
+          const maxItemsPerWaiter = Math.max(
+            1,
+            ...waiterPerfRows.map((r) => r.itemsCount)
+          );
+          const topWaiter = waiterPerfRows[0]?.itemsCount > 0 ? waiterPerfRows[0] : null;
+          const blockedCount = voiceOperators.filter((op) => op.accessBlocked).length;
+
+          return (
+            <div className="space-y-6">
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+                <div className="lg:col-span-5 space-y-5">
+                  {/* ADM Register Waiter Form + Voice Print */}
+                  <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
+                    <div className="space-y-1">
+                      <h2 className="text-base font-bold text-slate-100 flex items-center gap-2">
+                        <UserPlus className="w-5 h-5 text-amber-400" />
+                        Cadastrar Garçom (Login + Voz Compatível)
+                      </h2>
+                      <p className="text-xs text-slate-400">
+                        O garçom entra com e-mail e senha, usa microfone Bluetooth e só pode adicionar
+                        pedidos (não remove nada).
+                      </p>
+                    </div>
+
+                    <form onSubmit={handleSaveTrainedOperator} className="space-y-3 text-xs">
+                      <div className="space-y-1">
+                        <label className="text-slate-300 block font-medium">Nome do Garçom *</label>
+                        <input
+                          type="text"
+                          value={newOpName}
+                          onChange={(e) => setNewOpName(e.target.value)}
+                          placeholder="Ex: Rodrigo"
+                          required
+                          maxLength={60}
+                          className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-slate-100"
+                        />
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                        <div className="space-y-1">
+                          <label className="text-slate-300 block font-medium">E-mail do Garçom *</label>
+                          <input
+                            type="email"
+                            value={newOpEmail}
+                            onChange={(e) => setNewOpEmail(e.target.value)}
+                            placeholder="Ex: rodrigo@bar.com"
+                            required
+                            className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-slate-100"
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <label className="text-slate-300 block font-medium">Senha do Garçom *</label>
+                          <input
+                            type="text"
+                            value={newOpPassword}
+                            onChange={(e) => setNewOpPassword(e.target.value)}
+                            placeholder="Mín. 4 caracteres"
+                            required
+                            minLength={4}
+                            className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-slate-100 font-mono"
+                          />
+                        </div>
+                      </div>
+
+                      {/* Optional Biometric Voice Capture during Registration */}
+                      <div className="p-3 bg-slate-950 border border-slate-800 rounded-lg space-y-2">
+                        <div className="flex items-center justify-between gap-2">
+                          <div>
+                            <span className="font-semibold text-slate-200 block">
+                              Biometria de Voz do Garçom (Opcional)
+                            </span>
+                            <span className="text-[11px] text-slate-400">
+                              {newOpVoiceSample
+                                ? `Voz capturada: ${newOpVoiceSample.pitchHz} Hz (Timbre ${Math.round(newOpVoiceSample.spectralCentroid)} Hz)`
+                                : 'Peça para o garçom falar por 3s para medir compatibilidade'}
+                            </span>
+                          </div>
+                          <button
+                            type="button"
+                            disabled={capturingNewOpVoice}
+                            onClick={handleCaptureVoiceForNewWaiter}
+                            className="inline-flex items-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 text-amber-300 font-semibold rounded-lg shrink-0 cursor-pointer"
+                          >
+                            <AudioLines className="w-4 h-4" />
+                            {capturingNewOpVoice ? 'Ouvindo (3s)...' : 'Gravar Voz (3s)'}
+                          </button>
+                        </div>
+                      </div>
+
+                      <button
+                        type="submit"
+                        disabled={
+                          registeringWaiter ||
+                          !newOpName.trim() ||
+                          !newOpEmail.trim() ||
+                          newOpPassword.trim().length < 4
+                        }
+                        className="w-full py-2.5 bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-slate-950 font-bold rounded-lg transition-colors cursor-pointer"
+                      >
+                        {registeringWaiter ? 'Cadastrando...' : 'Cadastrar Garçom'}
+                      </button>
+                    </form>
                   </div>
 
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
-                    <div className="space-y-1">
-                      <label className="text-slate-300 block font-medium">E-mail do Garçom *</label>
-                      <input
-                        type="email"
-                        value={newOpEmail}
-                        onChange={(e) => setNewOpEmail(e.target.value)}
-                        placeholder="Ex: rodrigo@bar.com"
-                        required
-                        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-slate-100"
-                      />
-                    </div>
-                    <div className="space-y-1">
-                      <label className="text-slate-300 block font-medium">Senha do Garçom *</label>
-                      <input
-                        type="text"
-                        value={newOpPassword}
-                        onChange={(e) => setNewOpPassword(e.target.value)}
-                        placeholder="Mín. 4 caracteres"
-                        required
-                        minLength={4}
-                        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-slate-100 font-mono"
-                      />
-                    </div>
-                  </div>
-
-                  {/* Optional Biometric Voice Capture during Registration */}
-                  <div className="p-3 bg-slate-950 border border-slate-800 rounded-lg space-y-2">
-                    <div className="flex items-center justify-between gap-2">
-                      <div>
-                        <span className="font-semibold text-slate-200 block">
-                          Biometria de Voz do Garçom (Opcional)
-                        </span>
-                        <span className="text-[11px] text-slate-400">
-                          {newOpVoiceSample
-                            ? `Voz capturada: ${newOpVoiceSample.pitchHz} Hz (Timbre ${Math.round(newOpVoiceSample.spectralCentroid)} Hz)`
-                            : 'Peça para o garçom falar por 3s para medir compatibilidade'}
-                        </span>
+                  {/* Store Settings */}
+                  <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-3">
+                    <h3 className="text-sm font-bold text-slate-100 flex items-center gap-2">
+                      <Store className="w-4 h-4 text-amber-400" />
+                      Dados do Bar
+                    </h3>
+                    <form onSubmit={handleSaveUserProfile} className="space-y-3 text-xs">
+                      <div className="grid grid-cols-2 gap-2.5">
+                        <div className="space-y-1">
+                          <label className="text-slate-400 block">Nome do Bar</label>
+                          <input
+                            type="text"
+                            value={profileStoreName}
+                            onChange={(e) => setProfileStoreName(e.target.value)}
+                            required
+                            maxLength={80}
+                            className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100"
+                          />
+                        </div>
+                        <div className="space-y-1">
+                          <label className="text-slate-400 block">Código</label>
+                          <input
+                            type="text"
+                            value={profileStoreCode}
+                            onChange={(e) => setProfileStoreCode(e.target.value)}
+                            required
+                            maxLength={30}
+                            className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 font-mono"
+                          />
+                        </div>
                       </div>
                       <button
+                        type="submit"
+                        disabled={savingProfile}
+                        className="w-full py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold rounded-lg transition-colors cursor-pointer"
+                      >
+                        {savingProfile ? 'Salvando...' : 'Salvar Dados do Bar'}
+                      </button>
+                    </form>
+                  </div>
+                </div>
+
+                <div className="lg:col-span-7 bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
+                  <div className="flex flex-wrap items-center justify-between gap-2">
+                    <div>
+                      <h2 className="text-base font-bold text-slate-100">
+                        Garçons Cadastrados ({voiceOperators.length})
+                        {blockedCount > 0 && (
+                          <span className="ml-2 text-xs font-medium text-red-400">
+                            · {blockedCount} {blockedCount === 1 ? 'bloqueado' : 'bloqueados'}
+                          </span>
+                        )}
+                      </h2>
+                      <p className="text-xs text-slate-400">
+                        Grave a voz de cada garçom ou bloqueie o acesso instantaneamente para
+                        impedir novos lançamentos.
+                      </p>
+                    </div>
+                    {voiceOperators.length > 0 && (
+                      <button
                         type="button"
-                        disabled={capturingNewOpVoice}
-                        onClick={handleCaptureVoiceForNewWaiter}
-                        className="inline-flex items-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 text-amber-300 font-semibold rounded-lg shrink-0 cursor-pointer"
+                        disabled={testingCompatibility}
+                        onClick={handleTestLiveVoiceCompatibility}
+                        className="inline-flex items-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 text-emerald-300 text-xs font-semibold rounded-lg cursor-pointer"
                       >
                         <AudioLines className="w-4 h-4" />
-                        {capturingNewOpVoice ? 'Ouvindo (3s)...' : 'Gravar Voz (3s)'}
+                        {testingCompatibility ? 'Medindo Voz (2.5s)...' : 'Testar Compatibilidade Agora'}
                       </button>
-                    </div>
+                    )}
                   </div>
 
-                  <button
-                    type="submit"
-                    disabled={
-                      registeringWaiter ||
-                      !newOpName.trim() ||
-                      !newOpEmail.trim() ||
-                      newOpPassword.trim().length < 4
-                    }
-                    className="w-full py-2.5 bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-slate-950 font-bold rounded-lg transition-colors cursor-pointer"
-                  >
-                    {registeringWaiter ? 'Cadastrando...' : 'Cadastrar Garçom'}
-                  </button>
-                </form>
-              </div>
-
-              {/* Store Settings */}
-              <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-3">
-                <h3 className="text-sm font-bold text-slate-100 flex items-center gap-2">
-                  <Store className="w-4 h-4 text-amber-400" />
-                  Dados do Bar
-                </h3>
-                <form onSubmit={handleSaveUserProfile} className="space-y-3 text-xs">
-                  <div className="grid grid-cols-2 gap-2.5">
-                    <div className="space-y-1">
-                      <label className="text-slate-400 block">Nome do Bar</label>
-                      <input
-                        type="text"
-                        value={profileStoreName}
-                        onChange={(e) => setProfileStoreName(e.target.value)}
-                        required
-                        maxLength={80}
-                        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100"
-                      />
+                  {lastVoiceCompatibility && (
+                    <div className="p-3 bg-slate-950 border border-emerald-500/40 rounded-lg flex items-center justify-between text-xs">
+                      <span className="text-emerald-300 font-medium">
+                        Último teste de voz: <strong>{lastVoiceCompatibility.operatorName}</strong> com{' '}
+                        <strong className="font-mono">{lastVoiceCompatibility.confidence}%</strong> de
+                        compatibilidade ({lastVoiceCompatibility.pitchHz} Hz)
+                      </span>
                     </div>
-                    <div className="space-y-1">
-                      <label className="text-slate-400 block">Código</label>
-                      <input
-                        type="text"
-                        value={profileStoreCode}
-                        onChange={(e) => setProfileStoreCode(e.target.value)}
-                        required
-                        maxLength={30}
-                        className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 font-mono"
-                      />
+                  )}
+
+                  {voiceOperators.length === 0 ? (
+                    <div className="p-8 text-center border border-dashed border-slate-800 rounded-lg text-xs text-slate-400">
+                      Nenhum garçom cadastrado ainda. Use o formulário ao lado para criar o login e
+                      gravar a voz dos garçons.
                     </div>
-                  </div>
-                  <button
-                    type="submit"
-                    disabled={savingProfile}
-                    className="w-full py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 font-semibold rounded-lg transition-colors cursor-pointer"
-                  >
-                    {savingProfile ? 'Salvando...' : 'Salvar Dados do Bar'}
-                  </button>
-                </form>
-              </div>
-            </div>
-
-            <div className="lg:col-span-7 bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div>
-                  <h2 className="text-base font-bold text-slate-100">
-                    Garçons Cadastrados ({voiceOperators.length})
-                  </h2>
-                  <p className="text-xs text-slate-400">
-                    Grave ou calibre a voz de cada garçom para identificar compatibilidade pelo
-                    microfone Bluetooth.
-                  </p>
-                </div>
-                {voiceOperators.length > 0 && (
-                  <button
-                    type="button"
-                    disabled={testingCompatibility}
-                    onClick={handleTestLiveVoiceCompatibility}
-                    className="inline-flex items-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 text-emerald-300 text-xs font-semibold rounded-lg cursor-pointer"
-                  >
-                    <AudioLines className="w-4 h-4" />
-                    {testingCompatibility ? 'Medindo Voz (2.5s)...' : 'Testar Compatibilidade Agora'}
-                  </button>
-                )}
-              </div>
-
-              {lastVoiceCompatibility && (
-                <div className="p-3 bg-slate-950 border border-emerald-500/40 rounded-lg flex items-center justify-between text-xs">
-                  <span className="text-emerald-300 font-medium">
-                    Último teste de voz: <strong>{lastVoiceCompatibility.operatorName}</strong> com{' '}
-                    <strong className="font-mono">{lastVoiceCompatibility.confidence}%</strong> de
-                    compatibilidade ({lastVoiceCompatibility.pitchHz} Hz)
-                  </span>
-                </div>
-              )}
-
-              {voiceOperators.length === 0 ? (
-                <div className="p-8 text-center border border-dashed border-slate-800 rounded-lg text-xs text-slate-400">
-                  Nenhum garçom cadastrado ainda. Use o formulário ao lado para criar o login e
-                  gravar a voz dos garçons.
-                </div>
-              ) : (
-                <div className="border border-slate-800 rounded-lg overflow-x-auto">
-                  <table className="w-full text-left border-collapse text-xs">
-                    <thead>
-                      <tr className="bg-slate-950 border-b border-slate-800 text-slate-400">
-                        <th className="py-2.5 px-4 font-medium">Garçom</th>
-                        <th className="py-2.5 px-4 font-medium">Login</th>
-                        <th className="py-2.5 px-4 font-medium">Biometria de Voz</th>
-                        <th className="py-2.5 px-4 font-medium text-right">Ações</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-slate-800/70 bg-slate-950/40">
-                      {voiceOperators.map((op) => (
-                        <tr key={op.id} className="hover:bg-slate-800/30">
-                          <td className="py-2.5 px-4">
-                            <div className="font-semibold text-slate-100">{op.operatorName}</div>
-                            <div className="text-[11px] text-amber-400">Somente Adicionar</div>
-                          </td>
-                          <td className="py-2.5 px-4 text-slate-300 font-mono">
-                            {op.email || '—'}
-                          </td>
-                          <td className="py-2.5 px-4">
-                            {resettingAccountEmail === op.email && op.email ? (
-                              <div className="flex items-center gap-1.5">
-                                <input
-                                  type="text"
-                                  value={inlineNewPassword}
-                                  onChange={(e) => setInlineNewPassword(e.target.value)}
-                                  placeholder="Nova senha"
-                                  className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-100 w-28"
-                                />
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    handleQuickResetUserPassword(op.email!, op.operatorName)
-                                  }
-                                  className="px-2 py-1 bg-emerald-500 text-slate-950 font-bold rounded cursor-pointer"
-                                >
-                                  Salvar
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    setResettingAccountEmail(null);
-                                    setInlineNewPassword('');
-                                  }}
-                                  className="text-slate-400 hover:text-slate-200 px-1 cursor-pointer"
-                                >
-                                  ✕
-                                </button>
-                              </div>
-                            ) : (
-                              <div className="space-y-0.5 font-mono">
-                                <span
-                                  className={
-                                    op.samplesCount > 1
-                                      ? 'text-emerald-400 font-semibold block'
-                                      : 'text-slate-400 block'
-                                  }
-                                >
-                                  {op.samplesCount > 1
-                                    ? `Voz Calibrada (${op.pitchHz} Hz)`
-                                    : `Padrão (${op.pitchHz} Hz)`}
-                                </span>
-                                <span className="text-[11px] text-slate-500 block font-sans">
-                                  {op.samplesCount} {op.samplesCount === 1 ? 'amostra' : 'amostras'}
-                                </span>
-                              </div>
-                            )}
-                          </td>
-                          <td className="py-2.5 px-4 text-right space-x-2.5 whitespace-nowrap">
-                            <button
-                              type="button"
-                              disabled={calibratingOpId === op.id}
-                              onClick={() => handleCalibrateExistingWaiterVoice(op)}
-                              className="px-2.5 py-1 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 rounded font-semibold cursor-pointer"
-                              title="Gravar 3 segundos da voz deste garçom"
-                            >
-                              {calibratingOpId === op.id ? 'Ouvindo 3s...' : 'Gravar Voz'}
-                            </button>
-                            {op.email && (
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  setResettingAccountEmail(op.email!);
-                                  setInlineNewPassword('');
-                                }}
-                                className="text-sky-400 hover:underline font-medium cursor-pointer"
-                                title="Redefinir senha do garçom"
+                  ) : (
+                    <div className="border border-slate-800 rounded-lg overflow-x-auto">
+                      <table className="w-full text-left border-collapse text-xs">
+                        <thead>
+                          <tr className="bg-slate-950 border-b border-slate-800 text-slate-400">
+                            <th className="py-2.5 px-4 font-medium">Garçom</th>
+                            <th className="py-2.5 px-4 font-medium">Login</th>
+                            <th className="py-2.5 px-4 font-medium">Biometria de Voz</th>
+                            <th className="py-2.5 px-4 font-medium text-right">Ações</th>
+                          </tr>
+                        </thead>
+                        <tbody className="divide-y divide-slate-800/70 bg-slate-950/40">
+                          {voiceOperators.map((op) => {
+                            const isBlocked = Boolean(op.accessBlocked);
+                            return (
+                              <tr
+                                key={op.id}
+                                className={
+                                  isBlocked ? 'bg-red-950/20 hover:bg-red-950/30' : 'hover:bg-slate-800/30'
+                                }
                               >
-                                Senha
-                              </button>
-                            )}
-                            <button
-                              type="button"
-                              onClick={() => handleDeleteOperator(op.id)}
-                              className="text-slate-400 hover:text-red-400 transition-colors cursor-pointer"
-                              title="Remover garçom"
-                            >
-                              <Trash2 className="w-4 h-4 inline" />
-                            </button>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
+                                <td className="py-2.5 px-4">
+                                  <div className="font-semibold text-slate-100 flex items-center gap-1.5">
+                                    <span>{op.operatorName}</span>
+                                    {isBlocked && (
+                                      <span className="text-[10px] font-bold text-red-300 bg-red-950/80 border border-red-700/70 px-1.5 py-0.5 rounded">
+                                        BLOQUEADO
+                                      </span>
+                                    )}
+                                  </div>
+                                  <div
+                                    className={`text-[11px] ${
+                                      isBlocked ? 'text-red-400' : 'text-amber-400'
+                                    }`}
+                                  >
+                                    {isBlocked ? 'Lançamentos bloqueados' : 'Ativo · Somente Adicionar'}
+                                  </div>
+                                </td>
+                                <td className="py-2.5 px-4 text-slate-300 font-mono">
+                                  {op.email || '—'}
+                                </td>
+                                <td className="py-2.5 px-4">
+                                  {resettingAccountEmail === op.email && op.email ? (
+                                    <div className="flex items-center gap-1.5">
+                                      <input
+                                        type="text"
+                                        value={inlineNewPassword}
+                                        onChange={(e) => setInlineNewPassword(e.target.value)}
+                                        placeholder="Nova senha"
+                                        className="bg-slate-900 border border-slate-700 rounded px-2 py-1 text-xs text-slate-100 w-28"
+                                      />
+                                      <button
+                                        type="button"
+                                        onClick={() =>
+                                          handleQuickResetUserPassword(op.email!, op.operatorName)
+                                        }
+                                        className="px-2 py-1 bg-emerald-500 text-slate-950 font-bold rounded cursor-pointer"
+                                      >
+                                        Salvar
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setResettingAccountEmail(null);
+                                          setInlineNewPassword('');
+                                        }}
+                                        className="text-slate-400 hover:text-slate-200 px-1 cursor-pointer"
+                                      >
+                                        ✕
+                                      </button>
+                                    </div>
+                                  ) : (
+                                    <div className="space-y-0.5 font-mono">
+                                      <span
+                                        className={
+                                          op.samplesCount > 1
+                                            ? 'text-emerald-400 font-semibold block'
+                                            : 'text-slate-400 block'
+                                        }
+                                      >
+                                        {op.samplesCount > 1
+                                          ? `Voz Calibrada (${op.pitchHz} Hz)`
+                                          : `Padrão (${op.pitchHz} Hz)`}
+                                      </span>
+                                      <span className="text-[11px] text-slate-500 block font-sans">
+                                        {op.samplesCount} {op.samplesCount === 1 ? 'amostra' : 'amostras'}
+                                      </span>
+                                    </div>
+                                  )}
+                                </td>
+                                <td className="py-2.5 px-4 text-right whitespace-nowrap">
+                                  <div className="inline-flex items-center justify-end gap-2">
+                                    <button
+                                      type="button"
+                                      disabled={togglingAccessOpId === op.id}
+                                      onClick={() => handleToggleWaiterAccess(op)}
+                                      className={`inline-flex items-center gap-1 px-2.5 py-1 rounded border font-semibold transition-colors cursor-pointer disabled:opacity-50 ${
+                                        isBlocked
+                                          ? 'bg-emerald-500/20 hover:bg-emerald-500/30 text-emerald-300 border-emerald-500/50'
+                                          : 'bg-red-950/70 hover:bg-red-900/80 text-red-200 border-red-700/70'
+                                      }`}
+                                      title={
+                                        isBlocked
+                                          ? 'Liberar acesso para este garçom fazer lançamentos'
+                                          : 'Bloquear acesso instantaneamente e impedir novos lançamentos'
+                                      }
+                                    >
+                                      {isBlocked ? (
+                                        <>
+                                          <Unlock className="w-3.5 h-3.5" />
+                                          {togglingAccessOpId === op.id
+                                            ? 'Atualizando...'
+                                            : 'Liberar Acesso'}
+                                        </>
+                                      ) : (
+                                        <>
+                                          <Ban className="w-3.5 h-3.5" />
+                                          {togglingAccessOpId === op.id
+                                            ? 'Bloqueando...'
+                                            : 'Bloquear Acesso'}
+                                        </>
+                                      )}
+                                    </button>
+                                    <button
+                                      type="button"
+                                      disabled={calibratingOpId === op.id}
+                                      onClick={() => handleCalibrateExistingWaiterVoice(op)}
+                                      className="px-2.5 py-1 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 rounded font-semibold cursor-pointer"
+                                      title="Gravar 3 segundos da voz deste garçom"
+                                    >
+                                      {calibratingOpId === op.id ? 'Ouvindo 3s...' : 'Gravar Voz'}
+                                    </button>
+                                    {op.email && (
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          setResettingAccountEmail(op.email!);
+                                          setInlineNewPassword('');
+                                        }}
+                                        className="text-sky-400 hover:underline font-medium cursor-pointer"
+                                        title="Redefinir senha do garçom"
+                                      >
+                                        Senha
+                                      </button>
+                                    )}
+                                    <button
+                                      type="button"
+                                      onClick={() => handleDeleteOperator(op.id)}
+                                      className="text-slate-400 hover:text-red-400 transition-colors cursor-pointer"
+                                      title="Remover garçom"
+                                    >
+                                      <Trash2 className="w-4 h-4 inline" />
+                                    </button>
+                                  </div>
+                                </td>
+                              </tr>
+                            );
+                          })}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
                 </div>
-              )}
+              </div>
+
+              {/* RELATÓRIO DE PERFORMANCE DOS GARÇONS (ÚLTIMA SEMANA) */}
+              <section className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <h2 className="text-base font-bold text-slate-100 flex items-center gap-2">
+                      <BarChart3 className="w-5 h-5 text-amber-400" />
+                      Relatório de Performance — Última Semana (7 dias)
+                    </h2>
+                    <p className="text-xs text-slate-400 mt-0.5">
+                      Quantidade de itens lançados por cada garçom nos últimos 7 dias e o valor
+                      total das comandas associadas aos atendimentos de cada funcionário.
+                    </p>
+                  </div>
+                </div>
+
+                {/* KPI Summary Strip */}
+                <div className="grid grid-cols-1 sm:grid-cols-3 divide-y sm:divide-y-0 sm:divide-x divide-slate-800 border border-slate-800 rounded-lg bg-slate-950/60">
+                  <div className="p-4 space-y-1">
+                    <div className="text-xs text-slate-400">Itens Lançados pela Equipe (7 dias)</div>
+                    <div className="text-xl font-bold text-amber-400 font-mono tabular-nums">
+                      {totalWaiterItemsWeek} {totalWaiterItemsWeek === 1 ? 'item' : 'itens'}
+                    </div>
+                  </div>
+                  <div className="p-4 space-y-1">
+                    <div className="text-xs text-slate-400">Valor Total em Comandas Associadas</div>
+                    <div className="text-xl font-bold text-emerald-400 font-mono tabular-nums">
+                      {formatBRL(uniqueTeamTabsValue)}
+                      <span className="ml-2 text-xs font-sans font-normal text-slate-400">
+                        · {allWaiterTabIds.size}{' '}
+                        {allWaiterTabIds.size === 1 ? 'comanda' : 'comandas'}
+                      </span>
+                    </div>
+                  </div>
+                  <div className="p-4 space-y-1">
+                    <div className="text-xs text-slate-400 flex items-center gap-1.5">
+                      <Award className="w-3.5 h-3.5 text-amber-400" />
+                      Destaque da Semana
+                    </div>
+                    <div className="text-base font-bold text-slate-100 truncate">
+                      {topWaiter
+                        ? `${topWaiter.operator.operatorName} (${topWaiter.itemsCount} itens)`
+                        : 'Sem lançamentos na semana'}
+                    </div>
+                  </div>
+                </div>
+
+                {waiterPerfRows.length === 0 ? (
+                  <div className="p-6 text-center border border-dashed border-slate-800 rounded-lg text-xs text-slate-400">
+                    Cadastre garçons acima para acompanhar a produtividade semanal e o valor das
+                    comandas associadas a cada um.
+                  </div>
+                ) : (
+                  <div className="border border-slate-800 rounded-lg overflow-x-auto">
+                    <table className="w-full text-left border-collapse text-xs">
+                      <thead>
+                        <tr className="bg-slate-950 border-b border-slate-800 text-slate-400">
+                          <th className="py-2.5 px-4 font-medium">Garçom</th>
+                          <th className="py-2.5 px-4 font-medium">Itens Lançados (7 dias)</th>
+                          <th className="py-2.5 px-4 font-medium text-right">
+                            Valor em Itens Lançados
+                          </th>
+                          <th className="py-2.5 px-4 font-medium text-right">
+                            Comandas Associadas
+                          </th>
+                          <th className="py-2.5 px-4 font-medium text-right">
+                            Valor Total das Comandas
+                          </th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-800/70 bg-slate-950/40">
+                        {waiterPerfRows.map((row) => {
+                          const sharePct =
+                            row.itemsCount > 0
+                              ? Math.max(6, Math.round((row.itemsCount / maxItemsPerWaiter) * 100))
+                              : 0;
+                          return (
+                            <tr key={row.operator.id} className="hover:bg-slate-800/30">
+                              <td className="py-3 px-4">
+                                <div className="font-semibold text-slate-100 flex items-center gap-2">
+                                  <span>{row.operator.operatorName}</span>
+                                  {row.operator.accessBlocked && (
+                                    <span className="text-[10px] font-bold text-red-300 bg-red-950/80 border border-red-700/70 px-1.5 py-0.5 rounded">
+                                      BLOQUEADO
+                                    </span>
+                                  )}
+                                </div>
+                                <div className="text-[11px] text-slate-400 font-mono">
+                                  {row.operator.email || 'Sem e-mail'}
+                                </div>
+                              </td>
+                              <td className="py-3 px-4">
+                                <div className="flex items-center gap-3">
+                                  <div className="min-w-[92px]">
+                                    <span className="font-mono tabular-nums font-bold text-amber-400 text-sm">
+                                      {row.itemsCount} {row.itemsCount === 1 ? 'item' : 'itens'}
+                                    </span>
+                                    <span className="block text-[11px] text-slate-500">
+                                      {row.launchesCount}{' '}
+                                      {row.launchesCount === 1 ? 'lançamento' : 'lançamentos'}
+                                    </span>
+                                  </div>
+                                  <div className="flex-1 max-w-[140px] h-2 bg-slate-800 rounded-full overflow-hidden hidden sm:block">
+                                    <div
+                                      className="h-full bg-amber-500 rounded-full transition-all"
+                                      style={{ width: `${sharePct}%` }}
+                                    />
+                                  </div>
+                                </div>
+                              </td>
+                              <td className="py-3 px-4 text-right font-mono tabular-nums text-slate-200 font-semibold">
+                                {formatBRL(row.itemsTotalValue)}
+                              </td>
+                              <td className="py-3 px-4 text-right font-mono tabular-nums text-slate-300">
+                                {row.associatedTabsCount}{' '}
+                                {row.associatedTabsCount === 1 ? 'comanda' : 'comandas'}
+                              </td>
+                              <td className="py-3 px-4 text-right font-mono tabular-nums font-bold text-emerald-400 text-sm">
+                                {formatBRL(row.associatedTabsTotalValue)}
+                              </td>
+                            </tr>
+                          );
+                        })}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </section>
             </div>
-          </div>
-        )}
+          );
+        })()}
 
         {/* SECTION 5: SUPERADMIN (ADMINISTRAÇÃO DE USUÁRIOS ADM vs GARÇOM E COBRANÇA DE MENSALIDADES) */}
         {activeSection === 'superadmin' && isSuperAdmin && (() => {

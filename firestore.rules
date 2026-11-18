@@ -123,7 +123,7 @@ service cloud.firestore {
 
     function isValidVoiceOperator(data) {
       return data.keys().hasAll(['ownerId', 'operatorName', 'roleLabel', 'storeName', 'storeCode', 'pitchHz', 'spectralCentroid', 'voicePin', 'samplesCount', 'createdAt', 'updatedAt']) &&
-        data.keys().hasOnly(['ownerId', 'operatorName', 'roleLabel', 'storeName', 'storeCode', 'pitchHz', 'spectralCentroid', 'voicePin', 'samplesCount', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['ownerId', 'operatorName', 'roleLabel', 'storeName', 'storeCode', 'pitchHz', 'spectralCentroid', 'voicePin', 'samplesCount', 'accessBlocked', 'createdAt', 'updatedAt']) &&
         data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId.matches('^[a-zA-Z0-9_\\-]+$') &&
         data.ownerId == request.auth.uid &&
         data.operatorName is string && data.operatorName.size() >= 1 && data.operatorName.size() <= 60 &&
@@ -134,6 +134,7 @@ service cloud.firestore {
         data.spectralCentroid is number && data.spectralCentroid >= 0 && data.spectralCentroid <= 10000 &&
         data.voicePin is string && data.voicePin.size() >= 0 && data.voicePin.size() <= 30 &&
         data.samplesCount is number && data.samplesCount >= 1 && data.samplesCount <= 50 &&
+        (!('accessBlocked' in data) || data.accessBlocked is bool) &&
         data.createdAt is timestamp &&
         data.updatedAt is timestamp;
     }
@@ -281,7 +282,7 @@ service cloud.firestore {
         incoming().ownerId == existing().ownerId &&
         incoming().createdAt == existing().createdAt &&
         incoming().updatedAt == request.time &&
-        incoming().diff(existing()).affectedKeys().hasOnly(['operatorName', 'roleLabel', 'storeName', 'storeCode', 'pitchHz', 'spectralCentroid', 'voicePin', 'samplesCount', 'updatedAt']);
+        incoming().diff(existing()).affectedKeys().hasOnly(['operatorName', 'roleLabel', 'storeName', 'storeCode', 'pitchHz', 'spectralCentroid', 'voicePin', 'samplesCount', 'accessBlocked', 'updatedAt']);
       allow delete: if isVerified() &&
         isValidId(operatorId) &&
         existing().ownerId == request.auth.uid;
