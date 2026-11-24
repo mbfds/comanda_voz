@@ -1395,13 +1395,18 @@ ${customersSummary}`;
       const cleanTranscript = transcript.trim().slice(0, 250);
       const systemInstruction = `Você é o MARCELO, assistente de um bar brasileiro (Comanda Voz).
 O proprietário/ADM está ditando por voz um ou mais produtos para CADASTRAR no cardápio do bar.
-Extraia com precisão cada produto falado, incluindo:
-- name: Nome limpo e bem formatado do produto (ex: "Skol Lata 350ml", "Porção de Calabresa", "Caipirinha de Limão").
-- category: Exatamente uma entre: "cervejas", "doses", "porcoes", "sem_alcool", "outros".
-- price: Preço unitário numérico em reais (ex: 6.5). Se nenhum preço foi falado, retorne -1.
-- synonyms: Palavras-chave curtas em minúsculas separadas por vírgula para facilitar busca por voz depois (ex: "skol lata, latinha skol").
+REGRA IMPORTANTE DE SEPARAÇÃO:
+- O usuário frequentemente usa a palavra "reais" (ou "valor", "R$") como separador ANTES do preço: por exemplo, "porção de salame reais 15" significa nome "Porção de Salame" e preço 15; "dose de 51 reais 8" significa nome "Dose de 51" e preço 8!
+- Também aceite o formato clássico: "Dose de 51 8 reais" -> nome "Dose de 51" e preço 8.
+- Números que fazem parte do nome da bebida ou embalagem (ex: "51" em "Dose de 51" / "Cachaça 51", "88", "99", "600ml", "350ml", "12 anos") NUNCA devem ser confundidos com o preço! Se nenhum preço foi falado, retorne price: -1.
 
-Se o usuário falou vários produtos seguidos (ex: "Skol Lata 6 reais, Água Mineral 5 reais"), retorne todos no array "products".
+Extraia com precisão cada produto falado:
+- name: Nome limpo e bem formatado do produto (ex: "Dose de 51", "Porção de Salame", "Skol Lata 350ml").
+- category: Exatamente uma entre: "cervejas", "doses", "porcoes", "sem_alcool", "outros".
+- price: Preço unitário numérico em reais (ex: 15 ou 8.5). Se nenhum preço foi falado, retorne -1.
+- synonyms: Palavras-chave curtas em minúsculas separadas por vírgula para facilitar busca por voz depois (ex: "dose de 51, 51").
+
+Se o usuário falou vários produtos seguidos (ex: "Porção de salame reais 15, Dose de 51 reais 8"), retorne todos no array "products".
 Se não for possível identificar nenhum produto válido, retorne understood: false com unrecognizedReason em português.`;
 
       const response = await ai.models.generateContent({

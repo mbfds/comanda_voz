@@ -1947,46 +1947,89 @@ function extractPriceFromProductClause(clause: string): {
   price: number | null;
   remainingNameText: string;
 } {
-  let working = clause.trim();
+  const working = clause.trim();
+  const centsTokenRegexStr =
+    '(\\d{1,2}|cinquenta|vinte|trinta|quarenta|sessenta|setenta|oitenta|noventa|dez|quinze|cinco|meia)';
 
-  // 1. Numeric price with optional cents ("18,50", "18.50", "18 reais e 50", "6 e 50", "R$ 15", "15 reais")
+  const resolveCents = (rawCents?: string): number => {
+    if (!rawCents) return 0;
+    const cNorm = normalizeText(rawCents);
+    if (cNorm === 'meia') return 50;
+    const parsed = /^\d+$/.test(cNorm) ? parseInt(cNorm, 10) : parsePortugueseIntPhrase(cNorm);
+    return parsed !== null && parsed >= 0 && parsed < 100 ? parsed : 0;
+  };
+
+  // 1A. Explicit separator BEFORE numeric price: "porção de salame reais 15", "dose de 51 reais 8", "dose de 51 reais 8 e 50", "cachaça 51 valor 10"
+  const sepBeforeNumRegex = new RegExp(
+    `(?:\\b(?:por|a|custa|custando|sai(?:\\s+a)?)\\s+)?\\b(?:reais|real|valor(?:\\s+de)?|preco(?:\\s+de)?|preço(?:\\s+de)?)\\s+(?:de\\s+)?(\\d+(?:[.,]\\d{1,2})?)(?:\\s+e\\s+${centsTokenRegexStr}(?:\\s*centavos?)?)?\\b`,
+    'i'
+  );
+  const sepBeforeNumMatch = sepBeforeNumRegex.exec(working);
+  if (sepBeforeNumMatch && sepBeforeNumMatch[1]) {
+    let val = parseFloat(sepBeforeNumMatch[1].replace(',', '.'));
+    if (sepBeforeNumMatch[2] && Number.isInteger(val)) {
+      val += resolveCents(sepBeforeNumMatch[2]) / 100;
+    }
+    if (!Number.isNaN(val) && val >= 0 && val <= VALIDATION_LIMITS.MAX_PRICE) {
+      const before = working.slice(0, sepBeforeNumMatch.index).trim();
+      const after = working
+        .slice(sepBeforeNumMatch.index + sepBeforeNumMatch[0].length)
+        .trim();
+      return {
+        price: Number(val.toFixed(2)),
+        remainingNameText: `${before} ${after}`.replace(/\s+/g, ' ').trim(),
+      };
+    }
+  }
+
+  // 1B. Explicit separator BEFORE spoken Portuguese price: "porção de salame reais quinze", "dose de 51 reais oito e cinquenta"
+  const sepBeforeSpokenRegex =
+    /(?:\b(?:por|a|custa|custando|sai(?:\s+a)?)\s+)?\b(?:reais|real|valor(?:\s+de)?|preco(?:\s+de)?|preço(?:\s+de)?)\s+(?:de\s+)?((?:(?:cem|cento|duzentos|trezentos|quatrocentos|quinhentos|vinte|trinta|quarenta|cinquenta|sessenta|setenta|oitenta|noventa|dez|onze|doze|treze|quatorze|catorze|quinze|dezesseis|dezessete|dezoito|dezenove|zero|um|uma|dois|duas|tres|três|quatro|cinco|seis|sete|oito|nove)(?:\s+e\s+)?){1,4})(?:\s+e\s+(cinquenta|vinte|trinta|quarenta|sessenta|setenta|oitenta|noventa|dez|quinze|cinco|meia|\d{1,2})(?:\s*centavos?)?)?/i;
+  const sepBeforeSpokenMatch = sepBeforeSpokenRegex.exec(working);
+  if (sepBeforeSpokenMatch && sepBeforeSpokenMatch[1]) {
+    const intPart = parsePortugueseIntPhrase(sepBeforeSpokenMatch[1]);
+    if (intPart !== null && intPart >= 0) {
+      let val = intPart;
+      if (sepBeforeSpokenMatch[2]) {
+        val += resolveCents(sepBeforeSpokenMatch[2]) / 100;
+      }
+      const before = working.slice(0, sepBeforeSpokenMatch.index).trim();
+      const after = working
+        .slice(sepBeforeSpokenMatch.index + sepBeforeSpokenMatch[0].length)
+        .trim();
+      return {
+        price: Number(val.toFixed(2)),
+        remainingNameText: `${before} ${after}`.replace(/\s+/g, ' ').trim(),
+      };
+    }
+  }
+
+  // 2. Classic numeric price BEFORE "reais" (or explicit "por X" / trailing decimal "15,50")
+  // NOTE: Never match bare "de <num>" or bare trailing integers like "51" in "Dose de 51"!
   const numericPatterns: RegExp[] = [
-    // "por 18 reais e 50 centavos" / "18 reais e cinquenta" / "18 reais e 50"
-    /(?:\b(?:por|a|de|valor(?:\s+de)?|custa|custando|sai(?:\s+a)?|preco(?:\s+de)?|preço(?:\s+de)?)\s+)?(?:r\s*\$\s*)?(\d+(?:[.,]\d{1,2})?)\s*(?:reais|real|conto|pila)\s*(?:e\s+(\d{1,2}|cinquenta|vinte|trinta|quarenta|sessenta|setenta|oitenta|noventa|dez|quinze|cinco)(?:\s*centavos?)?)?\b/i,
-    // "6 e 50" / "6 e cinquenta" at the end or preceded by price preposition
-    /(?:\b(?:por|a|de|valor(?:\s+de)?|custa|custando|sai(?:\s+a)?|preco(?:\s+de)?|preço(?:\s+de)?)\s+)?(?:r\s*\$\s*)?(\d+)\s+e\s+(\d{2}|cinquenta)\b(?:\s*centavos?)?/i,
-    // "R$ 18,50" or "R$ 18" anywhere
-    /r\s*\$\s*(\d+(?:[.,]\d{1,2})?)/i,
-    // "por 18,50" / "a 18" / "valor 18"
-    /\b(?:por|valor(?:\s+de)?|custa|custando|sai(?:\s+a)?|preco(?:\s+de)?|preço(?:\s+de)?)\s+(?:r\s*\$\s*)?(\d+(?:[.,]\d{1,2})?)\b/i,
-    // Trailing decimal or integer price at end of phrase (ignoring volume like "600ml", "350ml", "2l", "1l")
+    // "dose de 51 8 reais" / "por 18 reais e 50 centavos"
+    /(?:\b(?:por|a|custa|custando|sai(?:\s+a)?)\s+)?(\d+(?:[.,]\d{1,2})?)\s*(?:reais|real|conto|pila)(?:\s+e\s+(\d{1,2}|cinquenta|vinte|trinta|quarenta|sessenta|setenta|oitenta|noventa|dez|quinze|cinco|meia)(?:\s*centavos?)?)?\b/i,
+    // "por 6 e 50" / "6 e 50"
+    /(?:\b(?:por|a|custa|custando|sai(?:\s+a)?)\s+)?(\d+)\s+e\s+(\d{2}|cinquenta)\b(?:\s*centavos?)?/i,
+    // "por 18,50" / "custa 18"
+    /\b(?:por|custa|custando|sai(?:\s+a)?)\s+(\d+(?:[.,]\d{1,2})?)\b/i,
+    // Explicit trailing decimal only (e.g. "Heineken 12,50" — never bare integers like "51")
     /(?:^|\s)(\d+[.,]\d{1,2})\s*$/,
-    /(?:^|\s)(\d{1,4})\s*(?:reais|real|conto|pila)?\s*$/,
   ];
 
   for (const pat of numericPatterns) {
     const m = pat.exec(working);
     if (!m || !m[1]) continue;
 
-    // Skip if matched trailing number is actually a volume token right next to ml/l/litros
+    // Skip if matched number is actually a volume token right next to ml/l/litros
     const afterMatch = working.slice(m.index + m[0].length).trim();
     if (/^(?:ml|mls|l|litro|litros|g|gramas|kg)\b/i.test(afterMatch)) {
       continue;
     }
-    const matchedStr = m[0].trim();
-    if (/^\d{3,}$/.test(m[1]) && (m[1] === '350' || m[1] === '600' || m[1] === '330' || m[1] === '269' || m[1] === '473' || m[1] === '500' || m[1] === '290') && !/(?:reais|real|r\$|por|valor|custa|preço|preco)/i.test(matchedStr)) {
-      continue;
-    }
 
     let val = parseFloat(m[1].replace(',', '.'));
-    if (m[2]) {
-      const centsRaw = normalizeText(m[2]);
-      const centsInt = /^\d+$/.test(centsRaw)
-        ? parseInt(centsRaw, 10)
-        : parsePortugueseIntPhrase(centsRaw);
-      if (centsInt !== null && centsInt >= 0 && centsInt < 100 && Number.isInteger(val)) {
-        val += centsInt / 100;
-      }
+    if (m[2] && Number.isInteger(val)) {
+      val += resolveCents(m[2]) / 100;
     }
 
     if (!Number.isNaN(val) && val >= 0 && val <= VALIDATION_LIMITS.MAX_PRICE) {
@@ -2000,9 +2043,9 @@ function extractPriceFromProductClause(clause: string): {
     }
   }
 
-  // 2. Fully spoken Portuguese price (e.g. "dezoito reais", "vinte e cinco reais e cinquenta", "dez reais e meia")
+  // 3. Fully spoken Portuguese price BEFORE "reais" (e.g. "dezoito reais", "vinte e cinco reais e cinquenta")
   const spokenRegex =
-    /(?:\b(?:por|a|de|valor(?:\s+de)?|custa|custando|sai(?:\s+a)?|preco(?:\s+de)?|preço(?:\s+de)?)\s+)?((?:(?:cem|cento|duzentos|trezentos|quatrocentos|quinhentos|vinte|trinta|quarenta|cinquenta|sessenta|setenta|oitenta|noventa|dez|onze|doze|treze|quatorze|catorze|quinze|dezesseis|dezessete|dezoito|dezenove|zero|um|uma|dois|duas|tres|três|quatro|cinco|seis|sete|oito|nove)(?:\s+e\s+)?){1,4})\s*(?:reais|real|conto|pila)(?:\s+e\s+((?:cinquenta|vinte|trinta|quarenta|sessenta|setenta|oitenta|noventa|dez|quinze|cinco|meia|\d{1,2}))(?:\s*centavos?)?)?/i;
+    /(?:\b(?:por|a|custa|custando|sai(?:\s+a)?)\s+)?((?:(?:cem|cento|duzentos|trezentos|quatrocentos|quinhentos|vinte|trinta|quarenta|cinquenta|sessenta|setenta|oitenta|noventa|dez|onze|doze|treze|quatorze|catorze|quinze|dezesseis|dezessete|dezoito|dezenove|zero|um|uma|dois|duas|tres|três|quatro|cinco|seis|sete|oito|nove)(?:\s+e\s+)?){1,4})\s*(?:reais|real|conto|pila)(?:\s+e\s+((?:cinquenta|vinte|trinta|quarenta|sessenta|setenta|oitenta|noventa|dez|quinze|cinco|meia|\d{1,2}))(?:\s*centavos?)?)?/i;
 
   const spokenMatch = spokenRegex.exec(working);
   if (spokenMatch && spokenMatch[1]) {
@@ -2010,11 +2053,7 @@ function extractPriceFromProductClause(clause: string): {
     if (intPart !== null && intPart >= 0) {
       let val = intPart;
       if (spokenMatch[2]) {
-        const cNorm = normalizeText(spokenMatch[2]);
-        const cVal = cNorm === 'meia' ? 50 : parsePortugueseIntPhrase(cNorm);
-        if (cVal !== null && cVal >= 0 && cVal < 100) {
-          val += cVal / 100;
-        }
+        val += resolveCents(spokenMatch[2]) / 100;
       }
       const before = working.slice(0, spokenMatch.index).trim();
       const after = working.slice(spokenMatch.index + spokenMatch[0].length).trim();
@@ -2073,7 +2112,7 @@ function parseSingleMenuProductClause(clause: string): ParsedVoiceMenuProduct | 
 
   let cleanNameRaw = remainingNameText
     .replace(/\b(?:no\s+card[aá]pio|ao\s+card[aá]pio|para\s+o\s+card[aá]pio)\b/gi, ' ')
-    .replace(/\s+(?:por|valor|pre[cç]o|custa|a|de)\s*$/i, '')
+    .replace(/\s+(?:por|valor|pre[cç]o|custa|reais|real|a|de)\s*$/i, '')
     .replace(/^[,.;:\s-]+|[,.;:\s-]+$/g, '')
     .replace(/\s+/g, ' ')
     .trim();
@@ -2107,11 +2146,10 @@ function parseSingleMenuProductClause(clause: string): ParsedVoiceMenuProduct | 
 /**
  * Parses one or more bar products spoken in Portuguese for adding to the Cardápio.
  * Supports:
- * - "Skol Lata 6 reais"
- * - "Cadastrar produto Litrão Brahma 18 reais categoria cervejas"
- * - "Porção de Calabresa por 38 reais e 50"
- * - Multiple products in one breath: "Skol Lata 6 reais, Água Mineral 5 reais"
- * - Name-only fallback (returns price: null so the UI pre-fills the form)
+ * - Separator-first standard: "Porção de salame reais 15", "Dose de 51 reais 8"
+ * - Classic format: "Skol Lata 6 reais", "Dose de 51 8 reais"
+ * - Multiple products in one breath: "Porção de salame reais 15, Dose de 51 reais 8"
+ * - Name-only fallback (returns price: null without stealing numbers like "51" in "Dose de 51")
  */
 export function parseVoiceMenuProductsLocally(transcript: string): ParsedVoiceMenuResult {
   const rawCleaned = sanitizeVoiceTranscriptForParsing(transcript);
@@ -2119,7 +2157,7 @@ export function parseVoiceMenuProductsLocally(transcript: string): ParsedVoiceMe
     return {
       understood: false,
       unrecognizedReason:
-        'Diga o nome e o preço do produto, por exemplo: "Skol Lata 6 reais".',
+        'Diga o nome do produto, a palavra "reais" e o valor. Ex: "Porção de salame reais 15".',
       products: [],
     };
   }
@@ -2130,7 +2168,7 @@ export function parseVoiceMenuProductsLocally(transcript: string): ParsedVoiceMe
     return {
       understood: false,
       unrecognizedReason:
-        'Diga o nome e o preço do produto após chamar o Marcelo.',
+        'Diga o nome do produto, "reais" e o valor após chamar o Marcelo.',
       products: [],
     };
   }
@@ -2142,10 +2180,14 @@ export function parseVoiceMenuProductsLocally(transcript: string): ParsedVoiceMe
 
   let candidateClauses: string[] = [effective];
   if (!hasExplicitSynonyms) {
-    // Split on semicolon, or comma when there are multiple prices, or " e " right after a complete price
+    // Split on semicolon, comma, or " e " right after a complete price (either "<num> reais" OR "reais <num>")
     const splitOnPriceBoundaries = effective
       .replace(
         /(\d+(?:[.,]\d{1,2})?\s*(?:reais|real|conto|pila))\s+e\s+(?![0-9]{1,2}\b|cinquenta\b|centavos?\b|vinte\b|trinta\b|quarenta\b|sessenta\b|setenta\b|oitenta\b|noventa\b|dez\b|quinze\b|cinco\b|meia\b)/gi,
+        '$1 ; '
+      )
+      .replace(
+        /(\b(?:reais|real|valor|pre[cç]o)\s+\d+(?:[.,]\d{1,2})?(?:\s+e\s+(?:\d{1,2}|cinquenta|meia)(?:\s*centavos?)?)?)\s+e\s+(?![0-9]{1,2}\b|cinquenta\b|centavos?\b|vinte\b|trinta\b|quarenta\b|sessenta\b|setenta\b|oitenta\b|noventa\b|dez\b|quinze\b|cinco\b|meia\b)/gi,
         '$1 ; '
       )
       .split(/\s*[;,]\s*/)
@@ -2153,7 +2195,7 @@ export function parseVoiceMenuProductsLocally(transcript: string): ParsedVoiceMe
       .filter(Boolean);
 
     if (splitOnPriceBoundaries.length > 1) {
-      // Only treat comma-splits as separate products if at least 2 parts parse cleanly with prices
+      // Only treat splits as separate products if at least 2 parts parse cleanly with prices
       const testParsed = splitOnPriceBoundaries
         .map((c) => parseSingleMenuProductClause(c))
         .filter((p): p is ParsedVoiceMenuProduct => Boolean(p && p.price !== null));
@@ -2175,7 +2217,7 @@ export function parseVoiceMenuProductsLocally(transcript: string): ParsedVoiceMe
     return {
       understood: false,
       unrecognizedReason:
-        'Não consegui identificar o nome do produto. Diga por exemplo: "Litrão Brahma 18 reais".',
+        'Não consegui identificar o nome do produto. Diga por exemplo: "Porção de salame reais 15".',
       products: [],
     };
   }

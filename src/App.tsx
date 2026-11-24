@@ -5791,13 +5791,14 @@ function ComandaVozWorkspace() {
                         <p className="text-emerald-400 font-medium">
                           {menuVoiceInterim
                             ? `Transcrevendo: "${menuVoiceInterim}"`
-                            : 'Ouvindo... Diga o nome e o preço (ex: "Skol Lata 6 reais").'}
+                            : 'Ouvindo... Diga produto + "reais" + valor (ex: "Porção de salame reais 15").'}
                         </p>
                       ) : (
                         <p className="text-[11px] text-slate-400 leading-relaxed">
-                          Diga por exemplo: <span className="text-slate-200">&ldquo;Skol Lata 6 reais&rdquo;</span>,{' '}
-                          <span className="text-slate-200">&ldquo;Porção de Calabresa 38 reais&rdquo;</span> ou vários juntos:{' '}
-                          <span className="text-slate-200">&ldquo;Litrão Brahma 18 reais, Água 5 reais&rdquo;</span>.
+                          Use <strong className="text-amber-300">&ldquo;reais&rdquo;</strong> para separar o valor:{' '}
+                          <span className="text-slate-200">&ldquo;Porção de salame reais 15&rdquo;</span>,{' '}
+                          <span className="text-slate-200">&ldquo;Dose de 51 reais 8&rdquo;</span> ou vários juntos:{' '}
+                          <span className="text-slate-200">&ldquo;Litrão Brahma reais 18, Água reais 5&rdquo;</span>.
                         </p>
                       )}
                     </div>
