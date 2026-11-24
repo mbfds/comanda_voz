@@ -51,6 +51,7 @@ interface ServerStoreSnapshot {
   storeCode: string;
   storeName: string;
   catalogInitialized: boolean;
+  autoArchivePaidAfter10Min?: boolean;
   menuItems: unknown[];
   tabs: unknown[];
   tabItems: unknown[];
@@ -1033,6 +1034,52 @@ async function startServer() {
       res.json({ exists: false, storeCode: code });
       return;
     }
+
+    if (existing.autoArchivePaidAfter10Min && Array.isArray(existing.tabs)) {
+      const cutoffMs = Date.now() - 10 * 60 * 1000;
+      let changed = false;
+      const nextTabs = existing.tabs.map((rawTab) => {
+        if (!rawTab || typeof rawTab !== 'object') return rawTab;
+        const t = rawTab as {
+          status?: string;
+          totalAmount?: number;
+          paidAmount?: number;
+          updatedAt?: { seconds?: number; _ms?: number } | string | number;
+        };
+        if (t.status !== 'paid') return rawTab;
+        const remaining = Math.max(0, (Number(t.totalAmount) || 0) - (Number(t.paidAmount) || 0));
+        if (remaining > 0) return rawTab;
+
+        let updatedMs: number | null = null;
+        if (typeof t.updatedAt === 'number') {
+          updatedMs = t.updatedAt;
+        } else if (typeof t.updatedAt === 'string') {
+          const parsed = Date.parse(t.updatedAt);
+          if (!Number.isNaN(parsed)) updatedMs = parsed;
+        } else if (t.updatedAt && typeof t.updatedAt === 'object') {
+          if (typeof t.updatedAt._ms === 'number') updatedMs = t.updatedAt._ms;
+          else if (typeof t.updatedAt.seconds === 'number') updatedMs = t.updatedAt.seconds * 1000;
+        }
+
+        if (updatedMs !== null && updatedMs <= cutoffMs) {
+          changed = true;
+          return {
+            ...t,
+            status: 'archived',
+            updatedAt: { seconds: Math.floor(Date.now() / 1000), nanoseconds: 0 },
+          };
+        }
+        return rawTab;
+      });
+
+      if (changed) {
+        existing.tabs = nextTabs;
+        existing.updatedAtMs = Date.now();
+        storeMemoryMap.set(code, existing);
+        saveDatabaseToDisk();
+      }
+    }
+
     res.json({ exists: true, ...existing });
   });
 
@@ -1103,6 +1150,10 @@ async function startServer() {
         typeof body.catalogInitialized === 'boolean'
           ? body.catalogInitialized
           : current?.catalogInitialized ?? true,
+      autoArchivePaidAfter10Min:
+        typeof body.autoArchivePaidAfter10Min === 'boolean'
+          ? body.autoArchivePaidAfter10Min
+          : current?.autoArchivePaidAfter10Min ?? false,
       menuItems: Array.isArray(body.menuItems)
         ? body.menuItems
         : current?.menuItems || [],
@@ -1328,6 +1379,102 @@ ${customersSummary}`;
       console.error('Erro ao interpretar pedido com Gemini:', message);
       res.status(500).json({
         error: message || 'Erro ao processar comando de voz no servidor.',
+      });
+    }
+  });
+
+  // Natural Language Menu Product Parser using Gemini (for adding/updating products by voice)
+  app.post('/api/parse-menu-product', async (req, res) => {
+    try {
+      const { transcript } = req.body as { transcript?: string };
+      if (!transcript || typeof transcript !== 'string' || !transcript.trim()) {
+        res.status(400).json({ error: 'Frase vazia.' });
+        return;
+      }
+
+      const cleanTranscript = transcript.trim().slice(0, 250);
+      const systemInstruction = `Você é o MARCELO, assistente de um bar brasileiro (Comanda Voz).
+O proprietário/ADM está ditando por voz um ou mais produtos para CADASTRAR no cardápio do bar.
+Extraia com precisão cada produto falado, incluindo:
+- name: Nome limpo e bem formatado do produto (ex: "Skol Lata 350ml", "Porção de Calabresa", "Caipirinha de Limão").
+- category: Exatamente uma entre: "cervejas", "doses", "porcoes", "sem_alcool", "outros".
+- price: Preço unitário numérico em reais (ex: 6.5). Se nenhum preço foi falado, retorne -1.
+- synonyms: Palavras-chave curtas em minúsculas separadas por vírgula para facilitar busca por voz depois (ex: "skol lata, latinha skol").
+
+Se o usuário falou vários produtos seguidos (ex: "Skol Lata 6 reais, Água Mineral 5 reais"), retorne todos no array "products".
+Se não for possível identificar nenhum produto válido, retorne understood: false com unrecognizedReason em português.`;
+
+      const response = await ai.models.generateContent({
+        model: 'gemini-4-hydrogen',
+        contents: `Produto ditado para o cardápio: "${cleanTranscript}"`,
+        config: {
+          systemInstruction,
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              understood: { type: Type.BOOLEAN },
+              unrecognizedReason: { type: Type.STRING },
+              products: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    name: { type: Type.STRING },
+                    category: { type: Type.STRING },
+                    price: { type: Type.NUMBER },
+                    synonyms: { type: Type.STRING },
+                  },
+                  required: ['name', 'category', 'price', 'synonyms'],
+                },
+              },
+            },
+            required: ['understood', 'unrecognizedReason', 'products'],
+          },
+        },
+      });
+
+      const rawText = (response.text ?? '{}').trim();
+      const parsed = JSON.parse(rawText) as {
+        understood?: boolean;
+        unrecognizedReason?: string;
+        products?: Array<{
+          name?: string;
+          category?: string;
+          price?: number;
+          synonyms?: string;
+        }>;
+      };
+
+      const normalizedProducts = Array.isArray(parsed.products)
+        ? parsed.products
+            .filter((p) => p && typeof p.name === 'string' && p.name.trim().length >= 2)
+            .map((p) => ({
+              name: String(p.name).trim().slice(0, 80),
+              category: ['cervejas', 'doses', 'porcoes', 'sem_alcool', 'outros'].includes(
+                String(p.category)
+              )
+                ? String(p.category)
+                : 'outros',
+              price:
+                typeof p.price === 'number' && Number.isFinite(p.price) && p.price >= 0
+                  ? Number(p.price.toFixed(2))
+                  : null,
+              synonyms: String(p.synonyms || p.name || '').trim().slice(0, 200),
+            }))
+        : [];
+
+      res.json({
+        understood: Boolean(parsed.understood && normalizedProducts.length > 0),
+        unrecognizedReason: parsed.unrecognizedReason || '',
+        products: normalizedProducts,
+      });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      console.error('Erro ao interpretar produto de cardápio com Gemini:', message);
+      res.status(500).json({
+        error: message || 'Erro ao interpretar produto por voz.',
       });
     }
   });

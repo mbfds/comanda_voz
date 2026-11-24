@@ -4,6 +4,8 @@ import {
   MenuItem,
   ParsedOrderItem,
   ParsedSingleCommand,
+  ParsedVoiceMenuProduct,
+  ParsedVoiceMenuResult,
   ParsedVoiceOrder,
   TabStageStatus,
   UserRoleType,
@@ -426,15 +428,17 @@ export function getCanonicalCustomerNameGroup(token: string): string | undefined
 }
 
 /**
- * Bounded Levenshtein edit distance for catching 1-2 letter phonetic STT slips
- * (e.g. "marcelo" vs "marcele", "tiago" vs "hiago" vs "diago" vs "tigo").
+ * Full Levenshtein edit distance between two strings (used for typo & STT slip tolerance).
  */
-function phoneticEditDistance(a: string, b: string): number {
+export function computeLevenshteinDistance(a: string, b: string): number {
   if (a === b) return 0;
-  if (Math.abs(a.length - b.length) > 2) return 99;
+  if (!a.length) return b.length;
+  if (!b.length) return a.length;
+
   const dp: number[][] = Array.from({ length: a.length + 1 }, (_, i) =>
     Array.from({ length: b.length + 1 }, (__, j) => (i === 0 ? j : j === 0 ? i : 0))
   );
+
   for (let i = 1; i <= a.length; i++) {
     for (let j = 1; j <= b.length; j++) {
       const cost = a[i - 1] === b[j - 1] ? 0 : 1;
@@ -442,6 +446,96 @@ function phoneticEditDistance(a: string, b: string): number {
     }
   }
   return dp[a.length][b.length];
+}
+
+/**
+ * Normalized Levenshtein similarity in [0..1], where 1.0 means identical strings.
+ */
+export function computeLevenshteinSimilarity(a: string, b: string): number {
+  if (!a || !b) return 0;
+  if (a === b) return 1.0;
+  const maxLen = Math.max(a.length, b.length);
+  if (maxLen === 0) return 1.0;
+  return Math.max(0, 1 - computeLevenshteinDistance(a, b) / maxLen);
+}
+
+/**
+ * Soundex phonetic encoding adapted for Brazilian Portuguese names.
+ * Pre-normalizes silent letters and homophone digraphs (th->t, ph->f, y->i, k->c,
+ * w->v, ç->s, silent h) before computing the 4-character Soundex key (e.g.
+ * "Tiago" and "Thiago" both produce "T200", "Matheus" and "Mateus" -> "M320",
+ * "Felipe" and "Phelipe" -> "F410").
+ */
+export function computeSoundexPt(token: string): string {
+  const phon = normalizePhoneticPt(token).replace(/[^a-z]/g, '');
+  if (!phon) return '';
+
+  const soundexDigit = (ch: string): string => {
+    switch (ch) {
+      case 'b':
+      case 'f':
+      case 'p':
+      case 'v':
+        return '1';
+      case 'c':
+      case 'g':
+      case 'j':
+      case 'k':
+      case 'q':
+      case 's':
+      case 'x':
+      case 'z':
+        return '2';
+      case 'd':
+      case 't':
+        return '3';
+      case 'l':
+        return '4';
+      case 'm':
+      case 'n':
+        return '5';
+      case 'r':
+        return '6';
+      default:
+        return '';
+    }
+  };
+
+  const firstChar = phon[0].toUpperCase();
+  let lastCode = soundexDigit(phon[0]);
+  let result = firstChar;
+
+  for (let i = 1; i < phon.length && result.length < 4; i++) {
+    const ch = phon[i];
+    if (ch === 'h' || ch === 'w' || ch === 'y') {
+      continue;
+    }
+    const code = soundexDigit(ch);
+    if (code && code !== lastCode) {
+      result += code;
+    }
+    lastCode = code || '';
+  }
+
+  return result.padEnd(4, '0').slice(0, 4);
+}
+
+/**
+ * Compares two tokens via Portuguese Soundex similarity [0..1].
+ */
+function computeSoundexSimilarity(tokA: string, tokB: string): number {
+  const sxA = computeSoundexPt(tokA);
+  const sxB = computeSoundexPt(tokB);
+  if (!sxA || !sxB) return 0;
+  if (sxA === sxB) return 1.0;
+
+  // Partial Soundex credit when initial phonetic class matches and trailing digits align closely
+  if (sxA[0] === sxB[0]) {
+    const sxDist = computeLevenshteinDistance(sxA.slice(1), sxB.slice(1));
+    return Math.max(0, 1 - sxDist / 3) * 0.75;
+  }
+
+  return 0;
 }
 
 function getSingleNameTokenSimilarity(tokA: string, tokB: string): number {
@@ -453,11 +547,45 @@ function getSingleNameTokenSimilarity(tokA: string, tokB: string): number {
   const phonA = normalizePhoneticPt(tokA);
   const phonB = normalizePhoneticPt(tokB);
   if (!phonA || !phonB) return 0;
-  if (phonA === phonB) return 0.98;
 
+  // Combine Soundex phonetic code similarity + Levenshtein edit similarity
+  const soundexSim = computeSoundexSimilarity(tokA, tokB);
+  const rawLevSim = computeLevenshteinSimilarity(normA, normB);
+  const phonLevSim = computeLevenshteinSimilarity(phonA, phonB);
+  const bestLevSim = Math.max(rawLevSim, phonLevSim);
+
+  // Exact phonetic + Soundex identity (e.g. "Tiago" & "Thiago" -> soundexSim=1.0, phonLevSim=1.0 -> ~0.99)
+  if (phonA === phonB && soundexSim === 1.0) {
+    return 0.99;
+  }
+
+  // Same canonical Brazilian name group (e.g. "Thiago" <-> "Hiago", "Marcelo" <-> "Marcelle")
   const groupA = getCanonicalCustomerNameGroup(tokA);
   const groupB = getCanonicalCustomerNameGroup(tokB);
-  if (groupA && groupB && groupA === groupB) return 0.96;
+  if (groupA && groupB && groupA === groupB) {
+    return Math.max(0.96, 0.55 * soundexSim + 0.45 * bestLevSim);
+  }
+
+  // Combined Soundex + Levenshtein score (requires reasonable Levenshtein alignment so unrelated names like
+  // "Thiago" (T200) and "Tais" (T200) aren't conflated solely by Soundex collision)
+  if (soundexSim === 1.0 && bestLevSim >= 0.60) {
+    return Number((0.55 * soundexSim + 0.45 * bestLevSim).toFixed(4));
+  }
+
+  // Strong Levenshtein match for minor typing/STT slips
+  const minLen = Math.min(phonA.length, phonB.length);
+  const maxLen = Math.max(phonA.length, phonB.length);
+  const phonDist = computeLevenshteinDistance(phonA, phonB);
+  if (minLen >= 3 && maxLen >= 4 && phonDist <= 1) {
+    return soundexSim > 0
+      ? Math.max(0.88, 0.40 * soundexSim + 0.60 * bestLevSim)
+      : bestLevSim >= 0.80
+      ? 0.82
+      : 0.35 * soundexSim + 0.65 * bestLevSim;
+  }
+  if (minLen >= 5 && maxLen >= 6 && phonDist <= 2 && soundexSim >= 0.5) {
+    return Math.max(0.80, 0.45 * soundexSim + 0.55 * bestLevSim);
+  }
 
   // Aggressive prefix/shortening equivalence for spoken names (>= 4 chars, e.g. "tiag" <-> "thiago")
   const shorter = phonA.length <= phonB.length ? phonA : phonB;
@@ -466,24 +594,14 @@ function getSingleNameTokenSimilarity(tokA: string, tokB: string): number {
     return 0.85 + 0.1 * (shorter.length / longer.length);
   }
 
-  // Bounded Levenshtein distance for phonetic STT recognition slips
-  const minLen = Math.min(phonA.length, phonB.length);
-  const maxLen = Math.max(phonA.length, phonB.length);
-  const dist = phoneticEditDistance(phonA, phonB);
-  if (minLen >= 3 && maxLen >= 4 && dist <= 1) {
-    return 0.90;
-  }
-  if (minLen >= 5 && maxLen >= 6 && dist <= 2) {
-    return 0.82;
-  }
-
-  // Aggressive character bigram/trigram Dice similarity for noisy speech-to-text transcripts
+  // Character n-gram Dice + Soundex/Levenshtein fallback for longer noisy STT transcripts
   if (phonA.length >= 4 && phonB.length >= 4) {
     const bi = computeCharNGramDice(phonA, phonB, 2);
     const tri = computeCharNGramDice(phonA, phonB, 3);
     const combinedDice = bi * 0.6 + tri * 0.4;
-    if (combinedDice >= 0.70) {
-      return combinedDice * 0.92;
+    const hybrid = combinedDice * 0.55 + bestLevSim * 0.25 + soundexSim * 0.20;
+    if (hybrid >= 0.72) {
+      return hybrid;
     }
   }
 
@@ -491,8 +609,9 @@ function getSingleNameTokenSimilarity(tokA: string, tokB: string): number {
 }
 
 /**
- * Computes aggressive customer name similarity [0..1] combining exact, phonetic,
- * Portuguese synonym groups, bounded Levenshtein, and character n-gram Dice matching.
+ * Computes aggressive customer name similarity [0..1] combining Levenshtein distance
+ * and Portuguese-adapted Soundex phonetic encoding, plus synonym groups and n-gram fallback.
+ * For example, "Tiago" and "Thiago" achieve ~0.99 (99%) similarity.
  */
 export function computeCustomerNameSimilarity(nameA: string, nameB: string): number {
   const normA = normalizeCustomerNameForSearch(nameA);
@@ -503,7 +622,10 @@ export function computeCustomerNameSimilarity(nameA: string, nameB: string): num
   const phonA = normalizePhoneticPt(normA);
   const phonB = normalizePhoneticPt(normB);
   if (!phonA || !phonB) return 0;
-  if (phonA === phonB) return 0.99;
+  if (phonA === phonB && computeSoundexPt(normA) === computeSoundexPt(normB)) {
+    return 0.99;
+  }
+  if (phonA === phonB) return 0.98;
 
   const tokensA = normA.split(/\s+/).filter(Boolean);
   const tokensB = normB.split(/\s+/).filter(Boolean);
@@ -519,9 +641,9 @@ export function computeCustomerNameSimilarity(nameA: string, nameB: string): num
   ) {
     const condensedA = phonA.replace(/\s+/g, '');
     const condensedB = phonB.replace(/\s+/g, '');
-    if (condensedA === condensedB) return 0.96;
+    if (condensedA === condensedB) return 0.98;
     const condSim = getSingleNameTokenSimilarity(condensedA, condensedB);
-    if (condSim >= 0.85) return condSim * 0.96;
+    if (condSim >= 0.85) return condSim * 0.97;
   }
 
   if (tokensA.length === tokensB.length) {
@@ -545,7 +667,7 @@ export function computeCustomerNameSimilarity(nameA: string, nameB: string): num
     }
   }
 
-  // Fallback token-coverage + full-phrase n-gram similarity for partial multi-word names
+  // Fallback token-coverage + Levenshtein/Soundex similarity for partial multi-word names
   const smaller = tokensA.length <= tokensB.length ? tokensA : tokensB;
   const larger = tokensA.length <= tokensB.length ? tokensB : tokensA;
   let matchedSimSum = 0;
@@ -565,13 +687,16 @@ export function computeCustomerNameSimilarity(nameA: string, nameB: string): num
     return (matchedSimSum / smaller.length) * 0.92;
   }
 
+  const fullLevSim = computeLevenshteinSimilarity(phonA, phonB);
   const fullDice = computeCharNGramDice(phonA, phonB, 2) * 0.6 + computeCharNGramDice(phonA, phonB, 3) * 0.4;
-  return fullDice >= 0.72 ? fullDice * 0.90 : 0;
+  const fullHybrid = Math.max(fullLevSim, fullDice);
+  return fullHybrid >= 0.74 ? fullHybrid * 0.90 : 0;
 }
 
 /**
- * Checks if two customer names refer to the same person (including Thiago/Tiago,
- * Marcelo/Marcelle/Marcele, synonym groups, and aggressive fuzzy/phonetic matches).
+ * Checks if two customer names refer to the same person using combined Levenshtein
+ * distance and Portuguese Soundex similarity (so e.g. "Tiago" and "Thiago" reach ~99%
+ * similarity and never create duplicate tabs).
  */
 export function areCustomerNamesEquivalent(nameA: string, nameB: string): boolean {
   return computeCustomerNameSimilarity(nameA, nameB) >= 0.78;
@@ -913,7 +1038,7 @@ function getProductTokenSimilarity(tokA: string, tokB: string): number {
 
   // Bounded Levenshtein for STT misspellings (e.g. "heinekem" <-> "heineken", "raimeken" <-> "heineken")
   if (phonA.length >= 4 && phonB.length >= 4) {
-    const dist = phoneticEditDistance(phonA, phonB);
+    const dist = computeLevenshteinDistance(phonA, phonB);
     const maxLen = Math.max(phonA.length, phonB.length);
     if (dist <= 1) return 0.88;
     if (maxLen >= 6 && dist <= 2) return 0.78;
@@ -1625,4 +1750,617 @@ export function parseVoiceOrderLocally(
     commands,
   };
 }
+
+// --- Voice Cardápio (Product Registration) Engine ---
+
+const PT_SPOKEN_UNITS: Record<string, number> = {
+  zero: 0,
+  um: 1,
+  uma: 1,
+  dois: 2,
+  duas: 2,
+  tres: 3,
+  quatro: 4,
+  cinco: 5,
+  seis: 6,
+  meia: 6,
+  sete: 7,
+  oito: 8,
+  nove: 9,
+  dez: 10,
+  onze: 11,
+  doze: 12,
+  treze: 13,
+  quatorze: 14,
+  catorze: 14,
+  quinze: 15,
+  dezesseis: 16,
+  dezessete: 17,
+  dezoito: 18,
+  dezenove: 19,
+};
+
+const PT_SPOKEN_TENS: Record<string, number> = {
+  vinte: 20,
+  trinta: 30,
+  quarenta: 40,
+  cinquenta: 50,
+  sessenta: 60,
+  setenta: 70,
+  oitenta: 80,
+  noventa: 90,
+};
+
+const PT_SPOKEN_HUNDREDS: Record<string, number> = {
+  cem: 100,
+  cento: 100,
+  duzentos: 200,
+  duzentas: 200,
+  trezentos: 300,
+  trezentas: 300,
+  quatrocentos: 400,
+  quatrocentas: 400,
+  quinhentos: 500,
+  quinhentas: 500,
+};
+
+function parsePortugueseIntPhrase(phrase: string): number | null {
+  const norm = normalizeText(phrase);
+  if (!norm) return null;
+  if (/^\d+$/.test(norm)) {
+    const val = parseInt(norm, 10);
+    return Number.isFinite(val) ? val : null;
+  }
+
+  const tokens = norm.split(/\s+/).filter((t) => t && t !== 'e');
+  if (tokens.length === 0) return null;
+
+  let total = 0;
+  let matchedAny = false;
+  for (const tok of tokens) {
+    if (PT_SPOKEN_HUNDREDS[tok] !== undefined) {
+      total += PT_SPOKEN_HUNDREDS[tok];
+      matchedAny = true;
+    } else if (PT_SPOKEN_TENS[tok] !== undefined) {
+      total += PT_SPOKEN_TENS[tok];
+      matchedAny = true;
+    } else if (PT_SPOKEN_UNITS[tok] !== undefined) {
+      total += PT_SPOKEN_UNITS[tok];
+      matchedAny = true;
+    } else {
+      return null;
+    }
+  }
+  return matchedAny ? total : null;
+}
+
+/**
+ * Detects whether a phrase directed at Marcelo is asking to register/add a new
+ * product in the bar's Cardápio (menu catalog) rather than marking a customer's tab.
+ */
+export function isMenuRegistrationVoiceCommand(transcript: string): boolean {
+  const wake = extractCommandAfterMarceloWakeWord(transcript);
+  const effective = normalizeText(wake.hasWakeWord ? wake.commandTranscript : transcript);
+  if (!effective) return false;
+
+  return (
+    /\b(?:cadastrar|cadastra|cadastro|criar|cria|novo|nova|incluir|inclui|inserir|insere)\s+(?:um\s+|uma\s+|o\s+|a\s+|novo\s+|nova\s+)?(?:produto|item)\b/i.test(
+      effective
+    ) ||
+    /\b(?:adicionar|adiciona|colocar|coloca|botar|bota|cadastrar|cadastra|incluir|inserir)\s+(?:um\s+|uma\s+|o\s+|a\s+)?(?:produto|item)?\s*(?:no|ao|na)\s+(?:cardapio|catalogo|menu|lista\s+de\s+produtos)\b/i.test(
+      effective
+    ) ||
+    /\badicionar\s+(?:um\s+|uma\s+|o\s+|a\s+|novo\s+)?produto\b/i.test(effective)
+  );
+}
+
+/**
+ * Infers the most appropriate bar ItemCategory from explicit spoken category hints
+ * or common Brazilian bar product names.
+ */
+export function inferProductCategory(
+  productName: string,
+  explicitHint?: string
+): ItemCategory {
+  const hintNorm = normalizeText(explicitHint || '');
+  if (hintNorm) {
+    if (/\b(?:cerveja|cervejas|chopp|breja)\b/.test(hintNorm)) return 'cervejas';
+    if (/\b(?:dose|doses|drink|drinks|destilado|destilados|coquetel|coqueteis)\b/.test(hintNorm)) {
+      return 'doses';
+    }
+    if (/\b(?:porcao|porcoes|espeto|espetos|espetinho|espetinhos|petisco|petiscos|comida|lanche)\b/.test(hintNorm)) {
+      return 'porcoes';
+    }
+    if (/\b(?:sem\s+alcool|nao\s+alcool|nao\s+alcoolico|refri|refrigerante|refrigerantes|agua|suco|energetico)\b/.test(hintNorm)) {
+      return 'sem_alcool';
+    }
+    if (/\b(?:outro|outros|diversos|geral)\b/.test(hintNorm)) return 'outros';
+  }
+
+  const norm = normalizeText(productName);
+  if (
+    /\b(?:cerveja|chopp|chope|litrao|litroes|skol|brahma|heineken|original|antarctica|antartica|bohemia|budweiser|corona|stella|amstel|spaten|sub\s*zero|itaipava|kaiser|petra|devassa|imperio|eisenbahn|becks|michelob|colorado|baden|patagonia|schin|bavaria|glacier|crystal|long\s*neck|longneck|latao)\b/.test(
+      norm
+    )
+  ) {
+    return 'cervejas';
+  }
+  if (
+    /\b(?:dose|cachaca|pinga|whisky|uisque|vodka|vodca|gin|campari|caipirinha|caipiroska|caipivodka|drink|batida|tequila|rum|conhaque|licor|vinho|espumante|montilla|jack\s*daniels|red\s*label|black\s*label|ballantines|johnnie|chivas|absolut|smirnoff|tanqueray|beefeater|jurupinga|catuaba|aperol|negroni|mojito|margarita|martini)\b/.test(
+      norm
+    )
+  ) {
+    return 'doses';
+  }
+  if (
+    /\b(?:porcao|espetinho|espeto|churrasquinho|batata|fritas|calabresa|torresmo|panceta|pururuca|mandioca|aipim|macaxeira|polenta|frango|passarinho|carne|picanha|contra\s*file|alcatra|linguica|salgado|pastel|coxinha|kibe|quibe|bolinho|tira\s*gosto|petisco|amendoim|queijo|provolone|sanduiche|lanche|hamburguer|burger|xis|tapioca|isca|camarao|tilapia|peixe)\b/.test(
+      norm
+    )
+  ) {
+    return 'porcoes';
+  }
+  if (
+    /\b(?:coca|guarana|fanta|sprite|pepsi|refri|refrigerante|agua|suco|energetico|red\s*bull|redbull|monster|tnt|bally|h2oh|tonica|schweppes|gelo|cafe|cha|del\s*valle|toddynho|achocolatado|limonada|soda)\b/.test(
+      norm
+    )
+  ) {
+    return 'sem_alcool';
+  }
+  return 'outros';
+}
+
+function formatProductNamePt(raw: string): string {
+  const lowerKeep = new Set(['de', 'do', 'da', 'dos', 'das', 'com', 'sem', 'e', 'ao', 'em', 'a']);
+  const tokens = raw
+    .trim()
+    .replace(/\s+/g, ' ')
+    .split(' ')
+    .filter(Boolean);
+
+  return tokens
+    .map((tok, idx) => {
+      const lower = tok.toLowerCase();
+      // Preserve units like 350ml, 600ml, 1L, 2L
+      if (/^\d+ml$/i.test(lower)) return `${lower.slice(0, -2)}ml`;
+      if (/^\d+l$/i.test(lower)) return `${lower.slice(0, -1)}L`;
+      if (/^\d+g$/i.test(lower)) return `${lower.slice(0, -1)}g`;
+      if (idx > 0 && lowerKeep.has(lower)) return lower;
+      return lower.charAt(0).toUpperCase() + lower.slice(1);
+    })
+    .join(' ');
+}
+
+function buildAutoProductSynonyms(name: string, explicitSynonyms?: string): string {
+  if (explicitSynonyms && explicitSynonyms.trim()) {
+    return sanitizeString(explicitSynonyms.trim(), VALIDATION_LIMITS.SYNONYMS_MAX_LEN);
+  }
+  const cleanLower = name.trim().toLowerCase();
+  const asciiLower = normalizeText(name);
+  const parts = [cleanLower];
+  if (asciiLower && asciiLower !== cleanLower) {
+    parts.push(asciiLower);
+  }
+  return sanitizeString(parts.join(', '), VALIDATION_LIMITS.SYNONYMS_MAX_LEN);
+}
+
+function extractPriceFromProductClause(clause: string): {
+  price: number | null;
+  remainingNameText: string;
+} {
+  let working = clause.trim();
+
+  // 1. Numeric price with optional cents ("18,50", "18.50", "18 reais e 50", "6 e 50", "R$ 15", "15 reais")
+  const numericPatterns: RegExp[] = [
+    // "por 18 reais e 50 centavos" / "18 reais e cinquenta" / "18 reais e 50"
+    /(?:\b(?:por|a|de|valor(?:\s+de)?|custa|custando|sai(?:\s+a)?|preco(?:\s+de)?|preço(?:\s+de)?)\s+)?(?:r\s*\$\s*)?(\d+(?:[.,]\d{1,2})?)\s*(?:reais|real|conto|pila)\s*(?:e\s+(\d{1,2}|cinquenta|vinte|trinta|quarenta|sessenta|setenta|oitenta|noventa|dez|quinze|cinco)(?:\s*centavos?)?)?\b/i,
+    // "6 e 50" / "6 e cinquenta" at the end or preceded by price preposition
+    /(?:\b(?:por|a|de|valor(?:\s+de)?|custa|custando|sai(?:\s+a)?|preco(?:\s+de)?|preço(?:\s+de)?)\s+)?(?:r\s*\$\s*)?(\d+)\s+e\s+(\d{2}|cinquenta)\b(?:\s*centavos?)?/i,
+    // "R$ 18,50" or "R$ 18" anywhere
+    /r\s*\$\s*(\d+(?:[.,]\d{1,2})?)/i,
+    // "por 18,50" / "a 18" / "valor 18"
+    /\b(?:por|valor(?:\s+de)?|custa|custando|sai(?:\s+a)?|preco(?:\s+de)?|preço(?:\s+de)?)\s+(?:r\s*\$\s*)?(\d+(?:[.,]\d{1,2})?)\b/i,
+    // Trailing decimal or integer price at end of phrase (ignoring volume like "600ml", "350ml", "2l", "1l")
+    /(?:^|\s)(\d+[.,]\d{1,2})\s*$/,
+    /(?:^|\s)(\d{1,4})\s*(?:reais|real|conto|pila)?\s*$/,
+  ];
+
+  for (const pat of numericPatterns) {
+    const m = pat.exec(working);
+    if (!m || !m[1]) continue;
+
+    // Skip if matched trailing number is actually a volume token right next to ml/l/litros
+    const afterMatch = working.slice(m.index + m[0].length).trim();
+    if (/^(?:ml|mls|l|litro|litros|g|gramas|kg)\b/i.test(afterMatch)) {
+      continue;
+    }
+    const matchedStr = m[0].trim();
+    if (/^\d{3,}$/.test(m[1]) && (m[1] === '350' || m[1] === '600' || m[1] === '330' || m[1] === '269' || m[1] === '473' || m[1] === '500' || m[1] === '290') && !/(?:reais|real|r\$|por|valor|custa|preço|preco)/i.test(matchedStr)) {
+      continue;
+    }
+
+    let val = parseFloat(m[1].replace(',', '.'));
+    if (m[2]) {
+      const centsRaw = normalizeText(m[2]);
+      const centsInt = /^\d+$/.test(centsRaw)
+        ? parseInt(centsRaw, 10)
+        : parsePortugueseIntPhrase(centsRaw);
+      if (centsInt !== null && centsInt >= 0 && centsInt < 100 && Number.isInteger(val)) {
+        val += centsInt / 100;
+      }
+    }
+
+    if (!Number.isNaN(val) && val >= 0 && val <= VALIDATION_LIMITS.MAX_PRICE) {
+      const before = working.slice(0, m.index).trim();
+      const after = working.slice(m.index + m[0].length).trim();
+      const joined = `${before} ${after}`.replace(/\s+/g, ' ').trim();
+      return {
+        price: Number(val.toFixed(2)),
+        remainingNameText: joined,
+      };
+    }
+  }
+
+  // 2. Fully spoken Portuguese price (e.g. "dezoito reais", "vinte e cinco reais e cinquenta", "dez reais e meia")
+  const spokenRegex =
+    /(?:\b(?:por|a|de|valor(?:\s+de)?|custa|custando|sai(?:\s+a)?|preco(?:\s+de)?|preço(?:\s+de)?)\s+)?((?:(?:cem|cento|duzentos|trezentos|quatrocentos|quinhentos|vinte|trinta|quarenta|cinquenta|sessenta|setenta|oitenta|noventa|dez|onze|doze|treze|quatorze|catorze|quinze|dezesseis|dezessete|dezoito|dezenove|zero|um|uma|dois|duas|tres|três|quatro|cinco|seis|sete|oito|nove)(?:\s+e\s+)?){1,4})\s*(?:reais|real|conto|pila)(?:\s+e\s+((?:cinquenta|vinte|trinta|quarenta|sessenta|setenta|oitenta|noventa|dez|quinze|cinco|meia|\d{1,2}))(?:\s*centavos?)?)?/i;
+
+  const spokenMatch = spokenRegex.exec(working);
+  if (spokenMatch && spokenMatch[1]) {
+    const intPart = parsePortugueseIntPhrase(spokenMatch[1]);
+    if (intPart !== null && intPart >= 0) {
+      let val = intPart;
+      if (spokenMatch[2]) {
+        const cNorm = normalizeText(spokenMatch[2]);
+        const cVal = cNorm === 'meia' ? 50 : parsePortugueseIntPhrase(cNorm);
+        if (cVal !== null && cVal >= 0 && cVal < 100) {
+          val += cVal / 100;
+        }
+      }
+      const before = working.slice(0, spokenMatch.index).trim();
+      const after = working.slice(spokenMatch.index + spokenMatch[0].length).trim();
+      const joined = `${before} ${after}`.replace(/\s+/g, ' ').trim();
+      return {
+        price: Number(val.toFixed(2)),
+        remainingNameText: joined,
+      };
+    }
+  }
+
+  return { price: null, remainingNameText: working };
+}
+
+function parseSingleMenuProductClause(clause: string): ParsedVoiceMenuProduct | null {
+  let working = sanitizeVoiceTranscriptForParsing(clause)
+    .replace(/^[,.;:\s]+|[,.;:\s]+$/g, '')
+    .trim();
+  if (!working) return null;
+
+  // Strip registration command prefixes
+  working = stripPolitePrefixes(working)
+    .replace(
+      /^(?:cadastrar|cadastra|cadastro|criar|cria|adicionar|adiciona|colocar|coloca|botar|bota|incluir|inclui|inserir|insere|novo|nova)\s+(?:um\s+|uma\s+|o\s+|a\s+|novo\s+|nova\s+)?(?:produto|item)?\s*(?:(?:no|ao|na)\s+(?:cardapio|cardápio|catalogo|catálogo|menu))?\s*/i,
+      ''
+    )
+    .replace(/^(?:no|ao|na)\s+(?:cardapio|cardápio|catalogo|catálogo|menu)\s+/i, '')
+    .replace(/^(?:um|uma|o|a)\s+(?=produto|item)/i, '')
+    .replace(/^(?:produto|item)\s+/i, '')
+    .trim();
+
+  // Extract explicit synonyms ("apelidos ...", "sinônimos ...", "palavras chave ...")
+  let explicitSynonyms = '';
+  const synMatch = working.match(
+    /\b(?:apelidos?|sin[oô]nimos?|palavras[\s-]+chaves?)\s*(?:de|:)?\s*(.+)$/i
+  );
+  if (synMatch && synMatch[1]) {
+    explicitSynonyms = synMatch[1].trim();
+    working = working.slice(0, synMatch.index).trim();
+  }
+
+  // Extract explicit category ("categoria cervejas", "na categoria porções", "tipo doses")
+  let explicitCategoryHint = '';
+  const catRegex =
+    /\b(?:na\s+categoria(?:\s+de)?|categoria(?:\s+de)?|tipo(?:\s+de)?)\s+(cervejas?|doses?(?:\s+e\s+drinks?)?|drinks?|por[cç][oõ]es?(?:\s+e\s+espetos?)?|espetos?|sem\s+[aá]lcool|n[aã]o\s+alco[oó]lic[oa]s?|outros?)\b/i;
+  const catMatch = catRegex.exec(working);
+  if (catMatch && catMatch[1]) {
+    explicitCategoryHint = catMatch[1].trim();
+    const before = working.slice(0, catMatch.index).trim();
+    const after = working.slice(catMatch.index + catMatch[0].length).trim();
+    working = `${before} ${after}`.replace(/\s+/g, ' ').trim();
+  }
+
+  // Extract price and isolate product name
+  const { price, remainingNameText } = extractPriceFromProductClause(working);
+
+  let cleanNameRaw = remainingNameText
+    .replace(/\b(?:no\s+card[aá]pio|ao\s+card[aá]pio|para\s+o\s+card[aá]pio)\b/gi, ' ')
+    .replace(/\s+(?:por|valor|pre[cç]o|custa|a|de)\s*$/i, '')
+    .replace(/^[,.;:\s-]+|[,.;:\s-]+$/g, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  // Normalize spoken volume units neatly inside product name
+  cleanNameRaw = cleanNameRaw
+    .replace(/\b(\d+)\s*litros?\b/gi, '$1L')
+    .replace(/\b(\d+)\s*mls?\b/gi, '$1ml')
+    .replace(/\bum\s+litro\b/gi, '1L')
+    .replace(/\bdois\s+litros\b/gi, '2L');
+
+  if (!cleanNameRaw || cleanNameRaw.length < 2) {
+    return null;
+  }
+
+  const formattedName = sanitizeString(
+    formatProductNamePt(cleanNameRaw),
+    VALIDATION_LIMITS.NAME_MAX_LEN
+  );
+  const category = inferProductCategory(formattedName, explicitCategoryHint);
+  const synonyms = buildAutoProductSynonyms(formattedName, explicitSynonyms);
+
+  return {
+    name: formattedName,
+    category,
+    price,
+    synonyms,
+  };
+}
+
+/**
+ * Parses one or more bar products spoken in Portuguese for adding to the Cardápio.
+ * Supports:
+ * - "Skol Lata 6 reais"
+ * - "Cadastrar produto Litrão Brahma 18 reais categoria cervejas"
+ * - "Porção de Calabresa por 38 reais e 50"
+ * - Multiple products in one breath: "Skol Lata 6 reais, Água Mineral 5 reais"
+ * - Name-only fallback (returns price: null so the UI pre-fills the form)
+ */
+export function parseVoiceMenuProductsLocally(transcript: string): ParsedVoiceMenuResult {
+  const rawCleaned = sanitizeVoiceTranscriptForParsing(transcript);
+  if (!rawCleaned) {
+    return {
+      understood: false,
+      unrecognizedReason:
+        'Diga o nome e o preço do produto, por exemplo: "Skol Lata 6 reais".',
+      products: [],
+    };
+  }
+
+  const wake = extractCommandAfterMarceloWakeWord(rawCleaned);
+  const effective = (wake.hasWakeWord ? wake.commandTranscript : rawCleaned).trim();
+  if (!effective) {
+    return {
+      understood: false,
+      unrecognizedReason:
+        'Diga o nome e o preço do produto após chamar o Marcelo.',
+      products: [],
+    };
+  }
+
+  // If user explicitly mentions "apelidos ..." or "sinônimos ...", keep as a single product so commas inside synonyms aren't split
+  const hasExplicitSynonyms = /\b(?:apelidos?|sin[oô]nimos?|palavras[\s-]+chaves?)\b/i.test(
+    effective
+  );
+
+  let candidateClauses: string[] = [effective];
+  if (!hasExplicitSynonyms) {
+    // Split on semicolon, or comma when there are multiple prices, or " e " right after a complete price
+    const splitOnPriceBoundaries = effective
+      .replace(
+        /(\d+(?:[.,]\d{1,2})?\s*(?:reais|real|conto|pila))\s+e\s+(?![0-9]{1,2}\b|cinquenta\b|centavos?\b|vinte\b|trinta\b|quarenta\b|sessenta\b|setenta\b|oitenta\b|noventa\b|dez\b|quinze\b|cinco\b|meia\b)/gi,
+        '$1 ; '
+      )
+      .split(/\s*[;,]\s*/)
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    if (splitOnPriceBoundaries.length > 1) {
+      // Only treat comma-splits as separate products if at least 2 parts parse cleanly with prices
+      const testParsed = splitOnPriceBoundaries
+        .map((c) => parseSingleMenuProductClause(c))
+        .filter((p): p is ParsedVoiceMenuProduct => Boolean(p && p.price !== null));
+      if (testParsed.length >= 2) {
+        candidateClauses = splitOnPriceBoundaries;
+      }
+    }
+  }
+
+  const products: ParsedVoiceMenuProduct[] = [];
+  for (const clause of candidateClauses) {
+    const parsed = parseSingleMenuProductClause(clause);
+    if (parsed) {
+      products.push(parsed);
+    }
+  }
+
+  if (products.length === 0) {
+    return {
+      understood: false,
+      unrecognizedReason:
+        'Não consegui identificar o nome do produto. Diga por exemplo: "Litrão Brahma 18 reais".',
+      products: [],
+    };
+  }
+
+  return {
+    understood: true,
+    unrecognizedReason: '',
+    products,
+  };
+}
+
+export interface ThermalReceiptItemInput {
+  itemName: string;
+  quantity: number;
+  unitPrice: number;
+  totalSubtotal: number;
+}
+
+export interface ThermalReceiptInput {
+  storeName: string;
+  customerName: string;
+  tableLabel?: string;
+  statusLabel: string;
+  totalAmount: number;
+  paidAmount: number;
+  itemCount: number;
+  paymentMethod?: string;
+  items: ThermalReceiptItemInput[];
+  printedAt?: Date;
+}
+
+function formatPlainBRL(value: number): string {
+  const safe = Number.isFinite(value) ? value : 0;
+  return `R$ ${safe.toFixed(2).replace('.', ',')}`;
+}
+
+function stripThermalUnsafeChars(text: string): string {
+  return (text ?? '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^\x20-\x7E]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function wrapTextToWidth(text: string, width: number): string[] {
+  const clean = stripThermalUnsafeChars(text);
+  if (!clean) return [''];
+  const words = clean.split(' ');
+  const lines: string[] = [];
+  let current = '';
+
+  for (const word of words) {
+    if (word.length > width) {
+      if (current) {
+        lines.push(current);
+        current = '';
+      }
+      for (let i = 0; i < word.length; i += width) {
+        lines.push(word.slice(i, i + width));
+      }
+      continue;
+    }
+    const candidate = current ? `${current} ${word}` : word;
+    if (candidate.length <= width) {
+      current = candidate;
+    } else {
+      if (current) lines.push(current);
+      current = word;
+    }
+  }
+  if (current) lines.push(current);
+  return lines;
+}
+
+function centerTextToWidth(text: string, width: number): string[] {
+  return wrapTextToWidth(text, width).map((line) => {
+    const padTotal = Math.max(0, width - line.length);
+    const padLeft = Math.floor(padTotal / 2);
+    return `${' '.repeat(padLeft)}${line}`;
+  });
+}
+
+function formatColumnsLine(leftText: string, rightText: string, width: number): string[] {
+  const cleanLeft = stripThermalUnsafeChars(leftText);
+  const cleanRight = stripThermalUnsafeChars(rightText);
+
+  if (cleanLeft.length + 1 + cleanRight.length <= width) {
+    const spaces = width - cleanLeft.length - cleanRight.length;
+    return [`${cleanLeft}${' '.repeat(spaces)}${cleanRight}`];
+  }
+
+  const maxLeftWidth = Math.max(10, width - cleanRight.length - 1);
+  const wrappedLeft = wrapTextToWidth(cleanLeft, maxLeftWidth);
+  const result: string[] = [];
+  for (let i = 0; i < wrappedLeft.length; i++) {
+    const part = wrappedLeft[i];
+    if (i === wrappedLeft.length - 1) {
+      const spaces = Math.max(1, width - part.length - cleanRight.length);
+      result.push(`${part}${' '.repeat(spaces)}${cleanRight}`.slice(0, width));
+    } else {
+      result.push(part);
+    }
+  }
+  return result;
+}
+
+/**
+ * Formats a customer's bar tab as plain text (ASCII-safe, 32 to 48 columns wide)
+ * ready for 58mm (32 cols) or 80mm (40-48 cols) thermal receipt printers.
+ */
+export function formatThermalReceiptText(
+  input: ThermalReceiptInput,
+  columns = 40
+): string {
+  const width = Math.min(48, Math.max(32, Math.round(columns)));
+  const doubleDivider = '='.repeat(width);
+  const singleDivider = '-'.repeat(width);
+  const printedDate = input.printedAt || new Date();
+  const formattedDate = printedDate.toLocaleDateString('pt-BR');
+  const formattedTime = printedDate.toLocaleTimeString('pt-BR', {
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+
+  const remaining = Math.max(
+    0,
+    Number(((input.totalAmount || 0) - (input.paidAmount || 0)).toFixed(2))
+  );
+
+  const lines: string[] = [];
+  lines.push(doubleDivider);
+  lines.push(...centerTextToWidth((input.storeName || 'COMANDA VOZ').toUpperCase(), width));
+  lines.push(...centerTextToWidth('CONFERENCIA DE CONTA', width));
+  lines.push(doubleDivider);
+
+  lines.push(...wrapTextToWidth(`Cliente: ${input.customerName}`, width));
+  if (input.tableLabel && input.tableLabel.trim()) {
+    lines.push(...wrapTextToWidth(`Mesa/Local: ${input.tableLabel}`, width));
+  }
+  lines.push(...formatColumnsLine(`Status: ${input.statusLabel}`, `${formattedDate} ${formattedTime}`, width));
+  lines.push(singleDivider);
+  lines.push(...formatColumnsLine('QTD ITEM', 'SUBTOTAL', width));
+  lines.push(singleDivider);
+
+  if (input.items.length === 0) {
+    lines.push(...centerTextToWidth('(Nenhum item lancado)', width));
+  } else {
+    for (const item of input.items) {
+      const itemLabel = `${item.quantity}x ${item.itemName}`;
+      const subtotalLabel = formatPlainBRL(item.totalSubtotal);
+      lines.push(...formatColumnsLine(itemLabel, subtotalLabel, width));
+      if (item.quantity > 1) {
+        lines.push(
+          ...wrapTextToWidth(`   (${item.quantity} un x ${formatPlainBRL(item.unitPrice)})`, width)
+        );
+      }
+    }
+  }
+
+  lines.push(singleDivider);
+  lines.push(...formatColumnsLine('Qtd. de itens:', String(input.itemCount || 0), width));
+  lines.push(...formatColumnsLine('TOTAL CONSUMIDO:', formatPlainBRL(input.totalAmount), width));
+
+  if ((input.paidAmount || 0) > 0) {
+    const payLabel = input.paymentMethod
+      ? `JA PAGO (${stripThermalUnsafeChars(input.paymentMethod)}):`
+      : 'JA PAGO:';
+    lines.push(...formatColumnsLine(payLabel, formatPlainBRL(input.paidAmount), width));
+  }
+
+  lines.push(doubleDivider);
+  if (remaining <= 0 && (input.totalAmount || 0) > 0) {
+    lines.push(...formatColumnsLine('CONTA QUITADA:', formatPlainBRL(0), width));
+  } else {
+    lines.push(...formatColumnsLine('FALTA PAGAR:', formatPlainBRL(remaining), width));
+  }
+  lines.push(doubleDivider);
+  lines.push('');
+  lines.push(...centerTextToWidth('Obrigado pela preferencia!', width));
+  lines.push(...centerTextToWidth('Comanda Voz - Marcelo', width));
+  lines.push('');
+
+  return lines.join('\n');
+}
+
+
 

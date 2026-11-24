@@ -61,13 +61,14 @@ service cloud.firestore {
     // Entity Validation Blueprints
     function isValidUserProfile(data) {
       return data.keys().hasAll(['ownerId', 'userName', 'userRole', 'storeName', 'storeCode', 'createdAt', 'updatedAt']) &&
-        data.keys().hasOnly(['ownerId', 'userName', 'userRole', 'storeName', 'storeCode', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['ownerId', 'userName', 'userRole', 'storeName', 'storeCode', 'autoArchivePaidAfter10Min', 'createdAt', 'updatedAt']) &&
         data.ownerId is string && data.ownerId.size() >= 1 && data.ownerId.size() <= 128 && data.ownerId.matches('^[a-zA-Z0-9_\\-]+$') &&
         data.ownerId == request.auth.uid &&
         data.userName is string && data.userName.size() >= 1 && data.userName.size() <= 60 &&
         isValidUserRole(data.userRole) &&
         data.storeName is string && data.storeName.size() >= 1 && data.storeName.size() <= 80 &&
         data.storeCode is string && data.storeCode.size() >= 1 && data.storeCode.size() <= 30 && data.storeCode.matches('^[a-zA-Z0-9_\\-]+$') &&
+        (!('autoArchivePaidAfter10Min' in data) || data.autoArchivePaidAfter10Min is bool) &&
         data.createdAt is timestamp &&
         data.updatedAt is timestamp;
     }
@@ -163,7 +164,7 @@ service cloud.firestore {
         incoming().ownerId == existing().ownerId &&
         incoming().createdAt == existing().createdAt &&
         incoming().updatedAt == request.time &&
-        incoming().diff(existing()).affectedKeys().hasOnly(['userName', 'userRole', 'storeName', 'storeCode', 'updatedAt']);
+        incoming().diff(existing()).affectedKeys().hasOnly(['userName', 'userRole', 'storeName', 'storeCode', 'autoArchivePaidAfter10Min', 'updatedAt']);
       allow delete: if false;
     }
 

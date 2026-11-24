@@ -36,6 +36,10 @@
           "maxLength": 30,
           "pattern": "^[a-zA-Z0-9_\\-]+$"
         },
+        "autoArchivePaidAfter10Min": {
+          "type": "boolean",
+          "description": "Indica se comandas quitadas devem ser arquivadas automaticamente após 10 minutos de pagamento."
+        },
         "createdAt": {
           "type": "string",
           "format": "date-time",

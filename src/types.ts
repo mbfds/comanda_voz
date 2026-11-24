@@ -16,6 +16,7 @@ export interface UserProfile {
   userRole: UserRoleType;
   storeName: string;
   storeCode: string;
+  autoArchivePaidAfter10Min?: boolean;
   createdAt: Timestamp | null;
   updatedAt: Timestamp | null;
 }
@@ -105,3 +106,17 @@ export interface ParsedVoiceOrder {
   spokenPin?: string;
   commands: ParsedSingleCommand[];
 }
+
+export interface ParsedVoiceMenuProduct {
+  name: string;
+  category: ItemCategory;
+  price: number | null;
+  synonyms: string;
+}
+
+export interface ParsedVoiceMenuResult {
+  understood: boolean;
+  unrecognizedReason: string;
+  products: ParsedVoiceMenuProduct[];
+}
+

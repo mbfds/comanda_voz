@@ -54,6 +54,7 @@ import {
   Unlock,
   BarChart3,
   Award,
+  Printer,
 } from 'lucide-react';
 import {
   auth,
@@ -67,6 +68,8 @@ import {
   ItemCategory,
   MenuItem,
   ParsedSingleCommand,
+  ParsedVoiceMenuProduct,
+  ParsedVoiceMenuResult,
   ParsedVoiceOrder,
   TabItem,
   TabStageStatus,
@@ -81,8 +84,12 @@ import {
   DEFAULT_BAR_MENU,
   extractCommandAfterMarceloWakeWord,
   formatBRL,
+  formatThermalReceiptText,
+  isMenuRegistrationVoiceCommand,
   normalizePhoneticPt,
+  normalizeProductText,
   normalizeText,
+  parseVoiceMenuProductsLocally,
   parseVoiceOrderLocally,
   sanitizeCategory,
   sanitizeStoreCode,
@@ -201,7 +208,7 @@ interface LastActionUndo {
 }
 
 interface MarceloReportCard {
-  intent: 'MARCAR' | 'FECHAR' | 'BAIXA';
+  intent: 'MARCAR' | 'FECHAR' | 'BAIXA' | 'CADASTRO_MENU';
   title: string;
   spokenSummary: string;
   customerName: string;
@@ -368,11 +375,12 @@ function ComandaVozWorkspace() {
   const isMutatingRef = useRef(false);
   const lastMutationMsRef = useRef(0);
 
-  // Store Profile Form
+  // Store Profile Form & ADM Settings
   const [profileUserName, setProfileUserName] = useState('');
   const [profileUserRole, setProfileUserRole] = useState<UserRoleType>('ADM');
   const [profileStoreName, setProfileStoreName] = useState('');
   const [profileStoreCode, setProfileStoreCode] = useState('');
+  const [autoArchivePaidAfter10Min, setAutoArchivePaidAfter10Min] = useState<boolean>(false);
   const [savingProfile, setSavingProfile] = useState(false);
 
   // Strict Role-Based Access Control (RBAC):
@@ -461,13 +469,18 @@ function ComandaVozWorkspace() {
   const [testingCompatibility, setTestingCompatibility] = useState(false);
   const [registeringWaiter, setRegisteringWaiter] = useState(false);
 
-  // Cardápio (Menu Item) Create & Edit Form State
+  // Cardápio (Menu Item) Create & Edit Form State + Voice Registration
   const [editingMenuId, setEditingMenuId] = useState<string | null>(null);
   const [newMenuName, setNewMenuName] = useState('');
   const [newMenuCategory, setNewMenuCategory] = useState<ItemCategory>('cervejas');
   const [newMenuPrice, setNewMenuPrice] = useState('');
   const [newMenuSynonyms, setNewMenuSynonyms] = useState('');
   const [savingMenu, setSavingMenu] = useState(false);
+  const [isListeningMenuVoice, setIsListeningMenuVoice] = useState(false);
+  const [menuVoiceInterim, setMenuVoiceInterim] = useState('');
+  const [menuVoiceProcessing, setMenuVoiceProcessing] = useState(false);
+  const menuRecognitionRef = useRef<SpeechRecognitionInstance | null>(null);
+  const printReceiptPreRef = useRef<HTMLPreElement | null>(null);
 
   // SUPERADMIN State (All Accounts, All Stores, Master Recovery Key, SaaS Billing)
   const [superAccounts, setSuperAccounts] = useState<SuperAdminAccountSummary[]>([]);
@@ -535,6 +548,7 @@ function ComandaVozWorkspace() {
   const syncDirectStoreSnapshot = async (nextData: {
     storeCode?: string;
     storeName?: string;
+    autoArchivePaidAfter10Min?: boolean;
     menuItems?: MenuItem[];
     tabs?: BarTab[];
     tabItems?: TabItem[];
@@ -551,6 +565,10 @@ function ComandaVozWorkspace() {
       nextData.storeName || directSession?.storeName || profileStoreName || 'Bar Central',
       VALIDATION_LIMITS.STORE_NAME_MAX_LEN
     );
+    const nextAutoArchive =
+      typeof nextData.autoArchivePaidAfter10Min === 'boolean'
+        ? nextData.autoArchivePaidAfter10Min
+        : autoArchivePaidAfter10Min;
     const updatedMenu = nextData.menuItems ?? menuItems;
     const updatedTabs = nextData.tabs ?? tabs;
     const updatedTabItems = nextData.tabItems ?? tabItems;
@@ -560,6 +578,7 @@ function ComandaVozWorkspace() {
       storeCode: code,
       storeName: sName,
       catalogInitialized: true,
+      autoArchivePaidAfter10Min: nextAutoArchive,
       menuItems: updatedMenu,
       tabs: updatedTabs,
       tabItems: updatedTabItems,
@@ -944,6 +963,7 @@ function ComandaVozWorkspace() {
           const data = (await res.json()) as {
             exists?: boolean;
             catalogInitialized?: boolean;
+            autoArchivePaidAfter10Min?: boolean;
             menuItems?: MenuItem[];
             tabs?: BarTab[];
             tabItems?: TabItem[];
@@ -970,6 +990,9 @@ function ComandaVozWorkspace() {
               : buildSeededMenu();
 
             localStorage.setItem(`comanda_voz_catalog_init_${code}`, 'true');
+            if (typeof data.autoArchivePaidAfter10Min === 'boolean') {
+              setAutoArchivePaidAfter10Min(data.autoArchivePaidAfter10Min);
+            }
             setMenuItems(loadedMenu);
             setTabs(Array.isArray(data.tabs) ? data.tabs : []);
             setTabItems(Array.isArray(data.tabItems) ? data.tabItems : []);
@@ -989,6 +1012,7 @@ function ComandaVozWorkspace() {
           const localRaw = localStorage.getItem(`comanda_voz_store_${code}`);
           if (localRaw) {
             const parsed = JSON.parse(localRaw) as {
+              autoArchivePaidAfter10Min?: boolean;
               menuItems?: MenuItem[];
               tabs?: BarTab[];
               tabItems?: TabItem[];
@@ -1002,6 +1026,9 @@ function ComandaVozWorkspace() {
             const loadedTabItems = Array.isArray(parsed.tabItems) ? parsed.tabItems : [];
             const loadedOps = Array.isArray(parsed.voiceOperators) ? parsed.voiceOperators : [];
 
+            if (typeof parsed.autoArchivePaidAfter10Min === 'boolean') {
+              setAutoArchivePaidAfter10Min(parsed.autoArchivePaidAfter10Min);
+            }
             setMenuItems(loadedMenu);
             setTabs(loadedTabs);
             setTabItems(loadedTabItems);
@@ -1083,6 +1110,7 @@ function ComandaVozWorkspace() {
           setProfileUserRole(loaded.userRole);
           setProfileStoreName(loaded.storeName);
           setProfileStoreCode(loaded.storeCode);
+          setAutoArchivePaidAfter10Min(Boolean(loaded.autoArchivePaidAfter10Min));
         } else {
           const defaultUserName = sanitizeString(
             firebaseUser.displayName ||
@@ -1261,6 +1289,55 @@ function ComandaVozWorkspace() {
       setIsListening(false);
     }
   }, [isCurrentWaiterBlocked, isListening]);
+
+  // Auto-archive settled ('paid') tabs 10 minutes after payment when enabled in ADM settings
+  useEffect(() => {
+    if (!autoArchivePaidAfter10Min || !user || !isAdmin) return;
+
+    const TEN_MINUTES_MS = 10 * 60 * 1000;
+
+    const runAutoArchiveCheck = async () => {
+      if (isMutatingRef.current) return;
+      const nowMs = Date.now();
+      const expiredPaidTabs = tabs.filter(
+        (t) =>
+          t.status === 'paid' &&
+          getRemainingBalance(t) <= 0 &&
+          nowMs - getTimestampMillis(t.updatedAt) >= TEN_MINUTES_MS
+      );
+
+      if (expiredPaidTabs.length === 0) return;
+
+      const expiredIds = new Set(expiredPaidTabs.map((t) => t.id));
+      try {
+        if (isDirectSession) {
+          const localTs = makeLocalTimestamp();
+          const nextTabs = tabs.map((t) =>
+            expiredIds.has(t.id)
+              ? { ...t, status: 'archived' as TabStageStatus, updatedAt: localTs }
+              : t
+          );
+          setTabs(nextTabs);
+          await syncDirectStoreSnapshot({ tabs: nextTabs, actionType: 'remove' });
+        } else {
+          const batch = writeBatch(db);
+          for (const t of expiredPaidTabs) {
+            batch.update(doc(db, 'tabs', t.id), {
+              status: 'archived',
+              updatedAt: serverTimestamp(),
+            });
+          }
+          await batch.commit();
+        }
+      } catch (err) {
+        console.warn('[AutoArchive] Falha ao arquivar comandas pagas automaticamente:', err);
+      }
+    };
+
+    runAutoArchiveCheck();
+    const intervalId = window.setInterval(runAutoArchiveCheck, 20000);
+    return () => window.clearInterval(intervalId);
+  }, [autoArchivePaidAfter10Min, user, isAdmin, isDirectSession, tabs]);
 
   const activeStageTabs = useMemo(
     () => tabs.filter((t) => t.status !== 'archived'),
@@ -2101,6 +2178,13 @@ function ComandaVozWorkspace() {
     setFeedbackBanner(null);
 
     try {
+      // 0. Check if user is asking Marcelo to register a new product into the Cardápio
+      if (isMenuRegistrationVoiceCommand(cleanPhrase)) {
+        await registerMenuProductsFromVoice(cleanPhrase, true);
+        setCommandInput('');
+        return;
+      }
+
       // 1. Run local phonetic & multi-customer parser first
       const localStrict = parseVoiceOrderLocally(
         cleanPhrase,
@@ -2242,6 +2326,17 @@ function ComandaVozWorkspace() {
       hadActiveMic = true;
       liveAcousticTrackerRef.current.stop();
       liveAcousticTrackerRef.current = null;
+    }
+    if (menuRecognitionRef.current || isListeningMenuVoice) {
+      hadActiveMic = true;
+      try {
+        menuRecognitionRef.current?.stop();
+      } catch {
+        // ignore
+      }
+      menuRecognitionRef.current = null;
+      setIsListeningMenuVoice(false);
+      setMenuVoiceInterim('');
     }
     if (hadActiveMic) {
       await new Promise((resolve) => setTimeout(resolve, 200));
@@ -2505,6 +2600,11 @@ function ComandaVozWorkspace() {
       } catch {
         // ignore
       }
+      try {
+        menuRecognitionRef.current?.stop();
+      } catch {
+        // ignore
+      }
       liveAcousticTrackerRef.current?.stop();
     };
   }, []);
@@ -2736,6 +2836,7 @@ function ComandaVozWorkspace() {
         await syncDirectStoreSnapshot({
           storeCode: cleanCode,
           storeName: cleanStore,
+          autoArchivePaidAfter10Min,
           actionType: 'add',
         });
       } else {
@@ -2745,18 +2846,68 @@ function ComandaVozWorkspace() {
           userRole: cleanRole,
           storeName: cleanStore,
           storeCode: cleanCode,
+          autoArchivePaidAfter10Min,
           createdAt: userProfile?.createdAt || serverTimestamp(),
           updatedAt: serverTimestamp(),
         });
       }
       setFeedbackBanner({
         type: 'success',
-        message: `Dados do bar (${cleanStore}) atualizados!`,
+        message: `Configurações do bar (${cleanStore}) atualizadas!`,
       });
     } catch (err) {
       handleFirestoreError(err, OperationType.WRITE, `userProfiles/${user.uid}`);
     } finally {
       setSavingProfile(false);
+    }
+  };
+
+  // Instant toggle for ADM auto-archive paid tabs after 10 minutes
+  const handleToggleAutoArchiveSetting = async (enabled: boolean) => {
+    if (!user || !isAdmin) return;
+    setAutoArchivePaidAfter10Min(enabled);
+    try {
+      const cleanName = sanitizeString(
+        profileUserName || userProfile?.userName || directSession?.userName || 'Administrador',
+        VALIDATION_LIMITS.OPERATOR_NAME_MAX_LEN
+      );
+      const cleanRole: UserRoleType = VALIDATION_LIMITS.VALID_ROLES.includes(profileUserRole)
+        ? profileUserRole
+        : 'ADM';
+      const cleanStore = sanitizeString(
+        profileStoreName || currentStoreName,
+        VALIDATION_LIMITS.STORE_NAME_MAX_LEN
+      );
+      const cleanCode = sanitizeStoreCode(profileStoreCode || currentStoreCode, 'BAR-01');
+
+      if (isDirectSession) {
+        await syncDirectStoreSnapshot({
+          storeCode: cleanCode,
+          storeName: cleanStore,
+          autoArchivePaidAfter10Min: enabled,
+          actionType: 'add',
+        });
+      } else {
+        await setDoc(doc(db, 'userProfiles', user.uid), {
+          ownerId: user.uid,
+          userName: cleanName,
+          userRole: cleanRole,
+          storeName: cleanStore,
+          storeCode: cleanCode,
+          autoArchivePaidAfter10Min: enabled,
+          createdAt: userProfile?.createdAt || serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+      }
+      setFeedbackBanner({
+        type: 'success',
+        message: enabled
+          ? 'Arquivamento automático ativado: comandas pagas serão arquivadas após 10 minutos.'
+          : 'Arquivamento automático desativado: comandas pagas permanecerão na lista até o arquivamento manual.',
+      });
+    } catch (err) {
+      setAutoArchivePaidAfter10Min(!enabled);
+      handleFirestoreError(err, OperationType.WRITE, `userProfiles/${user.uid}`);
     }
   };
 
@@ -3336,6 +3487,48 @@ function ComandaVozWorkspace() {
     setTimeout(() => setCopiedReceipt(false), 2500);
   };
 
+  // Format and print plain-text receipt (40 columns) for 58mm/80mm thermal printers
+  const handlePrintReceipt = (tab: BarTab) => {
+    const groupedItems = getConsolidatedItemsForTab(tab.id);
+    const receiptText = formatThermalReceiptText(
+      {
+        storeName: currentStoreName,
+        customerName: tab.customerName,
+        tableLabel: tab.tableLabel,
+        statusLabel: STAGE_LABELS[tab.status],
+        totalAmount: tab.totalAmount,
+        paidAmount: tab.paidAmount,
+        itemCount: tab.itemCount,
+        paymentMethod: tab.paymentMethod,
+        items: groupedItems.map((g) => ({
+          itemName: g.itemName,
+          quantity: g.totalQuantity,
+          unitPrice: g.unitPrice,
+          totalSubtotal: g.totalSubtotal,
+        })),
+      },
+      40
+    );
+
+    if (printReceiptPreRef.current) {
+      printReceiptPreRef.current.textContent = receiptText;
+    }
+
+    try {
+      window.print();
+      setFeedbackBanner({
+        type: 'success',
+        message: `Conta de ${tab.customerName} formatada (40 colunas) e enviada para impressão térmica.`,
+      });
+    } catch {
+      setFeedbackBanner({
+        type: 'error',
+        message:
+          'Não foi possível abrir o diálogo de impressão neste dispositivo. Use o botão de copiar ao lado.',
+      });
+    }
+  };
+
   // CARDÁPIO CRUD: Add or Edit Product in Bar Menu Catalog (ADM ONLY)
   const handleAddOrUpdateMenuItem = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -3431,6 +3624,359 @@ function ComandaVozWorkspace() {
       lastMutationMsRef.current = Date.now();
       isMutatingRef.current = false;
       setSavingMenu(false);
+    }
+  };
+
+  // CARDÁPIO POR VOZ: Parse & Register 1 or more products spoken by ADM
+  const registerMenuProductsFromVoice = async (
+    transcript: string,
+    viaMarceloBar = false
+  ) => {
+    const cleanTranscript = transcript.trim();
+    if (!cleanTranscript || !user) return;
+
+    if (!isAdmin) {
+      const deniedMsg = 'Somente o ADM pode cadastrar produtos no cardápio.';
+      setFeedbackBanner({ type: 'error', message: deniedMsg });
+      speakAsMarcelo(deniedMsg, marceloVoiceReplyEnabled);
+      return;
+    }
+
+    setMenuVoiceProcessing(true);
+    try {
+      let parsed: ParsedVoiceMenuResult = parseVoiceMenuProductsLocally(cleanTranscript);
+
+      const needsAiFallback =
+        !parsed.understood ||
+        parsed.products.length === 0 ||
+        parsed.products.some((p) => p.price === null);
+
+      if (needsAiFallback) {
+        try {
+          const resp = await fetch('/api/parse-menu-product', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ transcript: cleanTranscript }),
+          });
+          if (resp.ok) {
+            const aiParsed = (await resp.json()) as ParsedVoiceMenuResult;
+            if (
+              aiParsed &&
+              aiParsed.understood &&
+              Array.isArray(aiParsed.products) &&
+              aiParsed.products.length > 0
+            ) {
+              // Prefer AI result if local failed or if AI resolved price(s) that local missed
+              const aiHasPrice = aiParsed.products.some((p) => p.price !== null);
+              if (!parsed.understood || aiHasPrice) {
+                parsed = aiParsed;
+              }
+            }
+          }
+        } catch {
+          // Keep local parse result if network/AI unavailable
+        }
+      }
+
+      if (!parsed.understood || parsed.products.length === 0) {
+        const reason =
+          parsed.unrecognizedReason ||
+          'Não consegui entender o produto e o preço. Diga por exemplo: "Skol Lata 6 reais".';
+        setFeedbackBanner({ type: 'error', message: reason });
+        speakAsMarcelo(reason, marceloVoiceReplyEnabled);
+        return;
+      }
+
+      const readyProducts = parsed.products.filter(
+        (p): p is ParsedVoiceMenuProduct & { price: number } =>
+          typeof p.price === 'number' && Number.isFinite(p.price) && p.price >= 0
+      );
+      const missingPriceProducts = parsed.products.filter((p) => p.price === null);
+
+      if (readyProducts.length === 0 && missingPriceProducts.length > 0) {
+        const firstPartial = missingPriceProducts[0];
+        setEditingMenuId(null);
+        setNewMenuName(firstPartial.name);
+        setNewMenuCategory(sanitizeCategory(firstPartial.category));
+        setNewMenuPrice('');
+        setNewMenuSynonyms(firstPartial.synonyms);
+        if (viaMarceloBar) {
+          setActiveSection('cardapio');
+        }
+        const askPriceMsg = `Reconheci "${firstPartial.name}" (${CATEGORY_LABELS[sanitizeCategory(firstPartial.category)]}). Informe ou fale o preço para salvar no cardápio.`;
+        setFeedbackBanner({ type: 'success', message: askPriceMsg });
+        speakAsMarcelo(
+          `Reconheci ${firstPartial.name}. Agora informe o preço para salvar.`,
+          marceloVoiceReplyEnabled
+        );
+        return;
+      }
+
+      // Persist all recognized products with prices into Cardápio
+      isMutatingRef.current = true;
+      lastMutationMsRef.current = Date.now();
+      const localTs = makeLocalTimestamp();
+      let workingMenu = [...menuItems];
+      const savedSummaries: string[] = [];
+
+      try {
+        for (const prod of readyProducts) {
+          const cleanName = sanitizeString(prod.name, VALIDATION_LIMITS.NAME_MAX_LEN);
+          const cleanCat = sanitizeCategory(prod.category);
+          const cleanPrice = Math.min(
+            Math.max(Number(prod.price.toFixed(2)), 0),
+            VALIDATION_LIMITS.MAX_PRICE
+          );
+          const cleanSyn = sanitizeString(
+            (prod.synonyms || '').trim() || cleanName.toLowerCase(),
+            VALIDATION_LIMITS.SYNONYMS_MAX_LEN
+          );
+
+          const existingMatch = workingMenu.find(
+            (m) => normalizeProductText(m.name) === normalizeProductText(cleanName)
+          );
+          const menuId =
+            existingMatch?.id ||
+            `menu_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+
+          const itemObj: MenuItem = {
+            id: menuId,
+            ownerId: user.uid,
+            name: cleanName,
+            category: cleanCat,
+            price: cleanPrice,
+            synonyms: cleanSyn,
+            createdAt: existingMatch?.createdAt || localTs,
+            updatedAt: localTs,
+          };
+
+          workingMenu = [
+            ...workingMenu.filter((m) => m.id !== menuId),
+            itemObj,
+          ];
+
+          if (!isDirectSession) {
+            localStorage.setItem(`comanda_voz_fb_menu_seeded_${user.uid}`, 'true');
+            if (existingMatch) {
+              await updateDoc(doc(db, 'menuItems', menuId), {
+                name: cleanName,
+                category: cleanCat,
+                price: cleanPrice,
+                synonyms: cleanSyn,
+                updatedAt: serverTimestamp(),
+              });
+            } else {
+              await setDoc(doc(db, 'menuItems', menuId), {
+                ownerId: user.uid,
+                name: cleanName,
+                category: cleanCat,
+                price: cleanPrice,
+                synonyms: cleanSyn,
+                createdAt: serverTimestamp(),
+                updatedAt: serverTimestamp(),
+              });
+            }
+          }
+
+          savedSummaries.push(
+            `${cleanName} (${formatBRL(cleanPrice)})${existingMatch ? ' [atualizado]' : ''}`
+          );
+        }
+
+        workingMenu.sort((a, b) => a.name.localeCompare(b.name, 'pt-BR'));
+        setMenuItems(workingMenu);
+
+        if (isDirectSession) {
+          await syncDirectStoreSnapshot({
+            menuItems: workingMenu,
+            actionType: 'catalog',
+          });
+        }
+      } finally {
+        lastMutationMsRef.current = Date.now();
+        isMutatingRef.current = false;
+      }
+
+      setEditingMenuId(null);
+      setNewMenuName('');
+      setNewMenuPrice('');
+      setNewMenuSynonyms('');
+
+      const successMessage =
+        savedSummaries.length === 1
+          ? `Produto cadastrado no cardápio por voz: ${savedSummaries[0]}!`
+          : `${savedSummaries.length} produtos cadastrados por voz: ${savedSummaries.join(' | ')}`;
+
+      setFeedbackBanner({ type: 'success', message: successMessage });
+
+      if (viaMarceloBar) {
+        setMarceloReport({
+          intent: 'CADASTRO_MENU',
+          title: 'Cardápio Atualizado por Voz',
+          spokenSummary: successMessage,
+          customerName: 'Cardápio do Bar',
+          stageLabel: `${savedSummaries.length} ${savedSummaries.length === 1 ? 'produto' : 'produtos'}`,
+          waiterAttribution: activeWaiterDisplay.name,
+          itemsSummary: savedSummaries,
+          totalConsumed: 0,
+          totalPaid: 0,
+          remainingBalance: 0,
+        });
+      }
+
+      speakAsMarcelo(
+        readyProducts.length === 1
+          ? `Produto ${readyProducts[0].name} cadastrado no cardápio por ${formatBRL(readyProducts[0].price)}.`
+          : `${readyProducts.length} produtos cadastrados no cardápio com sucesso!`,
+        marceloVoiceReplyEnabled
+      );
+    } catch (err) {
+      handleFirestoreError(err, OperationType.CREATE, 'menuItems');
+      setFeedbackBanner({
+        type: 'error',
+        message: 'Não foi possível salvar o produto falado no cardápio.',
+      });
+    } finally {
+      setMenuVoiceProcessing(false);
+    }
+  };
+
+  // Toggle Voice Capture specifically inside Cardápio tab
+  const toggleCardapioVoiceCapture = () => {
+    if (!isAdmin) return;
+
+    if (isListeningMenuVoice) {
+      setMenuVoiceInterim('');
+      try {
+        menuRecognitionRef.current?.stop();
+      } catch {
+        // ignore
+      }
+      menuRecognitionRef.current = null;
+      setIsListeningMenuVoice(false);
+      return;
+    }
+
+    if (typeof window !== 'undefined' && !window.isSecureContext) {
+      setFeedbackBanner({
+        type: 'error',
+        message:
+          'O microfone exige conexão HTTPS (ou localhost). Acesse o sistema via HTTPS para cadastrar produtos por voz.',
+      });
+      return;
+    }
+
+    const SpeechRecognitionCtor =
+      (window as unknown as { SpeechRecognition?: new () => SpeechRecognitionInstance })
+        .SpeechRecognition ||
+      (window as unknown as { webkitSpeechRecognition?: new () => SpeechRecognitionInstance })
+        .webkitSpeechRecognition;
+
+    if (!SpeechRecognitionCtor) {
+      setFeedbackBanner({
+        type: 'error',
+        message:
+          'Seu navegador não suporta reconhecimento de voz nativo. Use Google Chrome ou Edge.',
+      });
+      return;
+    }
+
+    // Pause main Comandas recognition if active so both never fight for the mic
+    if (isListening || recognitionRef.current) {
+      if (restartSpeechTimerRef.current) {
+        clearTimeout(restartSpeechTimerRef.current);
+        restartSpeechTimerRef.current = null;
+      }
+      shouldKeepListeningRef.current = false;
+      marceloAwakeUntilMsRef.current = 0;
+      setMarceloAwakeWindowActive(false);
+      setInterimTranscript('');
+      try {
+        recognitionRef.current?.stop();
+      } catch {
+        // ignore
+      }
+      setIsListening(false);
+    }
+
+    const recognition = new SpeechRecognitionCtor();
+    recognition.lang = 'pt-BR';
+    recognition.continuous = false;
+    recognition.interimResults = true;
+
+    recognition.onresult = (event: SpeechRecognitionEvent) => {
+      if (menuRecognitionRef.current !== recognition) return;
+      let interim = '';
+      const startIdx =
+        typeof event.resultIndex === 'number'
+          ? Math.max(0, event.resultIndex)
+          : Math.max(0, event.results.length - 1);
+
+      for (let i = startIdx; i < event.results.length; i++) {
+        const res = event.results[i];
+        if (!res || !res[0]) continue;
+        if (res.isFinal) {
+          const finalPhrase = res[0].transcript.trim();
+          setMenuVoiceInterim('');
+          if (finalPhrase) {
+            registerMenuProductsFromVoice(finalPhrase, false);
+          }
+        } else {
+          interim += res[0].transcript;
+        }
+      }
+      setMenuVoiceInterim(interim.trim());
+    };
+
+    recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
+      if (menuRecognitionRef.current !== recognition) return;
+      const errCode = event.error || 'unknown';
+      setMenuVoiceInterim('');
+      setIsListeningMenuVoice(false);
+      menuRecognitionRef.current = null;
+
+      if (errCode === 'not-allowed' || errCode === 'service-not-allowed') {
+        setFeedbackBanner({
+          type: 'error',
+          message: isInsideEmbeddedIframe()
+            ? `Permissão de microfone bloqueada nesta janela incorporada (${errCode}). Clique em "Abrir em Nova Aba" ou libere o microfone no navegador.`
+            : `Permissão de microfone negada (${errCode}): clique no cadeado da barra de endereço e libere o microfone.`,
+        });
+      } else if (errCode === 'no-speech') {
+        setFeedbackBanner({
+          type: 'error',
+          message:
+            'Nenhuma fala detectada. Clique em "Cadastrar por Voz" e diga o nome e o preço do produto.',
+        });
+      } else {
+        setFeedbackBanner({
+          type: 'error',
+          message: `Erro ao capturar voz para o cardápio (${errCode}). Tente novamente.`,
+        });
+      }
+    };
+
+    recognition.onend = () => {
+      if (menuRecognitionRef.current !== recognition) return;
+      menuRecognitionRef.current = null;
+      setMenuVoiceInterim('');
+      setIsListeningMenuVoice(false);
+    };
+
+    menuRecognitionRef.current = recognition;
+    setMenuVoiceInterim('');
+    setFeedbackBanner(null);
+    setIsListeningMenuVoice(true);
+
+    try {
+      recognition.start();
+    } catch (err) {
+      menuRecognitionRef.current = null;
+      setIsListeningMenuVoice(false);
+      setFeedbackBanner({
+        type: 'error',
+        message: describeVoiceCaptureError(err),
+      });
     }
   };
 
@@ -4201,7 +4747,13 @@ function ComandaVozWorkspace() {
 
   // MAIN WORKSPACE (DECLUTTERED, CLEAN, FEW CLICKS)
   return (
-    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col">
+    <>
+      <pre
+        ref={printReceiptPreRef}
+        aria-hidden="true"
+        className="hidden print:block font-mono text-[11px] leading-[1.35] whitespace-pre text-black bg-white p-2 m-0"
+      />
+      <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col print:hidden">
       {/* Simple 3-Zone Header */}
       <header className="flex items-center justify-between gap-4 px-4 sm:px-6 py-3.5 border-b border-slate-800 bg-slate-900 sticky top-0 z-30">
         <button
@@ -4773,6 +5325,12 @@ function ComandaVozWorkspace() {
                 </button>
               </div>
 
+              {autoArchivePaidAfter10Min && (
+                <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-emerald-950/30 border border-emerald-500/30 text-[11px] text-emerald-300">
+                  <span>Auto-arquivo ativo: comandas pagas somem após 10 min</span>
+                </div>
+              )}
+
               {/* Search */}
               <div className="relative">
                 <Search className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
@@ -4920,6 +5478,16 @@ function ComandaVozWorkspace() {
                         className="px-3.5 py-2.5 text-xs font-bold bg-sky-500 hover:bg-sky-400 text-slate-950 rounded-lg transition-colors cursor-pointer"
                       >
                         Fechar / Ouvir Conta
+                      </button>
+
+                      <button
+                        type="button"
+                        onClick={() => handlePrintReceipt(selectedTab)}
+                        title="Imprimir conta em impressora térmica (texto simples, 40 colunas)"
+                        className="inline-flex items-center gap-1.5 px-3.5 py-2.5 text-xs font-bold bg-slate-800 hover:bg-slate-700 text-slate-100 border border-slate-700 rounded-lg transition-colors cursor-pointer"
+                      >
+                        <Printer className="w-3.5 h-3.5 text-amber-400" />
+                        Imprimir Conta
                       </button>
 
                       <button
@@ -5183,9 +5751,57 @@ function ComandaVozWorkspace() {
                       {editingMenuId ? 'Editar Produto' : 'Novo Produto no Cardápio'}
                     </h2>
                     <p className="text-xs text-slate-400">
-                      Cadastre os itens e preços que o Marcelo deve reconhecer.
+                      Cadastre os itens e preços manualmente ou falando pelo microfone.
                     </p>
                   </div>
+
+                  {/* Voice Product Registration Box */}
+                  {!editingMenuId && (
+                    <div className="p-3 bg-slate-950 border border-amber-500/30 rounded-lg space-y-2 text-xs">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-semibold text-amber-300 flex items-center gap-1.5">
+                          <Mic className="w-3.5 h-3.5" />
+                          Cadastrar Produto por Voz
+                        </span>
+                        <button
+                          type="button"
+                          disabled={menuVoiceProcessing || savingMenu}
+                          onClick={toggleCardapioVoiceCapture}
+                          className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg font-bold transition-colors cursor-pointer disabled:opacity-50 ${
+                            isListeningMenuVoice
+                              ? 'bg-red-500 hover:bg-red-400 text-white animate-pulse'
+                              : 'bg-amber-500 hover:bg-amber-400 text-slate-950'
+                          }`}
+                        >
+                          {isListeningMenuVoice ? (
+                            <>
+                              <MicOff className="w-3.5 h-3.5" />
+                              Parar Escuta
+                            </>
+                          ) : (
+                            <>
+                              <Mic className="w-3.5 h-3.5" />
+                              {menuVoiceProcessing ? 'Cadastrando...' : 'Falar Produto'}
+                            </>
+                          )}
+                        </button>
+                      </div>
+
+                      {isListeningMenuVoice ? (
+                        <p className="text-emerald-400 font-medium">
+                          {menuVoiceInterim
+                            ? `Transcrevendo: "${menuVoiceInterim}"`
+                            : 'Ouvindo... Diga o nome e o preço (ex: "Skol Lata 6 reais").'}
+                        </p>
+                      ) : (
+                        <p className="text-[11px] text-slate-400 leading-relaxed">
+                          Diga por exemplo: <span className="text-slate-200">&ldquo;Skol Lata 6 reais&rdquo;</span>,{' '}
+                          <span className="text-slate-200">&ldquo;Porção de Calabresa 38 reais&rdquo;</span> ou vários juntos:{' '}
+                          <span className="text-slate-200">&ldquo;Litrão Brahma 18 reais, Água 5 reais&rdquo;</span>.
+                        </p>
+                      )}
+                    </div>
+                  )}
 
                   <form onSubmit={handleAddOrUpdateMenuItem} className="space-y-3 text-xs">
                     <div className="space-y-1">
@@ -5591,11 +6207,11 @@ function ComandaVozWorkspace() {
                     </form>
                   </div>
 
-                  {/* Store Settings */}
+                  {/* Store Settings & ADM Options */}
                   <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-3">
                     <h3 className="text-sm font-bold text-slate-100 flex items-center gap-2">
                       <Store className="w-4 h-4 text-amber-400" />
-                      Dados do Bar
+                      Dados do Bar &amp; Configurações do ADM
                     </h3>
                     <form onSubmit={handleSaveUserProfile} className="space-y-3 text-xs">
                       <div className="grid grid-cols-2 gap-2.5">
@@ -5622,6 +6238,26 @@ function ComandaVozWorkspace() {
                           />
                         </div>
                       </div>
+
+                      <label className="flex items-start gap-2.5 p-3 rounded-lg bg-slate-950 border border-slate-800 hover:border-slate-700 cursor-pointer">
+                        <input
+                          type="checkbox"
+                          checked={autoArchivePaidAfter10Min}
+                          onChange={(e) => handleToggleAutoArchiveSetting(e.target.checked)}
+                          className="mt-0.5 h-4 w-4 rounded border-slate-600 bg-slate-900 text-amber-500 accent-amber-500 cursor-pointer shrink-0"
+                        />
+                        <span className="space-y-0.5">
+                          <span className="block font-semibold text-slate-100">
+                            Arquivar comandas automaticamente após 10 minutos de pagamento
+                          </span>
+                          <span className="block text-[11px] text-slate-400 leading-relaxed">
+                            Mantém a lista de comandas limpa apenas com o que está aberto, movendo
+                            contas já pagas (zeradas) para o arquivo automaticamente 10 min após a
+                            baixa.
+                          </span>
+                        </span>
+                      </label>
+
                       <button
                         type="submit"
                         disabled={savingProfile}
@@ -6610,7 +7246,8 @@ function ComandaVozWorkspace() {
           );
         })()}
       </main>
-    </div>
+      </div>
+    </>
   );
 }
 
