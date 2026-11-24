@@ -32,7 +32,9 @@ service cloud.firestore {
       return cat is string && cat.size() <= 20 && (
         cat == 'cervejas' ||
         cat == 'doses' ||
+        cat == 'pratos' ||
         cat == 'porcoes' ||
+        cat == 'sobremesas' ||
         cat == 'sem_alcool' ||
         cat == 'outros'
       );
@@ -197,7 +199,7 @@ service cloud.firestore {
       allow create: if isVerified() &&
         isValidId(tabId) &&
         isValidBarTab(incoming()) &&
-        incoming().status == 'open' &&
+        (incoming().status == 'open' || incoming().status == 'paid') &&
         incoming().createdAt == request.time &&
         incoming().updatedAt == request.time;
       allow update: if isVerified() &&

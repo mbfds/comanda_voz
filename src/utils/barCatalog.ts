@@ -26,7 +26,15 @@ export const VALIDATION_LIMITS = {
   MAX_PRICE: 100000,
   MAX_TOTAL: 1000000,
   MAX_QTY: 500,
-  VALID_CATEGORIES: ['cervejas', 'doses', 'porcoes', 'sem_alcool', 'outros'] as ItemCategory[],
+  VALID_CATEGORIES: [
+    'cervejas',
+    'doses',
+    'pratos',
+    'porcoes',
+    'sobremesas',
+    'sem_alcool',
+    'outros',
+  ] as ItemCategory[],
   VALID_STATUSES: ['open', 'closing', 'paid', 'archived'] as TabStageStatus[],
   VALID_ROLES: ['SUPERADMIN', 'ADM', 'Proprietário', 'Garçom', 'Caixa', 'Gerente'] as UserRoleType[],
 };
@@ -54,7 +62,9 @@ export function sanitizeCategory(cat: string): ItemCategory {
 export const CATEGORY_LABELS: Record<ItemCategory, string> = {
   cervejas: 'Cervejas',
   doses: 'Doses & Drinks',
+  pratos: 'Pratos & Refeições',
   porcoes: 'Porções & Espetos',
+  sobremesas: 'Sobremesas',
   sem_alcool: 'Sem Álcool',
   outros: 'Outros',
 };
@@ -1329,12 +1339,19 @@ function parseSingleClauseStrictly(
   const norm = normalizeText(cleaned);
 
   // Detect Intent:
-  // 1) BAIXA: "dar baixa", "dar uma baixa", "dê baixa", "da baixa", "deu baixa", "abaixa a conta", "baixar", "pagou", "recebi", "quitou", "quitar", "zerar", "abater"
-  // 2) FECHAR / CONSULTAR CONTA: "fechar", "feche", "fecha", "quanto ficou", "quando ficou", "quanto deu", "quanto ta", "qual o valor", "qual o total", "ver a conta", "resumo da conta", "pediu a conta"
-  // 3) MARCAR: default when adding items
+  // 1) VENDA_AVULSA: immediate counter/walk-in sale with instant payment ("venda avulsa de litrão no pix")
+  // 2) BAIXA: "dar baixa", "pagou", "quitou", "zerar", etc.
+  // 3) FECHAR / CONSULTAR CONTA: "fechar", "quanto ficou", etc.
+  // 4) MARCAR: default when adding items to a customer/table tab
   let intent: MarceloIntent = 'MARCAR';
 
   if (
+    /\b(?:venda\s+avulsa|venda\s+direta|vendas\s+avulsas|avulsa|avulso|venda\s+(?:de\s+|no\s+)?balcao)\b/i.test(
+      norm
+    )
+  ) {
+    intent = 'VENDA_AVULSA';
+  } else if (
     /\b(baixa|dar\s+(?:a\s+|uma\s+)?baixa|dar\s+(?:a\s+)?baixar|d[aáeê]\s+(?:a\s+|uma\s+)?baixa|deu\s+(?:a\s+)?baixa|t[aá]\s+baixa|dar\s+abaixa|fazer\s+(?:a\s+|uma\s+)?baixa|faz\s+(?:a\s+|uma\s+)?baixa|abaixar|abaixa|baixar|baixe|pagou|pagar|paga|recebi|quitou|quitar|quita|zerar|zere|zera|abater)\b/i.test(
       norm
     )
@@ -1346,6 +1363,104 @@ function parseSingleClauseStrictly(
     )
   ) {
     intent = 'FECHAR';
+  }
+
+  // Handle VENDA_AVULSA (Direct Walk-in / Counter Sale — No Customer Tab/Table)
+  if (intent === 'VENDA_AVULSA') {
+    let paymentMethod = 'PIX';
+    if (/\b(?:dinheiro|especie|esp[eé]cie|cash)\b/i.test(norm)) paymentMethod = 'Dinheiro';
+    else if (/\bcr[eé]dito\b|\bcredito\b/i.test(norm)) paymentMethod = 'Cartão de Crédito';
+    else if (/\bd[eé]bito\b|\bdebito\b|\bcart[aã]o\b|\bcartao\b/i.test(norm)) {
+      paymentMethod = 'Cartão de Débito';
+    }
+
+    let cleanedSale = sanitizeVoiceTranscriptForParsing(cleaned)
+      .replace(/\b(?:no|via|em|pelo|com)\s+pix\b/gi, ' ')
+      .replace(/\b(?:no|via|em|pelo|com)\s+cart[aã]o(?:\s+de\s+(?:cr[eé]dito|d[eé]bito))?\b/gi, ' ')
+      .replace(/\b(?:no|via|em|pelo|com)\s+(?:cr[eé]dito|d[eé]bito)\b/gi, ' ')
+      .replace(/\b(?:no|via|em|pelo|com)\s+(?:dinheiro|esp[eé]cie)\b/gi, ' ')
+      .replace(/\b(?:pix|dinheiro|cart[aã]o)\s*$/i, ' ')
+      .replace(/\b(?:[àa]\s+vista|j[aá]\s+pago|j[aá]\s+baixa|dar\s+baixa|na\s+hora)\b/gi, ' ')
+      .replace(
+        /^(?:fazer|faz|lan[cç]ar|lanca|registrar|registra|passar|passa|anotar|anota|marcar|marca|botar|bota)?\s*(?:uma\s+|a\s+)?(?:venda\s+avulsa|venda\s+direta|venda\s+(?:de\s+|no\s+)?balc[aã]o|avulsa|avulso)\s*(?:de|do|da)?\s*/i,
+        ''
+      )
+      .replace(/\b(?:no\s+balc[aã]o|venda\s+avulsa|venda\s+direta|avulsa|avulso)\b/gi, ' ')
+      .replace(/\s+(?:por\s+favor|por\s+gentileza|pf|obrigado|obrigada|valeu)\s*$/i, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+    cleanedSale = cleanedSale.replace(/^(?:de|do|da)\s+/i, '').trim();
+
+    const saleSegments = cleanedSale
+      .split(/\s+e\s+|,\s*/i)
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    if (saleSegments.length === 0) {
+      return {
+        command: null,
+        errorReason:
+          'Não identifiquei qual produto foi vendido na venda avulsa. Diga por exemplo: "Marcelo, venda avulsa de litrão no pix".',
+      };
+    }
+
+    const parsedSaleItems: ParsedOrderItem[] = [];
+    for (const seg of saleSegments) {
+      const segNorm = normalizeText(seg).replace(
+        /^(?:marque|marca|marcar|coloca|coloque|adiciona|bota|poe|põe|lanca|lança|anota|mais|de|do|da)\s+/i,
+        ''
+      );
+      let qty = 1;
+      let itemSearchText = segNorm;
+
+      const qtyMatch = segNorm.match(
+        /^(\d+|um|uma|dois|duas|tres|quatro|cinco|seis|sete|oito|nove|dez)\b\s*(.*)$/
+      );
+      if (qtyMatch && qtyMatch[2]) {
+        const remainder = qtyMatch[2].trim();
+        const startsWithUnit = /^(?:litros?|l\b|mls?\b|gramas?|g\b|kg\b)/i.test(remainder);
+        if (!startsWithUnit) {
+          const qToken = qtyMatch[1];
+          qty = Number.isNaN(Number(qToken)) ? PT_NUMBERS[qToken] || 1 : parseInt(qToken, 10);
+          itemSearchText = remainder.replace(/^(de\s+)/, '').trim();
+        }
+      }
+
+      if (!itemSearchText) {
+        return {
+          command: null,
+          errorReason: `Produto incompleto na venda avulsa ("${seg}"). Nada foi lançado.`,
+        };
+      }
+
+      const matchResult = matchCatalogItemStrictly(itemSearchText, catalog);
+      if (!matchResult.item) {
+        return {
+          command: null,
+          errorReason:
+            matchResult.errorReason ||
+            `O produto "${itemSearchText}" não está cadastrado no cardápio. Nada foi lançado.`,
+        };
+      }
+
+      parsedSaleItems.push({
+        itemName: matchResult.item.name,
+        category: matchResult.item.category,
+        quantity: Math.min(Math.max(qty, 1), VALIDATION_LIMITS.MAX_QTY),
+        unitPrice: matchResult.item.price,
+      });
+    }
+
+    return {
+      command: {
+        intent: 'VENDA_AVULSA',
+        customerName: 'Venda Avulsa',
+        tableLabel: 'VENDA_AVULSA',
+        paymentMethod,
+        items: parsedSaleItems,
+      },
+    };
   }
 
   // Handle FECHAR / QUANTO FICOU A CONTA
@@ -1662,7 +1777,7 @@ export function parseVoiceOrderLocally(
   // Never split "dar" + "uma" + "baixa", "dar" + "baixa", "dá" + "baixa", "dê" + "baixa", or polite auxiliary words.
   const rawParts = withoutWake
     .split(
-      /(?:,\s*|\s+e\s+|\s+)(?=(?:marque|marca|marcar|coloca|coloque|adiciona|bota|lanca|lança|anota|feche|fecha|fechar|quanto\s+ficou|quando\s+ficou|quanto\s+deu|quando\s+deu|quanto\s+ta|dar\s+(?:a\s+|uma\s+)?baixa|dar\s+(?:a\s+)?baixar|d[aáeê]\s+(?:a\s+|uma\s+)?baixa|fazer\s+(?:a\s+|uma\s+)?baixa|faz\s+(?:a\s+|uma\s+)?baixa|baixar|quitar|zerar)\b)|(?:,\s*|\s+e\s+)(?=(?:baixa\s+(?:n[oa]|d[oa]|a\s+conta)\b))/i
+      /(?:,\s*|\s+e\s+|\s+)(?=(?:marque|marca|marcar|coloca|coloque|adiciona|bota|lanca|lança|anota|feche|fecha|fechar|quanto\s+ficou|quando\s+ficou|quanto\s+deu|quando\s+deu|quanto\s+ta|venda\s+avulsa|venda\s+direta|dar\s+(?:a\s+|uma\s+)?baixa|dar\s+(?:a\s+)?baixar|d[aáeê]\s+(?:a\s+|uma\s+)?baixa|fazer\s+(?:a\s+|uma\s+)?baixa|faz\s+(?:a\s+|uma\s+)?baixa|baixar|quitar|zerar)\b)|(?:,\s*|\s+e\s+)(?=(?:baixa\s+(?:n[oa]|d[oa]|a\s+conta)\b))/i
     )
     .map((c) => c.trim())
     .filter(Boolean);
@@ -1868,8 +1983,14 @@ export function inferProductCategory(
     if (/\b(?:dose|doses|drink|drinks|destilado|destilados|coquetel|coqueteis)\b/.test(hintNorm)) {
       return 'doses';
     }
-    if (/\b(?:porcao|porcoes|espeto|espetos|espetinho|espetinhos|petisco|petiscos|comida|lanche)\b/.test(hintNorm)) {
+    if (/\b(?:prato|pratos|refeicao|refeicoes|almoco|jantar|executivo|pf|marmita|marmitex)\b/.test(hintNorm)) {
+      return 'pratos';
+    }
+    if (/\b(?:porcao|porcoes|espeto|espetos|espetinho|espetinhos|petisco|petiscos|lanche)\b/.test(hintNorm)) {
       return 'porcoes';
+    }
+    if (/\b(?:sobremesa|sobremesas|doce|doces)\b/.test(hintNorm)) {
+      return 'sobremesas';
     }
     if (/\b(?:sem\s+alcool|nao\s+alcool|nao\s+alcoolico|refri|refrigerante|refrigerantes|agua|suco|energetico)\b/.test(hintNorm)) {
       return 'sem_alcool';
@@ -1893,7 +2014,21 @@ export function inferProductCategory(
     return 'doses';
   }
   if (
-    /\b(?:porcao|espetinho|espeto|churrasquinho|batata|fritas|calabresa|torresmo|panceta|pururuca|mandioca|aipim|macaxeira|polenta|frango|passarinho|carne|picanha|contra\s*file|alcatra|linguica|salgado|pastel|coxinha|kibe|quibe|bolinho|tira\s*gosto|petisco|amendoim|queijo|provolone|sanduiche|lanche|hamburguer|burger|xis|tapioca|isca|camarao|tilapia|peixe)\b/.test(
+    /\b(?:prato|pf|executivo|marmita|marmitex|parmegiana|strogonoff|estrogonofe|feijoada|bife|acebolado|file\s+mignon|virado|baiao|galinhada|tropeiro|macarrao|espaguete|lasanha|risoto|moqueca|salmao|omelete|salada|sopa|caldo|refeicao|almoco|jantar|self\s+service)\b/.test(
+      norm
+    )
+  ) {
+    return 'pratos';
+  }
+  if (
+    /\b(?:pudim|sorvete|acai|torta|bolo|mousse|petit\s+gateau|sobremesa|brigadeiro|brownie|pave|romeu\s+e\s+julieta|cocada|doce)\b/.test(
+      norm
+    )
+  ) {
+    return 'sobremesas';
+  }
+  if (
+    /\b(?:porcao|espetinho|espeto|churrasquinho|batata|fritas|calabresa|torresmo|panceta|pururuca|mandioca|aipim|macaxeira|polenta|frango|passarinho|carne|picanha|contra\s*file|alcatra|linguica|salgado|pastel|coxinha|kibe|quibe|bolinho|tira\s*gosto|petisco|amendoim|queijo|provolone|sanduiche|lanche|hamburguer|burger|xis|tapioca|isca|camarao|tilapia|peixe|salame)\b/.test(
       norm
     )
   ) {
@@ -2098,7 +2233,7 @@ function parseSingleMenuProductClause(clause: string): ParsedVoiceMenuProduct | 
   // Extract explicit category ("categoria cervejas", "na categoria porções", "tipo doses")
   let explicitCategoryHint = '';
   const catRegex =
-    /\b(?:na\s+categoria(?:\s+de)?|categoria(?:\s+de)?|tipo(?:\s+de)?)\s+(cervejas?|doses?(?:\s+e\s+drinks?)?|drinks?|por[cç][oõ]es?(?:\s+e\s+espetos?)?|espetos?|sem\s+[aá]lcool|n[aã]o\s+alco[oó]lic[oa]s?|outros?)\b/i;
+    /\b(?:na\s+categoria(?:\s+de)?|categoria(?:\s+de)?|tipo(?:\s+de)?)\s+(cervejas?|doses?(?:\s+e\s+drinks?)?|drinks?|pratos?(?:\s+e\s+refei[cç][oõ]es?)?|refei[cç][oõ]es?|por[cç][oõ]es?(?:\s+e\s+espetos?)?|espetos?|sobremesas?|sem\s+[aá]lcool|n[aã]o\s+alco[oó]lic[oa]s?|outros?)\b/i;
   const catMatch = catRegex.exec(working);
   if (catMatch && catMatch[1]) {
     explicitCategoryHint = catMatch[1].trim();
@@ -2403,6 +2538,95 @@ export function formatThermalReceiptText(
 
   return lines.join('\n');
 }
+
+export interface ThermalCashClosingInput {
+  storeName: string;
+  dateLabel: string;
+  operatorName: string;
+  totalReceived: number;
+  directSalesTotal: number;
+  directSalesCount: number;
+  tabsPaidTotal: number;
+  tabsPaidCount: number;
+  openReceivableTotal: number;
+  openTabsCount: number;
+  byMethod: Array<{ method: string; total: number; count: number }>;
+  printedAt?: Date;
+}
+
+/**
+ * Formats a daily Cash Register Closing (Fechamento de Caixa) summary as
+ * 40-column plain text ready for 58mm/80mm thermal printers.
+ */
+export function formatThermalCashClosingText(
+  input: ThermalCashClosingInput,
+  columns = 40
+): string {
+  const width = Math.min(48, Math.max(32, Math.round(columns)));
+  const doubleDivider = '='.repeat(width);
+  const singleDivider = '-'.repeat(width);
+  const printedDate = input.printedAt || new Date();
+  const formattedTime = printedDate.toLocaleTimeString('pt-BR', {
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+
+  const lines: string[] = [];
+  lines.push(doubleDivider);
+  lines.push(...centerTextToWidth((input.storeName || 'COMANDA VOZ').toUpperCase(), width));
+  lines.push(...centerTextToWidth('FECHAMENTO DE CAIXA', width));
+  lines.push(doubleDivider);
+  lines.push(...formatColumnsLine(`Data: ${input.dateLabel}`, `Hora: ${formattedTime}`, width));
+  lines.push(...wrapTextToWidth(`Responsavel: ${input.operatorName}`, width));
+  lines.push(singleDivider);
+  lines.push(...formatColumnsLine('ENTRADAS RECEBIDAS', 'VALOR', width));
+  lines.push(singleDivider);
+  lines.push(
+    ...formatColumnsLine(
+      `Vendas Avulsas (${input.directSalesCount})`,
+      formatPlainBRL(input.directSalesTotal),
+      width
+    )
+  );
+  lines.push(
+    ...formatColumnsLine(
+      `Comandas Pagas (${input.tabsPaidCount})`,
+      formatPlainBRL(input.tabsPaidTotal),
+      width
+    )
+  );
+  lines.push(singleDivider);
+  lines.push(...centerTextToWidth('POR FORMA DE PAGAMENTO', width));
+  if (input.byMethod.length === 0) {
+    lines.push(...centerTextToWidth('(Nenhum recebimento)', width));
+  } else {
+    for (const row of input.byMethod) {
+      lines.push(
+        ...formatColumnsLine(
+          `${stripThermalUnsafeChars(row.method)} (${row.count})`,
+          formatPlainBRL(row.total),
+          width
+        )
+      );
+    }
+  }
+  lines.push(doubleDivider);
+  lines.push(...formatColumnsLine('TOTAL EM CAIXA:', formatPlainBRL(input.totalReceived), width));
+  lines.push(
+    ...formatColumnsLine(
+      `Em Aberto Mesas (${input.openTabsCount}):`,
+      formatPlainBRL(input.openReceivableTotal),
+      width
+    )
+  );
+  lines.push(doubleDivider);
+  lines.push('');
+  lines.push(...centerTextToWidth('Comanda Voz - Bar & Restaurante', width));
+  lines.push('');
+
+  return lines.join('\n');
+}
+
 
 
 

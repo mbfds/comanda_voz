@@ -1,10 +1,17 @@
 import { Timestamp } from 'firebase/firestore';
 
-export type ItemCategory = 'cervejas' | 'doses' | 'porcoes' | 'sem_alcool' | 'outros';
+export type ItemCategory =
+  | 'cervejas'
+  | 'doses'
+  | 'pratos'
+  | 'porcoes'
+  | 'sobremesas'
+  | 'sem_alcool'
+  | 'outros';
 
 export type TabStageStatus = 'open' | 'closing' | 'paid' | 'archived';
 
-export type MarceloIntent = 'MARCAR' | 'FECHAR' | 'BAIXA';
+export type MarceloIntent = 'MARCAR' | 'FECHAR' | 'BAIXA' | 'VENDA_AVULSA';
 
 export type UserRoleType = 'SUPERADMIN' | 'ADM' | 'Proprietário' | 'Garçom' | 'Caixa' | 'Gerente';
 

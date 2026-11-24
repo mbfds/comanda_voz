@@ -82,7 +82,7 @@
         "category": {
           "type": "string",
           "description": "Categoria do item.",
-          "enum": ["cervejas", "doses", "porcoes", "sem_alcool", "outros"]
+          "enum": ["cervejas", "doses", "pratos", "porcoes", "sobremesas", "sem_alcool", "outros"]
         },
         "price": {
           "type": "number",
@@ -212,7 +212,7 @@
         "category": {
           "type": "string",
           "description": "Categoria do item lançado.",
-          "enum": ["cervejas", "doses", "porcoes", "sem_alcool", "outros"]
+          "enum": ["cervejas", "doses", "pratos", "porcoes", "sobremesas", "sem_alcool", "outros"]
         },
         "quantity": {
           "type": "number",

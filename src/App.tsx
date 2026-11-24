@@ -55,6 +55,11 @@ import {
   BarChart3,
   Award,
   Printer,
+  LayoutGrid,
+  List,
+  Wallet,
+  ShoppingBag,
+  Calendar,
 } from 'lucide-react';
 import {
   auth,
@@ -84,6 +89,7 @@ import {
   DEFAULT_BAR_MENU,
   extractCommandAfterMarceloWakeWord,
   formatBRL,
+  formatThermalCashClosingText,
   formatThermalReceiptText,
   isMenuRegistrationVoiceCommand,
   normalizePhoneticPt,
@@ -142,7 +148,7 @@ interface SpeechRecognitionInstance extends EventTarget {
   onend: (() => void) | null;
 }
 
-type ActiveSection = 'comandas' | 'cardapio' | 'vendas' | 'equipe_comercio' | 'superadmin';
+type ActiveSection = 'comandas' | 'caixa' | 'cardapio' | 'vendas' | 'equipe_comercio' | 'superadmin';
 
 interface DirectBarSession {
   uid: string;
@@ -208,7 +214,7 @@ interface LastActionUndo {
 }
 
 interface MarceloReportCard {
-  intent: 'MARCAR' | 'FECHAR' | 'BAIXA' | 'CADASTRO_MENU';
+  intent: 'MARCAR' | 'FECHAR' | 'BAIXA' | 'VENDA_AVULSA' | 'CADASTRO_MENU';
   title: string;
   spokenSummary: string;
   customerName: string;
@@ -236,7 +242,18 @@ const SIMPLE_VOICE_EXAMPLES = [
     stage: '3. Dar Baixa',
     phrase: 'Dar baixa na conta do Tiago',
   },
+  {
+    stage: '4. Venda Avulsa',
+    phrase: 'Marcelo, venda avulsa de litrão no pix',
+  },
 ];
+
+function toLocalDateInputValue(date: Date): string {
+  const y = date.getFullYear();
+  const m = String(date.getMonth() + 1).padStart(2, '0');
+  const d = String(date.getDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
 
 function getTimestampMillis(ts: unknown): number {
   if (!ts) return Date.now();
@@ -403,6 +420,11 @@ function ComandaVozWorkspace() {
     [isSuperAdmin, currentUserRole]
   );
 
+  const canAccessCaixa = useMemo(
+    () => isAdmin || currentUserRole === 'Gerente' || currentUserRole === 'Caixa',
+    [isAdmin, currentUserRole]
+  );
+
   // Marcelo Assistant & Open-Microphone ("MARCELO" Wake-Word + Bluetooth + Biometrics) State
   const [commandInput, setCommandInput] = useState('');
   const [interimTranscript, setInterimTranscript] = useState('');
@@ -441,11 +463,21 @@ function ComandaVozWorkspace() {
   const [marceloReport, setMarceloReport] = useState<MarceloReportCard | null>(null);
   const [lastUndo, setLastUndo] = useState<LastActionUndo | null>(null);
 
-  // Selected Tab & Stage Filters
+  // Selected Tab, Table Map, Category Filters, Venda Avulsa & Caixa State
   const [selectedTabId, setSelectedTabId] = useState<string | null>(null);
   const [stageFilter, setStageFilter] = useState<'all' | 'open' | 'closing' | 'paid'>('all');
+  const [comandasViewMode, setComandasViewMode] = useState<'lista' | 'mesas'>('lista');
+  const [quickAddCategoryFilter, setQuickAddCategoryFilter] = useState<'all' | ItemCategory>('all');
+  const [cardapioCategoryFilter, setCardapioCategoryFilter] = useState<'all' | ItemCategory>('all');
   const [searchQuery, setSearchQuery] = useState('');
   const [copiedReceipt, setCopiedReceipt] = useState(false);
+
+  // Venda Avulsa (Walk-in / Counter Sale — No Customer Tab) & Caixa Fechamento State
+  const [showQuickVendaAvulsa, setShowQuickVendaAvulsa] = useState(false);
+  const [avulsaMenuId, setAvulsaMenuId] = useState('');
+  const [avulsaQty, setAvulsaQty] = useState(1);
+  const [avulsaPaymentMethod, setAvulsaPaymentMethod] = useState('PIX');
+  const [caixaDateKey, setCaixaDateKey] = useState(() => toLocalDateInputValue(new Date()));
 
   // New Tab Inline Form
   const [newCustomerName, setNewCustomerName] = useState('');
@@ -1301,6 +1333,7 @@ function ComandaVozWorkspace() {
       const nowMs = Date.now();
       const expiredPaidTabs = tabs.filter(
         (t) =>
+          t.tableLabel !== 'VENDA_AVULSA' &&
           t.status === 'paid' &&
           getRemainingBalance(t) <= 0 &&
           nowMs - getTimestampMillis(t.updatedAt) >= TEN_MINUTES_MS
@@ -1340,7 +1373,7 @@ function ComandaVozWorkspace() {
   }, [autoArchivePaidAfter10Min, user, isAdmin, isDirectSession, tabs]);
 
   const activeStageTabs = useMemo(
-    () => tabs.filter((t) => t.status !== 'archived'),
+    () => tabs.filter((t) => t.status !== 'archived' && t.tableLabel !== 'VENDA_AVULSA'),
     [tabs]
   );
 
@@ -2130,6 +2163,205 @@ function ComandaVozWorkspace() {
     }
   };
 
+  // VENDA AVULSA (Direct Walk-in / Counter Sale — immediately settled, NEVER tied to any customer tab or table)
+  const executeStageVendaAvulsa = async (
+    items: ParsedSingleCommand['items'],
+    paymentMethod = 'PIX',
+    rawTranscript: string,
+    sourceType: 'voz' | 'manual' | 'rapido',
+    waiterNameAttr: string,
+    storeNameAttr: string
+  ) => {
+    if (!user || !items || items.length === 0) return;
+    if (isCurrentWaiterBlocked) {
+      setFeedbackBanner({
+        type: 'error',
+        message:
+          'Acesso bloqueado pelo ADM: você está impedido de realizar novos lançamentos.',
+      });
+      return;
+    }
+
+    const cleanPayMethod = sanitizeString(paymentMethod, 40, 'PIX');
+    const cleanTranscript = sanitizeString(
+      rawTranscript,
+      VALIDATION_LIMITS.TRANSCRIPT_MAX_LEN,
+      'Venda Avulsa'
+    );
+    const cleanWaiterName = sanitizeString(
+      waiterNameAttr,
+      VALIDATION_LIMITS.OPERATOR_NAME_MAX_LEN,
+      'Caixa'
+    );
+    const cleanStoreName = sanitizeString(
+      storeNameAttr,
+      VALIDATION_LIMITS.STORE_NAME_MAX_LEN,
+      'Bar Central'
+    );
+
+    const saleTabId = `tab_avulsa_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+    const localTs = makeLocalTimestamp();
+    const newLocalItems: TabItem[] = [];
+    const addedItemIds: string[] = [];
+    const itemParts: string[] = [];
+    const summaryLines: string[] = [];
+
+    let totalSaleAmount = 0;
+    let totalSaleCount = 0;
+
+    for (const rawItem of items) {
+      const qty = Math.min(
+        Math.max(Math.round(Number(rawItem.quantity) || 1), 1),
+        VALIDATION_LIMITS.MAX_QTY
+      );
+      const unitPrice = Math.min(
+        Math.max(Number(rawItem.unitPrice) || 0, 0),
+        VALIDATION_LIMITS.MAX_PRICE
+      );
+      const subtotal = Math.min(
+        Number((qty * unitPrice).toFixed(2)),
+        VALIDATION_LIMITS.MAX_TOTAL
+      );
+      const itemName = sanitizeString(
+        rawItem.itemName,
+        VALIDATION_LIMITS.NAME_MAX_LEN,
+        'Item'
+      );
+      const category = sanitizeCategory(rawItem.category);
+      const itemId = `item_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`;
+
+      newLocalItems.push({
+        id: itemId,
+        ownerId: user.uid,
+        tabId: saleTabId,
+        customerName: 'Venda Avulsa',
+        itemName,
+        category,
+        quantity: qty,
+        unitPrice,
+        totalPrice: subtotal,
+        source: sourceType,
+        voiceTranscript: cleanTranscript,
+        launchedByName: cleanWaiterName,
+        storeName: cleanStoreName,
+        createdAt: localTs,
+        updatedAt: localTs,
+      });
+
+      totalSaleAmount = Math.min(
+        Number((totalSaleAmount + subtotal).toFixed(2)),
+        VALIDATION_LIMITS.MAX_TOTAL
+      );
+      totalSaleCount = Math.min(totalSaleCount + qty, 10000);
+      addedItemIds.push(itemId);
+      itemParts.push(`${qty}x ${itemName}`);
+      summaryLines.push(`${qty}x ${itemName} (${formatBRL(subtotal)})`);
+    }
+
+    const saleTabObj: BarTab = {
+      id: saleTabId,
+      ownerId: user.uid,
+      customerName: 'Venda Avulsa',
+      tableLabel: 'VENDA_AVULSA',
+      status: 'paid',
+      totalAmount: totalSaleAmount,
+      paidAmount: totalSaleAmount,
+      itemCount: totalSaleCount,
+      paymentMethod: cleanPayMethod,
+      createdAt: localTs,
+      updatedAt: localTs,
+    };
+
+    try {
+      if (isDirectSession) {
+        const nextTabs = [saleTabObj, ...tabs];
+        const nextTabItems = [...newLocalItems, ...tabItems];
+        setTabs(nextTabs);
+        setTabItems(nextTabItems);
+        await syncDirectStoreSnapshot({
+          tabs: nextTabs,
+          tabItems: nextTabItems,
+          actionType: 'add',
+        });
+      } else {
+        const batch = writeBatch(db);
+        for (const newItem of newLocalItems) {
+          batch.set(doc(db, 'tabItems', newItem.id), {
+            ownerId: newItem.ownerId,
+            tabId: newItem.tabId,
+            customerName: newItem.customerName,
+            itemName: newItem.itemName,
+            category: newItem.category,
+            quantity: newItem.quantity,
+            unitPrice: newItem.unitPrice,
+            totalPrice: newItem.totalPrice,
+            source: newItem.source,
+            voiceTranscript: newItem.voiceTranscript,
+            launchedByName: newItem.launchedByName,
+            storeName: newItem.storeName,
+            createdAt: serverTimestamp(),
+            updatedAt: serverTimestamp(),
+          });
+        }
+        batch.set(doc(db, 'tabs', saleTabId), {
+          ownerId: user.uid,
+          customerName: 'Venda Avulsa',
+          tableLabel: 'VENDA_AVULSA',
+          status: 'paid',
+          totalAmount: totalSaleAmount,
+          paidAmount: totalSaleAmount,
+          itemCount: totalSaleCount,
+          paymentMethod: cleanPayMethod,
+          createdAt: serverTimestamp(),
+          updatedAt: serverTimestamp(),
+        });
+        await batch.commit();
+      }
+
+      const spokenText = `Venda avulsa registrada e baixada no ${cleanPayMethod}! ${itemParts.join(', ')} — Total: ${formatBRL(totalSaleAmount)}.`;
+
+      setMarceloReport({
+        intent: 'VENDA_AVULSA',
+        title: `Venda Avulsa (Balcão) — Baixa no ${cleanPayMethod}`,
+        spokenSummary: spokenText,
+        customerName: 'Venda Avulsa (Sem Mesa)',
+        stageLabel: 'Paga no Balcão (Caixa)',
+        waiterAttribution: cleanWaiterName,
+        itemsSummary: summaryLines,
+        totalConsumed: totalSaleAmount,
+        totalPaid: totalSaleAmount,
+        remainingBalance: 0,
+      });
+
+      setFeedbackBanner({
+        type: 'success',
+        message: spokenText,
+      });
+      speakAsMarcelo(spokenText, marceloVoiceReplyEnabled);
+
+      if (isAdmin) {
+        setLastUndo({
+          description: `Venda avulsa (${itemParts.join(', ')} - ${cleanPayMethod})`,
+          tabsAffected: [
+            {
+              tabId: saleTabId,
+              createdNewTab: true,
+              customerName: 'Venda Avulsa',
+              tableLabel: 'VENDA_AVULSA',
+              previousTotal: 0,
+              previousPaid: 0,
+              previousCount: 0,
+              previousStatus: 'paid',
+            },
+          ],
+          addedItemIds,
+        });
+      }
+    } catch (err) {
+      handleFirestoreError(err, OperationType.WRITE, 'tabs/tabItems');
+    }
+  };
+
   // Master Command Dispatcher for Virtual Assistant "MARCELO"
   const processOrderPhrase = async (
     phrase: string,
@@ -2248,6 +2480,16 @@ function ComandaVozWorkspace() {
       }
 
       for (const cmd of finalParsed.commands) {
+        if (cmd.intent === 'VENDA_AVULSA') {
+          if (!cmd.items || cmd.items.length === 0) {
+            const abortMsg = 'Não identifiquei qual produto foi vendido na venda avulsa.';
+            setMarceloReport(null);
+            setFeedbackBanner({ type: 'error', message: abortMsg });
+            speakAsMarcelo(abortMsg, marceloVoiceReplyEnabled);
+            return;
+          }
+          continue;
+        }
         if (!cmd.customerName || cmd.customerName.trim().length < 2) {
           const abortMsg = 'Faltou dizer o nome do cliente.';
           setMarceloReport(null);
@@ -2264,9 +2506,21 @@ function ComandaVozWorkspace() {
         }
       }
 
+      const vendaAvulsaCmds = finalParsed.commands.filter((c) => c.intent === 'VENDA_AVULSA');
       const marcarCmds = finalParsed.commands.filter((c) => c.intent === 'MARCAR');
       const fecharCmds = finalParsed.commands.filter((c) => c.intent === 'FECHAR');
       const baixaCmds = finalParsed.commands.filter((c) => c.intent === 'BAIXA');
+
+      for (const vCmd of vendaAvulsaCmds) {
+        await executeStageVendaAvulsa(
+          vCmd.items,
+          vCmd.paymentMethod || 'PIX',
+          cleanPhrase,
+          sourceType,
+          waiterAttr,
+          storeAttr
+        );
+      }
 
       if (marcarCmds.length > 0) {
         await executeMultiCustomerStage1Marcar(
@@ -4426,7 +4680,7 @@ function ComandaVozWorkspace() {
               Marque, consulte e dê baixa nas comandas falando com o Marcelo.
             </h1>
             <p className="text-sm sm:text-base text-slate-300 leading-relaxed">
-              Simples e direto para a correria do bar:
+              Sistema completo para Bar e Restaurante — comandas, mapa de mesas, venda avulsa e fechamento de caixa:
             </p>
             <div className="space-y-2.5 text-sm text-slate-300">
               <div className="p-3 bg-slate-900 border border-slate-800 rounded-lg">
@@ -4438,8 +4692,8 @@ function ComandaVozWorkspace() {
                 conta do Tiago?&rdquo; ou &ldquo;Feche a conta do Tiago&rdquo;
               </div>
               <div className="p-3 bg-slate-900 border border-slate-800 rounded-lg">
-                <strong className="text-emerald-400">3. Dar Baixa:</strong> &ldquo;Dar baixa na
-                conta do Tiago&rdquo;
+                <strong className="text-emerald-400">3. Dar Baixa &amp; Venda Avulsa:</strong>{' '}
+                &ldquo;Dar baixa no Tiago&rdquo; ou &ldquo;Marcelo, venda avulsa de litrão no pix&rdquo;
               </div>
             </div>
           </div>
@@ -4759,9 +5013,14 @@ function ComandaVozWorkspace() {
         <button
           type="button"
           onClick={() => setActiveSection('comandas')}
-          className="text-base sm:text-lg font-bold tracking-tight text-slate-50 whitespace-nowrap shrink-0 cursor-pointer"
+          className="text-left whitespace-nowrap shrink-0 cursor-pointer"
         >
-          {currentStoreName} · <span className="text-amber-400">Marcelo</span>
+          <span className="text-base sm:text-lg font-bold tracking-tight text-slate-50 block leading-tight">
+            {currentStoreName} · <span className="text-amber-400">Marcelo</span>
+          </span>
+          <span className="text-[11px] text-slate-400 block leading-none mt-0.5">
+            Gestão de Bar &amp; Restaurante
+          </span>
         </button>
 
         {/* Clean Top Navigation */}
@@ -4777,6 +5036,19 @@ function ComandaVozWorkspace() {
           >
             Comandas ({activeStageTabs.length})
           </button>
+          {canAccessCaixa && (
+            <button
+              type="button"
+              onClick={() => setActiveSection('caixa')}
+              className={`py-1 transition-colors whitespace-nowrap cursor-pointer ${
+                activeSection === 'caixa'
+                  ? 'text-emerald-400 font-bold underline underline-offset-8 decoration-2'
+                  : 'hover:text-slate-100'
+              }`}
+            >
+              Caixa
+            </button>
+          )}
           <button
             type="button"
             onClick={() => setActiveSection('cardapio')}
@@ -4913,7 +5185,7 @@ function ComandaVozWorkspace() {
                       : commandInput
                   }
                   onChange={(e) => setCommandInput(e.target.value)}
-                  placeholder='Com microfone aberto, diga: "Marcelo, marca 1 litrão para Tiago" ou "Marcelo, dar baixa no Tiago"'
+                  placeholder='Diga: "Marcelo, marca 1 litrão para Tiago" ou "Marcelo, venda avulsa de litrão no pix"'
                   disabled={isProcessingCommand || isCurrentWaiterBlocked}
                   className="w-full bg-slate-950 border border-slate-700 focus:border-amber-500 rounded-lg px-4 py-3.5 text-sm text-slate-100 placeholder:text-slate-500 focus:outline-none disabled:opacity-50"
                 />
@@ -5153,7 +5425,10 @@ function ComandaVozWorkspace() {
                       Ouvir
                     </button>
                   )}
-                  {isAdmin && lastUndo && marceloReport?.intent === 'MARCAR' && (
+                  {isAdmin &&
+                    lastUndo &&
+                    (marceloReport?.intent === 'MARCAR' ||
+                      marceloReport?.intent === 'VENDA_AVULSA') && (
                     <button
                       type="button"
                       onClick={handleUndoLastLaunch}
@@ -5218,22 +5493,158 @@ function ComandaVozWorkspace() {
         {/* SECTION 1: COMANDAS (SIMPLE 2-COLUMN LAYOUT) */}
         {activeSection === 'comandas' && (
           <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 items-start">
-            {/* Left Column: Customer Tabs List */}
+            {/* Left Column: Customer Tabs List + Mapa de Mesas + Quick Venda Avulsa */}
             <div className="lg:col-span-5 bg-slate-900 border border-slate-800 rounded-xl p-4 space-y-3.5">
-              <div className="flex items-center justify-between gap-2">
-                <h2 className="text-base font-bold text-slate-100">
-                  Clientes ({filteredTabs.length})
-                </h2>
-                <button
-                  type="button"
-                  disabled={isCurrentWaiterBlocked}
-                  onClick={() => setShowNewTabForm((prev) => !prev)}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-slate-950 rounded-lg transition-colors cursor-pointer"
-                >
-                  <UserPlus className="w-3.5 h-3.5" />
-                  Nova Comanda
-                </button>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <h2 className="text-base font-bold text-slate-100">
+                    {comandasViewMode === 'mesas'
+                      ? 'Mapa de Mesas'
+                      : `Clientes (${filteredTabs.length})`}
+                  </h2>
+                  <div className="inline-flex p-0.5 bg-slate-950 border border-slate-800 rounded-lg text-[11px]">
+                    <button
+                      type="button"
+                      onClick={() => setComandasViewMode('lista')}
+                      className={`inline-flex items-center gap-1 px-2 py-1 rounded font-medium cursor-pointer ${
+                        comandasViewMode === 'lista'
+                          ? 'bg-slate-800 text-amber-400'
+                          : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      <List className="w-3 h-3" />
+                      Lista
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setComandasViewMode('mesas')}
+                      className={`inline-flex items-center gap-1 px-2 py-1 rounded font-medium cursor-pointer ${
+                        comandasViewMode === 'mesas'
+                          ? 'bg-slate-800 text-amber-400'
+                          : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      <LayoutGrid className="w-3 h-3" />
+                      Mesas
+                    </button>
+                  </div>
+                </div>
+
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    disabled={isCurrentWaiterBlocked}
+                    onClick={() => {
+                      if (!avulsaMenuId && menuItems.length > 0) {
+                        setAvulsaMenuId(menuItems[0].id);
+                      }
+                      setShowQuickVendaAvulsa((prev) => !prev);
+                      setShowNewTabForm(false);
+                    }}
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/40 disabled:opacity-40 text-emerald-300 rounded-lg transition-colors cursor-pointer"
+                  >
+                    <ShoppingBag className="w-3.5 h-3.5" />
+                    Avulsa
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isCurrentWaiterBlocked}
+                    onClick={() => {
+                      setShowNewTabForm((prev) => !prev);
+                      setShowQuickVendaAvulsa(false);
+                    }}
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-semibold bg-amber-500 hover:bg-amber-400 disabled:opacity-40 text-slate-950 rounded-lg transition-colors cursor-pointer"
+                  >
+                    <UserPlus className="w-3.5 h-3.5" />
+                    Nova Comanda
+                  </button>
+                </div>
               </div>
+
+              {showQuickVendaAvulsa && (
+                <form
+                  onSubmit={async (e) => {
+                    e.preventDefault();
+                    const chosen =
+                      menuItems.find((m) => m.id === avulsaMenuId) || menuItems[0];
+                    if (!chosen) return;
+                    await executeStageVendaAvulsa(
+                      [
+                        {
+                          itemName: chosen.name,
+                          category: chosen.category,
+                          quantity: Math.max(1, avulsaQty),
+                          unitPrice: chosen.price,
+                        },
+                      ],
+                      avulsaPaymentMethod,
+                      `Venda avulsa ${avulsaQty}x ${chosen.name} (${avulsaPaymentMethod})`,
+                      'manual',
+                      activeWaiterDisplay.name,
+                      activeWaiterDisplay.storeName
+                    );
+                    setAvulsaQty(1);
+                    setShowQuickVendaAvulsa(false);
+                  }}
+                  className="p-3 bg-emerald-950/30 border border-emerald-500/40 rounded-lg space-y-2.5 text-xs"
+                >
+                  <div className="flex items-center justify-between">
+                    <span className="font-bold text-emerald-300">
+                      Venda Avulsa (Balcão · Sem Mesa)
+                    </span>
+                    <span className="text-[11px] text-slate-400">Vai direto pro Caixa</span>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-12 gap-2">
+                    <select
+                      value={avulsaMenuId || menuItems[0]?.id || ''}
+                      onChange={(e) => setAvulsaMenuId(e.target.value)}
+                      className="sm:col-span-6 bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-2 text-slate-100"
+                    >
+                      {menuItems.map((m) => (
+                        <option key={m.id} value={m.id}>
+                          {m.name} ({formatBRL(m.price)})
+                        </option>
+                      ))}
+                    </select>
+                    <input
+                      type="number"
+                      min={1}
+                      max={100}
+                      value={avulsaQty}
+                      onChange={(e) =>
+                        setAvulsaQty(Math.max(1, parseInt(e.target.value || '1', 10) || 1))
+                      }
+                      className="sm:col-span-2 bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-2 text-slate-100 font-mono text-center"
+                    />
+                    <select
+                      value={avulsaPaymentMethod}
+                      onChange={(e) => setAvulsaPaymentMethod(e.target.value)}
+                      className="sm:col-span-4 bg-slate-900 border border-slate-700 rounded-lg px-2.5 py-2 text-slate-100"
+                    >
+                      <option value="PIX">PIX</option>
+                      <option value="Dinheiro">Dinheiro</option>
+                      <option value="Cartão de Débito">Débito</option>
+                      <option value="Cartão de Crédito">Crédito</option>
+                    </select>
+                  </div>
+                  <div className="flex justify-end gap-2">
+                    <button
+                      type="button"
+                      onClick={() => setShowQuickVendaAvulsa(false)}
+                      className="px-3 py-1.5 text-slate-400 hover:text-slate-200 cursor-pointer"
+                    >
+                      Cancelar
+                    </button>
+                    <button
+                      type="submit"
+                      disabled={menuItems.length === 0}
+                      className="px-3.5 py-1.5 font-bold bg-emerald-500 text-slate-950 rounded-md hover:bg-emerald-400 disabled:opacity-40 cursor-pointer"
+                    >
+                      Baixar no Caixa
+                    </button>
+                  </div>
+                </form>
+              )}
 
               {showNewTabForm && (
                 <form
@@ -5254,7 +5665,7 @@ function ComandaVozWorkspace() {
                       type="text"
                       value={newTableLabel}
                       onChange={(e) => setNewTableLabel(e.target.value)}
-                      placeholder="Mesa (opcional)"
+                      placeholder="Mesa (ex: Mesa 04)"
                       maxLength={40}
                       className="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-100 focus:outline-none focus:border-amber-500"
                     />
@@ -5277,147 +5688,262 @@ function ComandaVozWorkspace() {
                 </form>
               )}
 
-              {/* Simple Stage Filter */}
-              <div className="grid grid-cols-4 gap-1 p-1 bg-slate-950 border border-slate-800 rounded-lg text-xs">
-                <button
-                  type="button"
-                  onClick={() => setStageFilter('all')}
-                  className={`py-1.5 rounded font-medium cursor-pointer ${
-                    stageFilter === 'all'
-                      ? 'bg-slate-800 text-slate-100'
-                      : 'text-slate-400 hover:text-slate-200'
-                  }`}
-                >
-                  Todas ({stageCounts.all})
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setStageFilter('open')}
-                  className={`py-1.5 rounded font-medium cursor-pointer ${
-                    stageFilter === 'open'
-                      ? 'bg-amber-500/20 text-amber-300'
-                      : 'text-slate-400 hover:text-slate-200'
-                  }`}
-                >
-                  Abertas ({stageCounts.open})
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setStageFilter('closing')}
-                  className={`py-1.5 rounded font-medium cursor-pointer ${
-                    stageFilter === 'closing'
-                      ? 'bg-sky-500/20 text-sky-300'
-                      : 'text-slate-400 hover:text-slate-200'
-                  }`}
-                >
-                  Fechando ({stageCounts.closing})
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setStageFilter('paid')}
-                  className={`py-1.5 rounded font-medium cursor-pointer ${
-                    stageFilter === 'paid'
-                      ? 'bg-emerald-500/20 text-emerald-300'
-                      : 'text-slate-400 hover:text-slate-200'
-                  }`}
-                >
-                  Pagas ({stageCounts.paid})
-                </button>
-              </div>
+              {comandasViewMode === 'mesas' ? (
+                <div className="space-y-3">
+                  <div className="grid grid-cols-3 gap-2">
+                    {Array.from({ length: 12 }, (_, idx) => {
+                      const numStr = String(idx + 1).padStart(2, '0');
+                      const tableNormKey = `mesa ${idx + 1}`;
+                      const matchingTabs = activeStageTabs.filter((t) => {
+                        const tLabelNorm = normalizeText(t.tableLabel || '');
+                        const tNameNorm = normalizeText(t.customerName || '');
+                        return (
+                          tLabelNorm === tableNormKey ||
+                          tLabelNorm === `mesa ${numStr}` ||
+                          tNameNorm === tableNormKey ||
+                          tNameNorm === `mesa ${numStr}`
+                        );
+                      });
+                      const primaryTab = matchingTabs[0] || null;
+                      const tableRemaining = matchingTabs.reduce(
+                        (acc, t) => acc + getRemainingBalance(t),
+                        0
+                      );
+                      const isSelected = Boolean(
+                        primaryTab && selectedTab?.id === primaryTab.id
+                      );
+                      const statusStyle = !primaryTab
+                        ? 'bg-slate-950 border-slate-800 text-slate-400 hover:border-slate-700'
+                        : primaryTab.status === 'closing'
+                          ? 'bg-sky-950/40 border-sky-500/60 text-sky-200'
+                          : primaryTab.status === 'paid' && tableRemaining <= 0
+                            ? 'bg-emerald-950/40 border-emerald-500/50 text-emerald-200'
+                            : 'bg-amber-950/30 border-amber-500/60 text-amber-100';
 
-              {autoArchivePaidAfter10Min && (
-                <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-emerald-950/30 border border-emerald-500/30 text-[11px] text-emerald-300">
-                  <span>Auto-arquivo ativo: comandas pagas somem após 10 min</span>
-                </div>
-              )}
+                      return (
+                        <button
+                          key={numStr}
+                          type="button"
+                          onClick={() => {
+                            if (primaryTab) {
+                              setSelectedTabId(primaryTab.id);
+                              setShowBaixaDrawer(false);
+                            } else {
+                              setNewTableLabel(`Mesa ${numStr}`);
+                              setNewCustomerName(`Mesa ${numStr}`);
+                              setShowNewTabForm(true);
+                            }
+                          }}
+                          className={`p-2.5 rounded-lg border text-left transition-colors cursor-pointer ${statusStyle} ${
+                            isSelected ? 'ring-2 ring-amber-400' : ''
+                          }`}
+                        >
+                          <div className="flex items-center justify-between text-xs font-bold">
+                            <span>Mesa {numStr}</span>
+                            <span className="text-[10px] font-normal opacity-80">
+                              {!primaryTab
+                                ? 'Livre'
+                                : primaryTab.status === 'closing'
+                                  ? 'Fechando'
+                                  : primaryTab.status === 'paid' && tableRemaining <= 0
+                                    ? 'Paga'
+                                    : 'Ocupada'}
+                            </span>
+                          </div>
+                          {primaryTab ? (
+                            <div className="mt-1 space-y-0.5">
+                              <div className="text-[11px] truncate text-slate-200">
+                                {primaryTab.customerName}
+                              </div>
+                              <div className="text-xs font-mono font-bold text-amber-400">
+                                {formatBRL(tableRemaining)}
+                              </div>
+                            </div>
+                          ) : (
+                            <div className="mt-2 text-[10px] text-slate-500">+ Abrir</div>
+                          )}
+                        </button>
+                      );
+                    })}
+                  </div>
 
-              {/* Search */}
-              <div className="relative">
-                <Search className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
-                <input
-                  type="text"
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  placeholder="Buscar cliente (ex: Tiago / Thiago)..."
-                  className="w-full bg-slate-950 border border-slate-800 rounded-lg pl-9 pr-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-slate-600"
-                />
-              </div>
-
-              {/* Customer List */}
-              {dataLoading ? (
-                <div className="space-y-2 py-4">
-                  {[1, 2, 3].map((n) => (
-                    <div
-                      key={n}
-                      className="h-14 bg-slate-950 border border-slate-800/60 rounded-lg animate-pulse"
-                    />
-                  ))}
-                </div>
-              ) : filteredTabs.length === 0 ? (
-                <div className="text-center py-8 px-4 border border-dashed border-slate-800 rounded-lg space-y-1">
-                  <p className="text-sm font-medium text-slate-300">Nenhuma comanda aberta</p>
-                  <p className="text-xs text-slate-500">
-                    Fale &ldquo;Marca 1 litrão para Tiago&rdquo; para abrir automaticamente.
-                  </p>
+                  {activeStageTabs.filter((t) => !/^mesa\s+\d+/i.test((t.tableLabel || t.customerName).trim())).length > 0 && (
+                    <div className="pt-2 border-t border-slate-800 space-y-1.5">
+                      <span className="text-[11px] font-semibold text-slate-400 block">
+                        Comandas Individuais (Sem Mesa Fixa)
+                      </span>
+                      <div className="flex flex-wrap gap-1.5">
+                        {activeStageTabs
+                          .filter(
+                            (t) =>
+                              !/^mesa\s+\d+/i.test((t.tableLabel || t.customerName).trim())
+                          )
+                          .map((t) => (
+                            <button
+                              key={t.id}
+                              type="button"
+                              onClick={() => {
+                                setSelectedTabId(t.id);
+                                setShowBaixaDrawer(false);
+                              }}
+                              className={`px-2.5 py-1 rounded-md border text-xs cursor-pointer ${
+                                selectedTab?.id === t.id
+                                  ? 'bg-slate-800 border-amber-500 text-amber-300 font-bold'
+                                  : 'bg-slate-950 border-slate-800 text-slate-300 hover:border-slate-700'
+                              }`}
+                            >
+                              {t.customerName} · {formatBRL(getRemainingBalance(t))}
+                            </button>
+                          ))}
+                      </div>
+                    </div>
+                  )}
                 </div>
               ) : (
-                <div className="space-y-2 max-h-[520px] overflow-y-auto pr-1">
-                  {filteredTabs.map((tab) => {
-                    const isSelected = selectedTab?.id === tab.id;
-                    const remaining = getRemainingBalance(tab);
-                    return (
-                      <button
-                        key={tab.id}
-                        type="button"
-                        onClick={() => {
-                          setSelectedTabId(tab.id);
-                          setShowBaixaDrawer(false);
-                        }}
-                        className={`w-full text-left p-3.5 rounded-lg border transition-colors flex items-center justify-between gap-3 cursor-pointer ${
-                          isSelected
-                            ? 'bg-slate-800 border-amber-500'
-                            : 'bg-slate-950 border-slate-800/80 hover:border-slate-700'
-                        }`}
-                      >
-                        <div className="min-w-0">
-                          <div className="flex items-center gap-2">
-                            <span className="text-sm font-bold text-slate-100 truncate">
-                              {tab.customerName}
-                            </span>
-                            {tab.tableLabel && (
-                              <span className="text-xs text-slate-400">· {tab.tableLabel}</span>
-                            )}
-                          </div>
-                          <div className="text-xs text-slate-400 font-mono tabular-nums mt-0.5">
-                            <span
-                              className={
-                                tab.status === 'open'
-                                  ? 'text-amber-400'
-                                  : tab.status === 'closing'
-                                    ? 'text-sky-400'
-                                    : 'text-emerald-400'
-                              }
-                            >
-                              {STAGE_LABELS[tab.status]}
-                            </span>{' '}
-                            · {tab.itemCount} itens
-                          </div>
-                        </div>
+                <>
+                  {/* Simple Stage Filter */}
+                  <div className="grid grid-cols-4 gap-1 p-1 bg-slate-950 border border-slate-800 rounded-lg text-xs">
+                    <button
+                      type="button"
+                      onClick={() => setStageFilter('all')}
+                      className={`py-1.5 rounded font-medium cursor-pointer ${
+                        stageFilter === 'all'
+                          ? 'bg-slate-800 text-slate-100'
+                          : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      Todas ({stageCounts.all})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setStageFilter('open')}
+                      className={`py-1.5 rounded font-medium cursor-pointer ${
+                        stageFilter === 'open'
+                          ? 'bg-amber-500/20 text-amber-300'
+                          : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      Abertas ({stageCounts.open})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setStageFilter('closing')}
+                      className={`py-1.5 rounded font-medium cursor-pointer ${
+                        stageFilter === 'closing'
+                          ? 'bg-sky-500/20 text-sky-300'
+                          : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      Fechando ({stageCounts.closing})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setStageFilter('paid')}
+                      className={`py-1.5 rounded font-medium cursor-pointer ${
+                        stageFilter === 'paid'
+                          ? 'bg-emerald-500/20 text-emerald-300'
+                          : 'text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      Pagas ({stageCounts.paid})
+                    </button>
+                  </div>
 
-                        <div className="text-right shrink-0 font-mono tabular-nums">
-                          <div className="text-base font-bold text-amber-400">
-                            {formatBRL(remaining)}
-                          </div>
-                          {tab.paidAmount > 0 && (
-                            <div className="text-[11px] text-emerald-400">
-                              Pago: {formatBRL(tab.paidAmount)}
+                  {autoArchivePaidAfter10Min && (
+                    <div className="flex items-center justify-between gap-2 px-2.5 py-1.5 rounded-lg bg-emerald-950/30 border border-emerald-500/30 text-[11px] text-emerald-300">
+                      <span>Auto-arquivo ativo: comandas pagas somem após 10 min</span>
+                    </div>
+                  )}
+
+                  {/* Search */}
+                  <div className="relative">
+                    <Search className="w-4 h-4 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2" />
+                    <input
+                      type="text"
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      placeholder="Buscar cliente ou mesa (ex: Tiago / Mesa 04)..."
+                      className="w-full bg-slate-950 border border-slate-800 rounded-lg pl-9 pr-3 py-2 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none focus:border-slate-600"
+                    />
+                  </div>
+
+                  {/* Customer List */}
+                  {dataLoading ? (
+                    <div className="space-y-2 py-4">
+                      {[1, 2, 3].map((n) => (
+                        <div
+                          key={n}
+                          className="h-14 bg-slate-950 border border-slate-800/60 rounded-lg animate-pulse"
+                        />
+                      ))}
+                    </div>
+                  ) : filteredTabs.length === 0 ? (
+                    <div className="text-center py-8 px-4 border border-dashed border-slate-800 rounded-lg space-y-1">
+                      <p className="text-sm font-medium text-slate-300">Nenhuma comanda aberta</p>
+                      <p className="text-xs text-slate-500">
+                        Fale &ldquo;Marca 1 litrão para Tiago&rdquo; para abrir automaticamente.
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="space-y-2 max-h-[520px] overflow-y-auto pr-1">
+                      {filteredTabs.map((tab) => {
+                        const isSelected = selectedTab?.id === tab.id;
+                        const remaining = getRemainingBalance(tab);
+                        return (
+                          <button
+                            key={tab.id}
+                            type="button"
+                            onClick={() => {
+                              setSelectedTabId(tab.id);
+                              setShowBaixaDrawer(false);
+                            }}
+                            className={`w-full text-left p-3.5 rounded-lg border transition-colors flex items-center justify-between gap-3 cursor-pointer ${
+                              isSelected
+                                ? 'bg-slate-800 border-amber-500'
+                                : 'bg-slate-950 border-slate-800/80 hover:border-slate-700'
+                            }`}
+                          >
+                            <div className="min-w-0">
+                              <div className="flex items-center gap-2">
+                                <span className="text-sm font-bold text-slate-100 truncate">
+                                  {tab.customerName}
+                                </span>
+                                {tab.tableLabel && (
+                                  <span className="text-xs text-slate-400">· {tab.tableLabel}</span>
+                                )}
+                              </div>
+                              <div className="text-xs text-slate-400 font-mono tabular-nums mt-0.5">
+                                <span
+                                  className={
+                                    tab.status === 'open'
+                                      ? 'text-amber-400'
+                                      : tab.status === 'closing'
+                                        ? 'text-sky-400'
+                                        : 'text-emerald-400'
+                                  }
+                                >
+                                  {STAGE_LABELS[tab.status]}
+                                </span>{' '}
+                                · {tab.itemCount} itens
+                              </div>
                             </div>
-                          )}
-                        </div>
-                      </button>
-                    );
-                  })}
-                </div>
+
+                            <div className="text-right shrink-0 font-mono tabular-nums">
+                              <div className="text-base font-bold text-amber-400">
+                                {formatBRL(remaining)}
+                              </div>
+                              {tab.paidAmount > 0 && (
+                                <div className="text-[11px] text-emerald-400">
+                                  Pago: {formatBRL(tab.paidAmount)}
+                                </div>
+                              )}
+                            </div>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  )}
+                </>
               )}
             </div>
 
@@ -5706,31 +6232,68 @@ function ComandaVozWorkspace() {
                     )}
                   </div>
 
-                  {/* Quick 1-Tap Product Buttons */}
-                  <div className="space-y-2 pt-2 border-t border-slate-800">
-                    <span className="text-xs font-semibold text-slate-300 block">
-                      Toque rápido para marcar na conta de {selectedTab.customerName}:
-                    </span>
-                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-                      {menuItems.map((item) => (
+                  {/* Quick 1-Tap Product Buttons with Restaurant/Bar Category Tabs */}
+                  <div className="space-y-2.5 pt-2 border-t border-slate-800">
+                    <div className="flex flex-wrap items-center justify-between gap-2">
+                      <span className="text-xs font-semibold text-slate-300">
+                        Toque rápido para marcar na conta de {selectedTab.customerName}:
+                      </span>
+                      <div className="flex flex-wrap gap-1 text-[11px]">
                         <button
-                          key={item.id}
                           type="button"
-                          disabled={isCurrentWaiterBlocked}
-                          onClick={() => handleQuickAddMenuItem(item)}
-                          className="p-2.5 bg-slate-950 hover:bg-slate-800 disabled:opacity-40 border border-slate-800 rounded-lg text-left transition-colors flex items-center justify-between gap-2 cursor-pointer"
+                          onClick={() => setQuickAddCategoryFilter('all')}
+                          className={`px-2 py-0.5 rounded border cursor-pointer ${
+                            quickAddCategoryFilter === 'all'
+                              ? 'bg-amber-500/20 border-amber-500/50 text-amber-300 font-semibold'
+                              : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+                          }`}
                         >
-                          <div className="min-w-0">
-                            <div className="text-xs font-medium text-slate-200 truncate">
-                              {item.name}
-                            </div>
-                            <div className="text-[11px] font-mono tabular-nums text-amber-400">
-                              + {formatBRL(item.price)}
-                            </div>
-                          </div>
-                          <Plus className="w-4 h-4 text-slate-400 shrink-0" />
+                          Todos
                         </button>
-                      ))}
+                        {(Object.keys(CATEGORY_LABELS) as ItemCategory[])
+                          .filter((cat) => menuItems.some((m) => m.category === cat))
+                          .map((cat) => (
+                            <button
+                              key={cat}
+                              type="button"
+                              onClick={() => setQuickAddCategoryFilter(cat)}
+                              className={`px-2 py-0.5 rounded border cursor-pointer ${
+                                quickAddCategoryFilter === cat
+                                  ? 'bg-amber-500/20 border-amber-500/50 text-amber-300 font-semibold'
+                                  : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+                              }`}
+                            >
+                              {CATEGORY_LABELS[cat]}
+                            </button>
+                          ))}
+                      </div>
+                    </div>
+                    <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                      {menuItems
+                        .filter(
+                          (m) =>
+                            quickAddCategoryFilter === 'all' ||
+                            m.category === quickAddCategoryFilter
+                        )
+                        .map((item) => (
+                          <button
+                            key={item.id}
+                            type="button"
+                            disabled={isCurrentWaiterBlocked}
+                            onClick={() => handleQuickAddMenuItem(item)}
+                            className="p-2.5 bg-slate-950 hover:bg-slate-800 disabled:opacity-40 border border-slate-800 rounded-lg text-left transition-colors flex items-center justify-between gap-2 cursor-pointer"
+                          >
+                            <div className="min-w-0">
+                              <div className="text-xs font-medium text-slate-200 truncate">
+                                {item.name}
+                              </div>
+                              <div className="text-[11px] font-mono tabular-nums text-amber-400">
+                                + {formatBRL(item.price)}
+                              </div>
+                            </div>
+                            <Plus className="w-4 h-4 text-slate-400 shrink-0" />
+                          </button>
+                        ))}
                     </div>
                   </div>
                 </div>
@@ -5738,6 +6301,361 @@ function ComandaVozWorkspace() {
             </div>
           </div>
         )}
+
+        {/* SECTION 1B: CAIXA & FECHAMENTO DIÁRIO (Vendas Avulsas + Comandas Baixadas) */}
+        {activeSection === 'caixa' && canAccessCaixa && (() => {
+          const allAvulsaForDay = tabs.filter(
+            (t) =>
+              t.tableLabel === 'VENDA_AVULSA' &&
+              toLocalDateInputValue(new Date(getTimestampMillis(t.updatedAt || t.createdAt))) ===
+                caixaDateKey
+          );
+          const allPaidTabsForDay = tabs.filter(
+            (t) =>
+              t.tableLabel !== 'VENDA_AVULSA' &&
+              (t.paidAmount || 0) > 0 &&
+              toLocalDateInputValue(new Date(getTimestampMillis(t.updatedAt || t.createdAt))) ===
+                caixaDateKey
+          );
+
+          const directSalesTotal = Number(
+            allAvulsaForDay
+              .reduce((acc, t) => acc + (t.paidAmount || t.totalAmount || 0), 0)
+              .toFixed(2)
+          );
+          const tabsPaidTotal = Number(
+            allPaidTabsForDay.reduce((acc, t) => acc + (t.paidAmount || 0), 0).toFixed(2)
+          );
+          const totalReceived = Number((directSalesTotal + tabsPaidTotal).toFixed(2));
+          const openReceivableTotal = Number(
+            activeStageTabs.reduce((acc, t) => acc + getRemainingBalance(t), 0).toFixed(2)
+          );
+          const openTabsCount = activeStageTabs.filter((t) => getRemainingBalance(t) > 0).length;
+
+          const methodMap = new Map<string, { method: string; total: number; count: number }>();
+          for (const t of [...allAvulsaForDay, ...allPaidTabsForDay]) {
+            const methodLabel = (t.paymentMethod || '').trim() || 'PIX';
+            const paidVal = t.paidAmount || 0;
+            if (paidVal <= 0) continue;
+            const prev = methodMap.get(methodLabel) || {
+              method: methodLabel,
+              total: 0,
+              count: 0,
+            };
+            prev.total = Number((prev.total + paidVal).toFixed(2));
+            prev.count += 1;
+            methodMap.set(methodLabel, prev);
+          }
+          const byMethod = Array.from(methodMap.values()).sort((a, b) => b.total - a.total);
+
+          const dateLabelFormatted = (() => {
+            const parts = caixaDateKey.split('-');
+            if (parts.length === 3) return `${parts[2]}/${parts[1]}/${parts[0]}`;
+            return caixaDateKey;
+          })();
+
+          const handlePrintCashClosing = () => {
+            const closingText = formatThermalCashClosingText(
+              {
+                storeName: currentStoreName,
+                dateLabel: dateLabelFormatted,
+                operatorName: activeWaiterDisplay.name,
+                totalReceived,
+                directSalesTotal,
+                directSalesCount: allAvulsaForDay.length,
+                tabsPaidTotal,
+                tabsPaidCount: allPaidTabsForDay.length,
+                openReceivableTotal,
+                openTabsCount,
+                byMethod,
+              },
+              40
+            );
+            if (printReceiptPreRef.current) {
+              printReceiptPreRef.current.textContent = closingText;
+            }
+            try {
+              window.print();
+              setFeedbackBanner({
+                type: 'success',
+                message: `Fechamento de Caixa (${dateLabelFormatted}) formatado (40 colunas) para impressão.`,
+              });
+            } catch {
+              setFeedbackBanner({
+                type: 'error',
+                message: 'Não foi possível abrir o diálogo de impressão neste dispositivo.',
+              });
+            }
+          };
+
+          return (
+            <div className="space-y-5">
+              <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-4">
+                <div className="flex flex-wrap items-center justify-between gap-3">
+                  <div>
+                    <h2 className="text-lg font-bold text-slate-100 flex items-center gap-2">
+                      <Wallet className="w-5 h-5 text-emerald-400" />
+                      Caixa &amp; Fechamento Diário
+                    </h2>
+                    <p className="text-xs text-slate-400 mt-0.5">
+                      Separa vendas avulsas de balcão (sem mesa) e recebimentos das comandas.
+                    </p>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-2.5 text-xs">
+                    <label className="inline-flex items-center gap-2 bg-slate-950 border border-slate-700 rounded-lg px-3 py-2 text-slate-200">
+                      <Calendar className="w-3.5 h-3.5 text-amber-400" />
+                      <input
+                        type="date"
+                        value={caixaDateKey}
+                        onChange={(e) =>
+                          setCaixaDateKey(e.target.value || toLocalDateInputValue(new Date()))
+                        }
+                        className="bg-transparent text-slate-100 focus:outline-none"
+                      />
+                    </label>
+                    <button
+                      type="button"
+                      onClick={handlePrintCashClosing}
+                      className="inline-flex items-center gap-1.5 px-4 py-2 font-bold bg-amber-500 hover:bg-amber-400 text-slate-950 rounded-lg transition-colors cursor-pointer"
+                    >
+                      <Printer className="w-4 h-4" />
+                      Imprimir Fechamento
+                    </button>
+                  </div>
+                </div>
+
+                {/* KPI Strip */}
+                <div className="grid grid-cols-2 lg:grid-cols-4 gap-3">
+                  <div className="p-4 bg-slate-950 border border-emerald-500/40 rounded-lg space-y-1">
+                    <span className="text-xs text-slate-400 block">Total em Caixa ({dateLabelFormatted})</span>
+                    <span className="text-2xl font-bold font-mono tabular-nums text-emerald-400">
+                      {formatBRL(totalReceived)}
+                    </span>
+                  </div>
+                  <div className="p-4 bg-slate-950 border border-slate-800 rounded-lg space-y-1">
+                    <span className="text-xs text-slate-400 block">
+                      Vendas Avulsas ({allAvulsaForDay.length})
+                    </span>
+                    <span className="text-xl font-bold font-mono tabular-nums text-amber-400">
+                      {formatBRL(directSalesTotal)}
+                    </span>
+                  </div>
+                  <div className="p-4 bg-slate-950 border border-slate-800 rounded-lg space-y-1">
+                    <span className="text-xs text-slate-400 block">
+                      Comandas Recebidas ({allPaidTabsForDay.length})
+                    </span>
+                    <span className="text-xl font-bold font-mono tabular-nums text-sky-400">
+                      {formatBRL(tabsPaidTotal)}
+                    </span>
+                  </div>
+                  <div className="p-4 bg-slate-950 border border-slate-800 rounded-lg space-y-1">
+                    <span className="text-xs text-slate-400 block">
+                      Em Aberto Mesas ({openTabsCount})
+                    </span>
+                    <span className="text-xl font-bold font-mono tabular-nums text-slate-200">
+                      {formatBRL(openReceivableTotal)}
+                    </span>
+                  </div>
+                </div>
+
+                {/* Quick Venda Avulsa Bar inside Caixa */}
+                <form
+                  onSubmit={async (e) => {
+                    e.preventDefault();
+                    const chosen =
+                      menuItems.find((m) => m.id === avulsaMenuId) || menuItems[0];
+                    if (!chosen) return;
+                    await executeStageVendaAvulsa(
+                      [
+                        {
+                          itemName: chosen.name,
+                          category: chosen.category,
+                          quantity: Math.max(1, avulsaQty),
+                          unitPrice: chosen.price,
+                        },
+                      ],
+                      avulsaPaymentMethod,
+                      `Venda avulsa ${avulsaQty}x ${chosen.name} (${avulsaPaymentMethod})`,
+                      'manual',
+                      activeWaiterDisplay.name,
+                      activeWaiterDisplay.storeName
+                    );
+                    setAvulsaQty(1);
+                  }}
+                  className="p-3.5 bg-slate-950 border border-emerald-500/30 rounded-lg flex flex-col sm:flex-row items-stretch sm:items-end gap-3 text-xs"
+                >
+                  <div className="flex-1 space-y-1">
+                    <label className="text-emerald-300 font-semibold block">
+                      Lançar Venda Avulsa (Balcão — Não entra em mesa)
+                    </label>
+                    <select
+                      value={avulsaMenuId || menuItems[0]?.id || ''}
+                      onChange={(e) => setAvulsaMenuId(e.target.value)}
+                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-slate-100"
+                    >
+                      {menuItems.map((m) => (
+                        <option key={m.id} value={m.id}>
+                          {m.name} — {formatBRL(m.price)}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                  <div className="w-full sm:w-20 space-y-1">
+                    <label className="text-slate-400 block">Qtd</label>
+                    <input
+                      type="number"
+                      min={1}
+                      max={100}
+                      value={avulsaQty}
+                      onChange={(e) =>
+                        setAvulsaQty(Math.max(1, parseInt(e.target.value || '1', 10) || 1))
+                      }
+                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-slate-100 font-mono text-center"
+                    />
+                  </div>
+                  <div className="w-full sm:w-44 space-y-1">
+                    <label className="text-slate-400 block">Pagamento</label>
+                    <select
+                      value={avulsaPaymentMethod}
+                      onChange={(e) => setAvulsaPaymentMethod(e.target.value)}
+                      className="w-full bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-slate-100"
+                    >
+                      <option value="PIX">PIX</option>
+                      <option value="Dinheiro">Dinheiro</option>
+                      <option value="Cartão de Débito">Cartão de Débito</option>
+                      <option value="Cartão de Crédito">Cartão de Crédito</option>
+                    </select>
+                  </div>
+                  <button
+                    type="submit"
+                    disabled={menuItems.length === 0 || isCurrentWaiterBlocked}
+                    className="px-4 py-2 bg-emerald-500 hover:bg-emerald-400 disabled:opacity-40 text-slate-950 font-bold rounded-lg whitespace-nowrap cursor-pointer"
+                  >
+                    + Registrar e Baixar
+                  </button>
+                </form>
+
+                {/* Payment Method Breakdown */}
+                <div className="space-y-2">
+                  <h3 className="text-xs font-semibold text-slate-300">
+                    Resumo por Forma de Pagamento
+                  </h3>
+                  {byMethod.length === 0 ? (
+                    <p className="text-xs text-slate-500">
+                      Nenhum pagamento registrado para {dateLabelFormatted}.
+                    </p>
+                  ) : (
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5 text-xs">
+                      {byMethod.map((row) => (
+                        <div
+                          key={row.method}
+                          className="p-3 bg-slate-950 border border-slate-800 rounded-lg flex items-center justify-between"
+                        >
+                          <div>
+                            <div className="font-semibold text-slate-200">{row.method}</div>
+                            <div className="text-[11px] text-slate-400">
+                              {row.count} {row.count === 1 ? 'baixa' : 'baixas'}
+                            </div>
+                          </div>
+                          <div className="font-mono font-bold text-emerald-400">
+                            {formatBRL(row.total)}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+
+              {/* Split Tables: Vendas Avulsas vs Comandas Pagas */}
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-5">
+                <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-3">
+                  <h3 className="text-sm font-bold text-slate-100 flex items-center gap-2">
+                    <ShoppingBag className="w-4 h-4 text-amber-400" />
+                    Vendas Avulsas do Dia ({allAvulsaForDay.length})
+                  </h3>
+                  {allAvulsaForDay.length === 0 ? (
+                    <p className="text-xs text-slate-400">
+                      Nenhuma venda avulsa lançada em {dateLabelFormatted}. Diga &ldquo;Marcelo, venda avulsa de litrão no pix&rdquo;.
+                    </p>
+                  ) : (
+                    <div className="divide-y divide-slate-800 border border-slate-800 rounded-lg bg-slate-950/50 text-xs">
+                      {allAvulsaForDay.map((sale) => {
+                        const saleItems = tabItems.filter((i) => i.tabId === sale.id);
+                        const timeStr = new Date(
+                          getTimestampMillis(sale.createdAt)
+                        ).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+                        return (
+                          <div
+                            key={sale.id}
+                            className="p-3 flex items-center justify-between gap-3"
+                          >
+                            <div className="min-w-0">
+                              <div className="font-semibold text-slate-100">
+                                {saleItems.length > 0
+                                  ? saleItems
+                                      .map((i) => `${i.quantity}x ${i.itemName}`)
+                                      .join(', ')
+                                  : 'Venda Avulsa'}
+                              </div>
+                              <div className="text-[11px] text-slate-400">
+                                {timeStr} · {sale.paymentMethod || 'PIX'} ·{' '}
+                                {saleItems[0]?.launchedByName || 'Balcão'}
+                              </div>
+                            </div>
+                            <div className="font-mono font-bold text-amber-400 shrink-0">
+                              {formatBRL(sale.paidAmount || sale.totalAmount)}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+
+                <div className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-3">
+                  <h3 className="text-sm font-bold text-slate-100 flex items-center gap-2">
+                    <Receipt className="w-4 h-4 text-sky-400" />
+                    Comandas Recebidas no Dia ({allPaidTabsForDay.length})
+                  </h3>
+                  {allPaidTabsForDay.length === 0 ? (
+                    <p className="text-xs text-slate-400">
+                      Nenhuma comanda com baixa registrada em {dateLabelFormatted}.
+                    </p>
+                  ) : (
+                    <div className="divide-y divide-slate-800 border border-slate-800 rounded-lg bg-slate-950/50 text-xs">
+                      {allPaidTabsForDay.map((t) => {
+                        const timeStr = new Date(
+                          getTimestampMillis(t.updatedAt || t.createdAt)
+                        ).toLocaleTimeString('pt-BR', { hour: '2-digit', minute: '2-digit' });
+                        return (
+                          <div
+                            key={t.id}
+                            className="p-3 flex items-center justify-between gap-3"
+                          >
+                            <div className="min-w-0">
+                              <div className="font-semibold text-slate-100 truncate">
+                                {t.customerName}
+                                {t.tableLabel ? ` · ${t.tableLabel}` : ''}
+                              </div>
+                              <div className="text-[11px] text-slate-400">
+                                {timeStr} · {t.paymentMethod || 'PIX'} · {STAGE_LABELS[t.status]}
+                              </div>
+                            </div>
+                            <div className="font-mono font-bold text-emerald-400 shrink-0">
+                              {formatBRL(t.paidAmount)}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          );
+        })()}
 
         {/* SECTION 2: CARDÁPIO (SIMPLE & RELIABLE CRUD FOR ADM) */}
         {activeSection === 'cardapio' && (
@@ -5827,8 +6745,10 @@ function ComandaVozWorkspace() {
                           className="w-full bg-slate-950 border border-slate-700 rounded-lg px-3 py-2.5 text-slate-100"
                         >
                           <option value="cervejas">Cervejas</option>
-                          <option value="doses">Doses & Drinks</option>
-                          <option value="porcoes">Porções & Espetos</option>
+                          <option value="doses">Doses &amp; Drinks</option>
+                          <option value="pratos">Pratos &amp; Refeições</option>
+                          <option value="porcoes">Porções &amp; Espetos</option>
+                          <option value="sobremesas">Sobremesas</option>
                           <option value="sem_alcool">Sem Álcool</option>
                           <option value="outros">Outros</option>
                         </select>
@@ -5934,6 +6854,37 @@ function ComandaVozWorkspace() {
                 )}
               </div>
 
+              <div className="flex flex-wrap gap-1.5 text-[11px]">
+                <button
+                  type="button"
+                  onClick={() => setCardapioCategoryFilter('all')}
+                  className={`px-2.5 py-1 rounded-md border cursor-pointer ${
+                    cardapioCategoryFilter === 'all'
+                      ? 'bg-amber-500/20 border-amber-500/50 text-amber-300 font-semibold'
+                      : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+                  }`}
+                >
+                  Todos ({menuItems.length})
+                </button>
+                {(Object.keys(CATEGORY_LABELS) as ItemCategory[])
+                  .filter((cat) => menuItems.some((m) => m.category === cat))
+                  .map((cat) => (
+                    <button
+                      key={cat}
+                      type="button"
+                      onClick={() => setCardapioCategoryFilter(cat)}
+                      className={`px-2.5 py-1 rounded-md border cursor-pointer ${
+                        cardapioCategoryFilter === cat
+                          ? 'bg-amber-500/20 border-amber-500/50 text-amber-300 font-semibold'
+                          : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-slate-200'
+                      }`}
+                    >
+                      {CATEGORY_LABELS[cat]} (
+                      {menuItems.filter((m) => m.category === cat).length})
+                    </button>
+                  ))}
+              </div>
+
               {menuItems.length === 0 ? (
                 <div className="p-8 text-center border border-dashed border-slate-800 rounded-lg space-y-2 text-xs">
                   <p className="text-slate-300 font-semibold">Cardápio vazio.</p>
@@ -5955,7 +6906,13 @@ function ComandaVozWorkspace() {
                       </tr>
                     </thead>
                     <tbody className="divide-y divide-slate-800/70 bg-slate-950/40">
-                      {menuItems.map((item) => (
+                      {menuItems
+                        .filter(
+                          (item) =>
+                            cardapioCategoryFilter === 'all' ||
+                            item.category === cardapioCategoryFilter
+                        )
+                        .map((item) => (
                         <tr key={item.id} className="hover:bg-slate-800/30">
                           <td className="py-2.5 px-4 font-semibold text-slate-100">
                             {item.name}

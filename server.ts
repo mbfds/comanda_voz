@@ -1239,25 +1239,34 @@ async function startServer() {
           ? `Comandas abertas/ativas atualmente no bar: ${safeCustomers.map((c) => `"${c}"`).join(', ')}. ATENÇÃO FONÉTICA: Nomes como "Thiago" e "Tiago" (com ou sem H), "Matheus" e "Mateus", "Felipe" e "Phelipe", "Victor" e "Vitor", "Luiz" e "Luis" são a MESMA pessoa! Se houver uma comanda ativa com grafia fonética equivalente, retorne EXATAMENTE o nome da comanda ativa.`
           : 'Nenhuma comanda ativa ainda.';
 
-      const systemInstruction = `Você é o MARCELO, o assistente virtual inteligente de voz de um bar brasileiro (Comanda Voz).
-O garçom ou dono do bar fala comandos direcionados a você, muitas vezes na correria SEM PAUSA para vários clientes seguidos!
+      const systemInstruction = `Você é o MARCELO, o assistente virtual inteligente de voz de um bar e restaurante brasileiro (Comanda Voz).
+O garçom ou dono do estabelecimento fala comandos direcionados a você, muitas vezes na correria SEM PAUSA para vários clientes seguidos!
 
-AS 3 AÇÕES PRINCIPAIS QUE VOCÊ DEVE COMPREENDER PERFEITAMENTE:
-1. "MARCAR": Adicionar produtos do cardápio na comanda do cliente.
-   Exemplos: "marca 1 litrão para Thiago", "marque 2 espetinhos pro Tiago", "coloca 1 original na conta do Jonas".
+AS 4 AÇÕES PRINCIPAIS QUE VOCÊ DEVE COMPREENDER PERFEITAMENTE:
+1. "MARCAR": Adicionar produtos do cardápio na comanda do cliente ou mesa.
+   Exemplos: "marca 1 litrão para Thiago", "marque 2 espetinhos pro Tiago", "coloca 1 prato feito na mesa 4".
    ATENÇÃO CRÍTICA A TAMANHOS E EMBALAGENS:
    - Nunca confunda "coca lata" / "350ml" com "coca cola 2 litros" / "2L", nem "long neck" com "600ml" ou "litrão"!
    - Se o usuário disser uma escolha com "ou" (ex: "coca lata ou coca cola 2 litros"), ou se disser algo ambíguo que serve para dois produtos de tamanhos diferentes (ex: apenas "coca" quando existem Lata e 2 Litros no cardápio), NÃO chute! Retorne "understood": false explicando que ficou ambíguo.
 2. "FECHAR": Fechar a conta OU responder quanto ficou / quanto deu a conta do cliente.
-   Exemplos: "feche a conta do Thiago", "fechar conta do Tiago", "quanto ficou a conta do Thiago?", "quando ficou a conta do Tiago?" (o microfone muitas vezes transcreve "quanto ficou" como "quando ficou" — entenda ambos como FECHAR!), "quanto deu a conta do Tiago?", "qual o valor da conta do Tiago?".
+   Exemplos: "feche a conta do Thiago", "fechar conta do Tiago", "quanto ficou a conta do Thiago?", "quando ficou a conta do Tiago?".
 3. "BAIXA": Dar baixa total ou parcial no pagamento da conta do cliente.
-   Exemplos: "dar baixa na conta do Thiago", "dê baixa na conta do Tiago", "dar uma baixa na conta do Tiago", "fazer baixa no Thiago", "baixa de 20 reais na conta do Tiago e continua consumindo", "Tiago pagou a conta", "quitar conta do Thiago".
+   Exemplos: "dar baixa na conta do Thiago", "baixa de 20 reais na conta do Tiago e continua consumindo", "Tiago pagou a conta".
+4. "VENDA_AVULSA": Venda avulsa / direta no balcão que JÁ ENTRA PAGA na hora sem abrir comanda nem mesa para ninguém!
+   Exemplos: "Marcelo, venda avulsa de litrão no pix", "venda avulsa de 2 cervejas lata no dinheiro", "venda direta de 1 espetinho no cartão".
+   Para VENDA_AVULSA:
+   - Use intent: "VENDA_AVULSA"
+   - Use customerName: "Venda Avulsa"
+   - Use tableLabel: "VENDA_AVULSA"
+   - Extraia paymentMethod ("PIX", "Dinheiro", "Cartão de Crédito" ou "Cartão de Débito"; padrão "PIX")
+   - Preencha items com os produtos exatos do cardápio.
 
 REGRA DE OURO DE SEGURANÇA ("SE NÃO ENTENDEU, NÃO FAÇA NADA"):
-- Se for um comando de MARCAR e o produto pedido NÃO existir no Cardápio do Bar listado abaixo, estiver ambíguo entre dois itens, ou não tiver nome de cliente, retorne "understood": false.
+- Se for um comando de MARCAR ou VENDA_AVULSA e o produto pedido NÃO existir no Cardápio listado abaixo ou estiver ambíguo entre dois itens, retorne "understood": false.
+- Em MARCAR, FECHAR e BAIXA exige nome de cliente/mesa; em VENDA_AVULSA NÃO exige cliente (use "Venda Avulsa").
 - Nomes com grafia fonética igual (ex: "Thiago" e "Tiago" sem H, "Marcelo" e "Marcelle", "Matheus" e "Mateus") DEVEM ser reconhecidos normalmente e unificados com o nome da comanda ativa se já existir!
 
-Cardápio do Bar (ÚNICOS PRODUTOS VÁLIDOS):
+Cardápio (ÚNICOS PRODUTOS VÁLIDOS):
 ${catalogSummary}
 
 ${customersSummary}`;
@@ -1299,15 +1308,15 @@ ${customersSummary}`;
                   properties: {
                     intent: {
                       type: Type.STRING,
-                      description: 'MARCAR, FECHAR ou BAIXA.',
+                      description: 'MARCAR, FECHAR, BAIXA ou VENDA_AVULSA.',
                     },
                     customerName: {
                       type: Type.STRING,
-                      description: 'Nome limpo do cliente ou mesa titular da comanda.',
+                      description: 'Nome limpo do cliente ou mesa titular da comanda (ou "Venda Avulsa" para VENDA_AVULSA).',
                     },
                     tableLabel: {
                       type: Type.STRING,
-                      description: 'Mesa ou local mencionado, ou string vazia.',
+                      description: 'Mesa ou local mencionado, "VENDA_AVULSA" para venda avulsa, ou string vazia.',
                     },
                     paymentAmount: {
                       type: Type.NUMBER,
@@ -1315,7 +1324,7 @@ ${customersSummary}`;
                     },
                     paymentMethod: {
                       type: Type.STRING,
-                      description: 'Forma de pagamento mencionada (PIX, Dinheiro, Cartão) ou PIX.',
+                      description: 'Forma de pagamento mencionada (PIX, Dinheiro, Cartão de Débito, Cartão de Crédito) ou PIX.',
                     },
                     keepConsuming: {
                       type: Type.BOOLEAN,
@@ -1323,7 +1332,7 @@ ${customersSummary}`;
                     },
                     items: {
                       type: Type.ARRAY,
-                      description: 'Lista de produtos do cardápio quando intent for MARCAR.',
+                      description: 'Lista de produtos do cardápio quando intent for MARCAR ou VENDA_AVULSA.',
                       items: {
                         type: Type.OBJECT,
                         properties: {
@@ -1333,7 +1342,7 @@ ${customersSummary}`;
                           },
                           category: {
                             type: Type.STRING,
-                            description: 'Categoria: cervejas, doses, porcoes, sem_alcool ou outros.',
+                            description: 'Categoria: cervejas, doses, pratos, porcoes, sobremesas, sem_alcool ou outros.',
                           },
                           quantity: {
                             type: Type.INTEGER,
@@ -1401,8 +1410,8 @@ REGRA IMPORTANTE DE SEPARAÇÃO:
 - Números que fazem parte do nome da bebida ou embalagem (ex: "51" em "Dose de 51" / "Cachaça 51", "88", "99", "600ml", "350ml", "12 anos") NUNCA devem ser confundidos com o preço! Se nenhum preço foi falado, retorne price: -1.
 
 Extraia com precisão cada produto falado:
-- name: Nome limpo e bem formatado do produto (ex: "Dose de 51", "Porção de Salame", "Skol Lata 350ml").
-- category: Exatamente uma entre: "cervejas", "doses", "porcoes", "sem_alcool", "outros".
+- name: Nome limpo e bem formatado do produto (ex: "Dose de 51", "Porção de Salame", "Prato Feito Filé", "Skol Lata 350ml").
+- category: Exatamente uma entre: "cervejas", "doses", "pratos", "porcoes", "sobremesas", "sem_alcool", "outros".
 - price: Preço unitário numérico em reais (ex: 15 ou 8.5). Se nenhum preço foi falado, retorne -1.
 - synonyms: Palavras-chave curtas em minúsculas separadas por vírgula para facilitar busca por voz depois (ex: "dose de 51, 51").
 
@@ -1457,7 +1466,15 @@ Se não for possível identificar nenhum produto válido, retorne understood: fa
             .filter((p) => p && typeof p.name === 'string' && p.name.trim().length >= 2)
             .map((p) => ({
               name: String(p.name).trim().slice(0, 80),
-              category: ['cervejas', 'doses', 'porcoes', 'sem_alcool', 'outros'].includes(
+              category: [
+                'cervejas',
+                'doses',
+                'pratos',
+                'porcoes',
+                'sobremesas',
+                'sem_alcool',
+                'outros',
+              ].includes(
                 String(p.category)
               )
                 ? String(p.category)
