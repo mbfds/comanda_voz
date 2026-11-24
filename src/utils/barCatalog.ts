@@ -930,6 +930,10 @@ const PRODUCT_STOPWORDS = new Set(['de', 'do', 'da', 'dos', 'das', 'com', 'em', 
  */
 export function normalizeProductText(str: string): string {
   return normalizeText(str)
+    .replace(/\b(?:dois|2)\s*(?:litros?|l)?\s+e\s+mei[oa]\b/g, ' 2l5 ')
+    .replace(/\b2[.,]5\s*(?:litros?|l)?\b/g, ' 2l5 ')
+    .replace(/\b(?:um|uma|1)\s*(?:litros?|l)?\s+e\s+mei[oa]\b/g, ' 1l5 ')
+    .replace(/\b1[.,]5\s*(?:litros?|l)?\b/g, ' 1l5 ')
     .replace(/[-/.,_+]+/g, ' ')
     .replace(/\b(?:dois|2)\s*(?:litros?|l)\b/g, ' 2l ')
     .replace(/\b(?:tres|3)\s*(?:litros?|l)\b/g, ' 3l ')
@@ -951,14 +955,19 @@ function tokenizeProduct(normProd: string): string[] {
 function extractProductQualifiers(normProd: string): {
   sizeGroup: string | null;
   variants: Set<string>;
+  isHalfPortion: boolean;
 } {
   const padded = ` ${normProd} `;
   let sizeGroup: string | null = null;
 
   if (/\b(?:lata|latinha|latas|latinhas|350ml|269ml|350|269|latao|473ml)\b/.test(padded)) {
     sizeGroup = 'LATA_350';
+  } else if (/\b2l5\b/.test(padded)) {
+    sizeGroup = 'GARRAFA_2_5L';
   } else if (/\b(?:2l|2litro|2litros)\b/.test(padded)) {
     sizeGroup = 'GARRAFA_2L';
+  } else if (/\b1l5\b/.test(padded)) {
+    sizeGroup = 'GARRAFA_1_5L';
   } else if (/\b(?:1l|litrao|litroes)\b/.test(padded)) {
     sizeGroup = 'LITRAO_1L';
   } else if (/\b(?:600ml|600)\b/.test(padded)) {
@@ -974,7 +983,9 @@ function extractProductQualifiers(normProd: string): {
   if (/\b(?:sem\s+gas)\b/.test(padded)) variants.add('SEM_GAS');
   if (/\b(?:com\s+gas)\b/.test(padded)) variants.add('COM_GAS');
 
-  return { sizeGroup, variants };
+  const isHalfPortion = /\b(?:meia|meio)\b/.test(padded);
+
+  return { sizeGroup, variants, isHalfPortion };
 }
 
 function buildCharNGrams(str: string, n: number): string[] {
@@ -1092,7 +1103,7 @@ function computeBestSubphraseNGramScore(
 function scoreCandidatePhrase(
   searchNorm: string,
   searchTokens: string[],
-  searchQualifiers: { sizeGroup: string | null; variants: Set<string> },
+  searchQualifiers: { sizeGroup: string | null; variants: Set<string>; isHalfPortion: boolean },
   candRaw: string,
   isPrimaryName: boolean
 ): number {
@@ -1202,6 +1213,13 @@ function scoreCandidatePhrase(
   }
   if (searchQualifiers.variants.has('ZERO') && candQualifiers.variants.has('ZERO')) {
     score += 180;
+  }
+  if (searchQualifiers.isHalfPortion && candQualifiers.isHalfPortion) {
+    score += 200;
+  } else if (searchQualifiers.isHalfPortion && !candQualifiers.isHalfPortion) {
+    score -= 160;
+  } else if (!searchQualifiers.isHalfPortion && candQualifiers.isHalfPortion) {
+    score -= 90;
   }
   // Slight preference if user didn't specify size and candidate also doesn't lock to a specific size
   if (!searchQualifiers.sizeGroup && candQualifiers.sizeGroup) {
@@ -1321,11 +1339,93 @@ function matchCatalogItemStrictly(
   return { item: top1.item };
 }
 
+function parseSingleSegmentQtyAndName(seg: string): {
+  qty: number;
+  itemSearchText: string;
+} {
+  const segNorm = normalizeText(seg).replace(
+    /^(?:marque|marca|marcar|coloca|coloque|adiciona|bota|poe|põe|lanca|lança|anota|mais|de|do|da)\s+/i,
+    ''
+  );
+  let qty = 1;
+  let itemSearchText = segNorm;
+
+  const qtyMatch = segNorm.match(
+    /^(\d+|um|uma|dois|duas|tres|quatro|cinco|seis|sete|oito|nove|dez)\b\s*(.*)$/
+  );
+  if (qtyMatch && qtyMatch[2]) {
+    const remainder = qtyMatch[2].trim();
+    // Do NOT treat volume/weight/fraction numbers like "2 litros de coca", "2 e meio", or "600 ml" as quantity
+    const startsWithUnit =
+      /^(?:litros?|l\b|mls?\b|gramas?|g\b|kg\b|e\s+mei[oa]\b)/i.test(remainder);
+    if (!startsWithUnit) {
+      const qToken = qtyMatch[1];
+      qty = Number.isNaN(Number(qToken)) ? PT_NUMBERS[qToken] || 1 : parseInt(qToken, 10);
+      itemSearchText = remainder.replace(/^(de\s+)/, '').trim();
+    }
+  }
+
+  return { qty, itemSearchText };
+}
+
 /**
- * Parses a single clause for the 3 core intents:
+ * Splits order items cleanly by comma (ignoring decimal commas like "2,5") and " e ",
+ * while preserving compound product names like "Coca Cola 2L e Meio", "2 litros e meio",
+ * "2 e meio", "Meio a Meio", or catalog items that legitimately contain " e ".
+ */
+function smartSplitOrderSegments(rawOrderText: string, catalog: MenuItem[]): string[] {
+  const commaChunks = rawOrderText
+    .split(/,(?!\d)\s*/i)
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  const COMPOUND_MARKER = '__COMPOUND_E__';
+  const result: string[] = [];
+
+  for (const chunk of commaChunks) {
+    const protectedChunk = chunk
+      .replace(
+        /\b(\d+|um|uma|dois|duas|tr[eê]s|1l|2l|3l|litros?|l)\s+e\s+(mei[oa])\b/gi,
+        `$1 ${COMPOUND_MARKER} $2`
+      )
+      .replace(/\b(meio)\s+a\s+(meio)\b/gi, '$1 a $2');
+
+    const unmasked = protectedChunk.replace(new RegExp(COMPOUND_MARKER, 'g'), 'e');
+
+    // If there's an explicit quantity after " e " (e.g. "1 litrão e 2 água"), split there
+    const hasExplicitNextItemQty =
+      /\s+e\s+(?=(?:\d+|um|uma|dois|duas|tr[eê]s|quatro|cinco|seis|sete|oito|nove|dez|mais)\b)/i.test(
+        protectedChunk
+      );
+
+    if (!hasExplicitNextItemQty && /\s+e\s+/i.test(protectedChunk)) {
+      const wholeParsed = parseSingleSegmentQtyAndName(unmasked);
+      if (wholeParsed.itemSearchText) {
+        const directWholeMatch = matchCatalogItemStrictly(wholeParsed.itemSearchText, catalog);
+        if (directWholeMatch.item) {
+          result.push(unmasked);
+          continue;
+        }
+      }
+    }
+
+    const parts = protectedChunk
+      .split(/\s+e\s+/i)
+      .map((p) => p.replace(new RegExp(COMPOUND_MARKER, 'g'), 'e').trim())
+      .filter(Boolean);
+
+    result.push(...parts);
+  }
+
+  return result;
+}
+
+/**
+ * Parses a single clause for the 4 core intents:
  * 1. MARCAR (add items to customer's tab)
  * 2. FECHAR (close/review bill, or answer "quanto/quando ficou a conta do cliente")
  * 3. BAIXA (record payment / dar baixa)
+ * 4. VENDA_AVULSA (direct counter sale, settled immediately with no tab/table)
  */
 function parseSingleClauseStrictly(
   clause: string,
@@ -1392,10 +1492,7 @@ function parseSingleClauseStrictly(
 
     cleanedSale = cleanedSale.replace(/^(?:de|do|da)\s+/i, '').trim();
 
-    const saleSegments = cleanedSale
-      .split(/\s+e\s+|,\s*/i)
-      .map((s) => s.trim())
-      .filter(Boolean);
+    const saleSegments = smartSplitOrderSegments(cleanedSale, catalog);
 
     if (saleSegments.length === 0) {
       return {
@@ -1407,25 +1504,7 @@ function parseSingleClauseStrictly(
 
     const parsedSaleItems: ParsedOrderItem[] = [];
     for (const seg of saleSegments) {
-      const segNorm = normalizeText(seg).replace(
-        /^(?:marque|marca|marcar|coloca|coloque|adiciona|bota|poe|põe|lanca|lança|anota|mais|de|do|da)\s+/i,
-        ''
-      );
-      let qty = 1;
-      let itemSearchText = segNorm;
-
-      const qtyMatch = segNorm.match(
-        /^(\d+|um|uma|dois|duas|tres|quatro|cinco|seis|sete|oito|nove|dez)\b\s*(.*)$/
-      );
-      if (qtyMatch && qtyMatch[2]) {
-        const remainder = qtyMatch[2].trim();
-        const startsWithUnit = /^(?:litros?|l\b|mls?\b|gramas?|g\b|kg\b)/i.test(remainder);
-        if (!startsWithUnit) {
-          const qToken = qtyMatch[1];
-          qty = Number.isNaN(Number(qToken)) ? PT_NUMBERS[qToken] || 1 : parseInt(qToken, 10);
-          itemSearchText = remainder.replace(/^(de\s+)/, '').trim();
-        }
-      }
+      const { qty, itemSearchText } = parseSingleSegmentQtyAndName(seg);
 
       if (!itemSearchText) {
         return {
@@ -1545,13 +1624,17 @@ function parseSingleClauseStrictly(
     .trim();
   let orderPart = cleanedForMarcar;
 
-  const targetRegex =
-    /\b(?:na\s+comanda\s+d[oa]\s+|na\s+conta\s+d[oa]\s+|comanda\s+d[oa]\s+|conta\s+d[oa]\s+|na\s+para\s+o?\s*|para\s+o\s+|para\s+a\s+|para\s+|pro\s+|pra\s+|no\s+|na\s+)([a-zA-ZÀ-ÿ0-9\s]{2,45})$/i;
-  const matchTarget = cleanedForMarcar.match(targetRegex);
+  const explicitTargetRegex =
+    /^(.*)\b(?:na\s+comanda\s+d[oa]\s+|na\s+conta\s+d[oa]\s+|comanda\s+d[oa]\s+|conta\s+d[oa]\s+|na\s+para\s+o?\s*|para\s+o\s+|para\s+a\s+|para\s+|pro\s+|pra\s+)([a-zA-ZÀ-ÿ0-9\s]{2,45})$/i;
+  const fallbackTargetRegex =
+    /^(.*)\b(?:no\s+|na\s+)([a-zA-ZÀ-ÿ0-9\s]{2,45})$/i;
+  const matchTarget =
+    cleanedForMarcar.match(explicitTargetRegex) ||
+    cleanedForMarcar.match(fallbackTargetRegex);
 
-  if (matchTarget && matchTarget[1]) {
-    const rawTarget = cleanCustomerCandidateText(matchTarget[1]);
-    orderPart = cleanedForMarcar.slice(0, matchTarget.index).trim();
+  if (matchTarget && matchTarget[2]) {
+    const rawTarget = cleanCustomerCandidateText(matchTarget[2]);
+    orderPart = matchTarget[1].trim();
     customerName = resolveCustomerNameFromExisting(rawTarget, existingCustomerNames);
 
     if (/^mesa\s+\d+/i.test(customerName)) {
@@ -1566,14 +1649,13 @@ function parseSingleClauseStrictly(
     };
   }
 
-  const segments = orderPart
+  const strippedOrderPart = orderPart
     .replace(
       /^(marque|marca|marcar|coloca|coloque|adiciona|bota|poe|põe|lanca|lança|anota|mais)\s+/i,
       ''
     )
-    .split(/\s+e\s+|,\s*/i)
-    .map((s) => s.trim())
-    .filter(Boolean);
+    .trim();
+  const segments = smartSplitOrderSegments(strippedOrderPart, catalog);
 
   if (segments.length === 0) {
     return {
@@ -1585,26 +1667,7 @@ function parseSingleClauseStrictly(
   const parsedItems: ParsedOrderItem[] = [];
 
   for (const seg of segments) {
-    const segNorm = normalizeText(seg).replace(
-      /^(marque|marca|marcar|coloca|coloque|adiciona|bota|poe|põe|lanca|lança|anota|mais)\s+/i,
-      ''
-    );
-    let qty = 1;
-    let itemSearchText = segNorm;
-
-    const qtyMatch = segNorm.match(
-      /^(\d+|um|uma|dois|duas|tres|quatro|cinco|seis|sete|oito|nove|dez)\b\s*(.*)$/
-    );
-    if (qtyMatch && qtyMatch[2]) {
-      const remainder = qtyMatch[2].trim();
-      // Do NOT treat volume/weight numbers like "2 litros de coca" or "600 ml" as quantity
-      const startsWithUnit = /^(?:litros?|l\b|mls?\b|gramas?|g\b|kg\b)/i.test(remainder);
-      if (!startsWithUnit) {
-        const qToken = qtyMatch[1];
-        qty = Number.isNaN(Number(qToken)) ? PT_NUMBERS[qToken] || 1 : parseInt(qToken, 10);
-        itemSearchText = remainder.replace(/^(de\s+)/, '').trim();
-      }
-    }
+    const { qty, itemSearchText } = parseSingleSegmentQtyAndName(seg);
 
     if (!itemSearchText) {
       return {
