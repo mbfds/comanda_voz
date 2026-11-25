@@ -930,10 +930,10 @@ const PRODUCT_STOPWORDS = new Set(['de', 'do', 'da', 'dos', 'das', 'com', 'em', 
  */
 export function normalizeProductText(str: string): string {
   return normalizeText(str)
-    .replace(/\b(?:dois|2)\s*(?:litros?|l)?\s+e\s+mei[oa]\b/g, ' 2l5 ')
-    .replace(/\b2[.,]5\s*(?:litros?|l)?\b/g, ' 2l5 ')
-    .replace(/\b(?:um|uma|1)\s*(?:litros?|l)?\s+e\s+mei[oa]\b/g, ' 1l5 ')
-    .replace(/\b1[.,]5\s*(?:litros?|l)?\b/g, ' 1l5 ')
+    .replace(/\b(?:dois|2)\s*(?:litros?|litr[ao]o?s?|litroes|l)?\s+e\s+mei[oa]\b/g, ' 2l5 ')
+    .replace(/\b2[.,]5\s*(?:litros?|litr[ao]o?s?|litroes|l)?\b/g, ' 2l5 ')
+    .replace(/\b(?:um|uma|1)\s*(?:litros?|litr[ao]o?s?|litroes|l)?\s+e\s+mei[oa]\b/g, ' 1l5 ')
+    .replace(/\b1[.,]5\s*(?:litros?|litr[ao]o?s?|litroes|l)?\b/g, ' 1l5 ')
     .replace(/[-/.,_+]+/g, ' ')
     .replace(/\b(?:dois|2)\s*(?:litros?|l)\b/g, ' 2l ')
     .replace(/\b(?:tres|3)\s*(?:litros?|l)\b/g, ' 3l ')
@@ -1344,7 +1344,7 @@ function parseSingleSegmentQtyAndName(seg: string): {
   itemSearchText: string;
 } {
   const segNorm = normalizeText(seg).replace(
-    /^(?:marque|marca|marcar|coloca|coloque|adiciona|bota|poe|põe|lanca|lança|anota|mais|de|do|da)\s+/i,
+    /^(?:(?:depois|agora|tambem|também|ainda|entao|então|marque|marca|marcar|coloca|coloque|adiciona|bota|poe|põe|lanca|lança|anota|mais|de|do|da)\s+)+/i,
     ''
   );
   let qty = 1;
@@ -1357,7 +1357,9 @@ function parseSingleSegmentQtyAndName(seg: string): {
     const remainder = qtyMatch[2].trim();
     // Do NOT treat volume/weight/fraction numbers like "2 litros de coca", "2 e meio", or "600 ml" as quantity
     const startsWithUnit =
-      /^(?:litros?|l\b|mls?\b|gramas?|g\b|kg\b|e\s+mei[oa]\b)/i.test(remainder);
+      /^(?:litros?|l\b|mls?\b|gramas?|g\b|kg\b|e\s+mei[oa]\b|(?:litr[ao]o?s?|litr[oõ]es|litroes)\s+e\s+mei[oa]\b)/i.test(
+        remainder
+      );
     if (!startsWithUnit) {
       const qToken = qtyMatch[1];
       qty = Number.isNaN(Number(qToken)) ? PT_NUMBERS[qToken] || 1 : parseInt(qToken, 10);
@@ -1385,7 +1387,7 @@ function smartSplitOrderSegments(rawOrderText: string, catalog: MenuItem[]): str
   for (const chunk of commaChunks) {
     const protectedChunk = chunk
       .replace(
-        /\b(\d+|um|uma|dois|duas|tr[eê]s|1l|2l|3l|litros?|l)\s+e\s+(mei[oa])\b/gi,
+        /\b(\d+|um|uma|dois|duas|tr[eê]s|1l|2l|3l|litros?|litr[aã]o?s?|litr[oõ]es|litroes|l)\s+e\s+(mei[oa])\b/gi,
         `$1 ${COMPOUND_MARKER} $2`
       )
       .replace(/\b(meio)\s+a\s+(meio)\b/gi, '$1 a $2');
@@ -1635,7 +1637,18 @@ function parseSingleClauseStrictly(
   if (matchTarget && matchTarget[2]) {
     const rawTarget = cleanCustomerCandidateText(matchTarget[2]);
     orderPart = matchTarget[1].trim();
-    customerName = resolveCustomerNameFromExisting(rawTarget, existingCustomerNames);
+    const isSameAccountPhrase =
+      /^(?:mesma\s+conta|mesma\s+comanda|mesmo\s+cliente|ele|ela|aqui)$/i.test(
+        normalizeText(rawTarget)
+      );
+    if (isSameAccountPhrase && fallbackSelectedCustomerName?.trim()) {
+      customerName = resolveCustomerNameFromExisting(
+        fallbackSelectedCustomerName,
+        existingCustomerNames
+      );
+    } else if (!isSameAccountPhrase) {
+      customerName = resolveCustomerNameFromExisting(rawTarget, existingCustomerNames);
+    }
 
     if (/^mesa\s+\d+/i.test(customerName)) {
       tableLabel = customerName;

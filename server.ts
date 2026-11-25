@@ -5,6 +5,7 @@ import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
+import { mergeStoreSnapshots } from './src/utils/storeSyncMerge';
 
 dotenv.config();
 
@@ -1091,6 +1092,12 @@ async function startServer() {
       callerUid?: string;
       callerName?: string;
       actionType?: 'add' | 'remove' | 'sync' | 'catalog';
+      mutatedScopes?: Array<'tabs' | 'tabItems' | 'menuItems' | 'voiceOperators'>;
+      removedTabItemIds?: string[];
+      removedTabIds?: string[];
+      removedMenuIds?: string[];
+      removedOperatorIds?: string[];
+      clearedAllMenu?: boolean;
     };
 
     // Enforce RBAC on the server: Garçom can NEVER perform a 'remove' action
@@ -1140,36 +1147,37 @@ async function startServer() {
       }
     }
 
-    const nextSnapshot: ServerStoreSnapshot = {
-      storeCode: code,
-      storeName:
-        typeof body.storeName === 'string' && body.storeName.trim()
-          ? body.storeName.trim().slice(0, 80)
-          : current?.storeName || 'Bar & Comércio Central',
-      catalogInitialized:
-        typeof body.catalogInitialized === 'boolean'
-          ? body.catalogInitialized
-          : current?.catalogInitialized ?? true,
-      autoArchivePaidAfter10Min:
-        typeof body.autoArchivePaidAfter10Min === 'boolean'
-          ? body.autoArchivePaidAfter10Min
-          : current?.autoArchivePaidAfter10Min ?? false,
-      menuItems: Array.isArray(body.menuItems)
-        ? body.menuItems
-        : current?.menuItems || [],
-      tabs: Array.isArray(body.tabs) ? body.tabs : current?.tabs || [],
-      tabItems: Array.isArray(body.tabItems)
-        ? body.tabItems
-        : current?.tabItems || [],
-      voiceOperators: Array.isArray(body.voiceOperators)
-        ? body.voiceOperators
-        : current?.voiceOperators || [],
-      updatedAtMs: typeof body.updatedAtMs === 'number' ? body.updatedAtMs : Date.now(),
-    };
+    const nextSnapshot: ServerStoreSnapshot = mergeStoreSnapshots(
+      current,
+      {
+        storeCode: code,
+        storeName: body.storeName,
+        catalogInitialized: body.catalogInitialized,
+        autoArchivePaidAfter10Min: body.autoArchivePaidAfter10Min,
+        menuItems: body.menuItems,
+        tabs: body.tabs,
+        tabItems: body.tabItems,
+        voiceOperators: body.voiceOperators,
+        updatedAtMs: body.updatedAtMs,
+      },
+      {
+        actionType: body.actionType || 'add',
+        mutatedScopes: Array.isArray(body.mutatedScopes) ? body.mutatedScopes : undefined,
+        removedTabItemIds: Array.isArray(body.removedTabItemIds)
+          ? body.removedTabItemIds
+          : undefined,
+        removedTabIds: Array.isArray(body.removedTabIds) ? body.removedTabIds : undefined,
+        removedMenuIds: Array.isArray(body.removedMenuIds) ? body.removedMenuIds : undefined,
+        removedOperatorIds: Array.isArray(body.removedOperatorIds)
+          ? body.removedOperatorIds
+          : undefined,
+        clearedAllMenu: Boolean(body.clearedAllMenu),
+      }
+    );
 
     // Also keep waiter accounts in sync with voiceOperators list
-    if (Array.isArray(body.voiceOperators)) {
-      for (const rawOp of body.voiceOperators) {
+    if (Array.isArray(nextSnapshot.voiceOperators)) {
+      for (const rawOp of nextSnapshot.voiceOperators) {
         if (rawOp && typeof rawOp === 'object') {
           const op = rawOp as {
             id?: string;
@@ -1206,7 +1214,7 @@ async function startServer() {
 
     storeMemoryMap.set(code, nextSnapshot);
     saveDatabaseToDisk();
-    res.json({ ok: true, updatedAtMs: nextSnapshot.updatedAtMs });
+    res.json({ ok: true, updatedAtMs: nextSnapshot.updatedAtMs, snapshot: nextSnapshot });
   });
 
   // Natural Language Bar Assistant "MARCELO" Multi-Customer & Strict Parser using Gemini
@@ -1510,8 +1518,17 @@ Se não for possível identificar nenhum produto válido, retorne understood: fa
     app.use(vite.middlewares);
   } else {
     const distPath = path.join(__dirname, 'dist');
-    app.use(express.static(distPath));
+    app.use(
+      express.static(distPath, {
+        setHeaders: (res, filePath) => {
+          if (filePath.endsWith('index.html')) {
+            res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
+          }
+        },
+      })
+    );
     app.get('*', (_req, res) => {
+      res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
       res.sendFile(path.join(distPath, 'index.html'));
     });
   }

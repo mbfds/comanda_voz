@@ -16,6 +16,7 @@ import {
   deleteDoc,
   updateDoc,
   setDoc,
+  increment,
   Timestamp,
 } from 'firebase/firestore';
 import {
@@ -586,6 +587,11 @@ function ComandaVozWorkspace() {
     tabItems?: TabItem[];
     voiceOperators?: VoiceOperator[];
     actionType?: 'add' | 'remove' | 'catalog';
+    removedTabItemIds?: string[];
+    removedTabIds?: string[];
+    removedMenuIds?: string[];
+    removedOperatorIds?: string[];
+    clearedAllMenu?: boolean;
   }) => {
     isMutatingRef.current = true;
     lastMutationMsRef.current = Date.now();
@@ -606,6 +612,12 @@ function ComandaVozWorkspace() {
     const updatedTabItems = nextData.tabItems ?? tabItems;
     const updatedOperators = nextData.voiceOperators ?? voiceOperators;
 
+    const mutatedScopes: Array<'tabs' | 'tabItems' | 'menuItems' | 'voiceOperators'> = [];
+    if (nextData.tabs !== undefined) mutatedScopes.push('tabs');
+    if (nextData.tabItems !== undefined) mutatedScopes.push('tabItems');
+    if (nextData.menuItems !== undefined) mutatedScopes.push('menuItems');
+    if (nextData.voiceOperators !== undefined) mutatedScopes.push('voiceOperators');
+
     const payload = {
       storeCode: code,
       storeName: sName,
@@ -620,6 +632,12 @@ function ComandaVozWorkspace() {
       callerUid: directSession?.uid || user?.uid || '',
       callerName: userProfile?.userName || directSession?.userName || '',
       actionType: nextData.actionType || 'add',
+      mutatedScopes,
+      removedTabItemIds: nextData.removedTabItemIds,
+      removedTabIds: nextData.removedTabIds,
+      removedMenuIds: nextData.removedMenuIds,
+      removedOperatorIds: nextData.removedOperatorIds,
+      clearedAllMenu: nextData.clearedAllMenu,
       updatedAtMs: Date.now(),
     };
 
@@ -631,11 +649,48 @@ function ComandaVozWorkspace() {
     }
 
     try {
-      await fetch(`/api/store/${encodeURIComponent(code)}`, {
+      const response = await fetch(`/api/store/${encodeURIComponent(code)}`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload),
       });
+      if (response.ok) {
+        const resData = (await response.json()) as {
+          ok?: boolean;
+          snapshot?: {
+            autoArchivePaidAfter10Min?: boolean;
+            menuItems?: MenuItem[];
+            tabs?: BarTab[];
+            tabItems?: TabItem[];
+            voiceOperators?: VoiceOperator[];
+          };
+        };
+        if (resData.snapshot) {
+          if (typeof resData.snapshot.autoArchivePaidAfter10Min === 'boolean') {
+            setAutoArchivePaidAfter10Min(resData.snapshot.autoArchivePaidAfter10Min);
+          }
+          if (Array.isArray(resData.snapshot.menuItems)) {
+            setMenuItems(resData.snapshot.menuItems);
+          }
+          if (Array.isArray(resData.snapshot.tabs)) {
+            setTabs(resData.snapshot.tabs);
+          }
+          if (Array.isArray(resData.snapshot.tabItems)) {
+            setTabItems(resData.snapshot.tabItems);
+          }
+          if (Array.isArray(resData.snapshot.voiceOperators)) {
+            setVoiceOperators(resData.snapshot.voiceOperators);
+          }
+          try {
+            localStorage.setItem(
+              `comanda_voz_store_${code}`,
+              JSON.stringify(resData.snapshot)
+            );
+          } catch {
+            // ignore storage quota errors
+          }
+        }
+      }
     } catch {
       // offline fallback handled by localStorage
     } finally {
@@ -982,7 +1037,7 @@ function ComandaVozWorkspace() {
     let isCancelled = false;
 
     const loadFromServerOrLocal = async (isInitial: boolean) => {
-      if (!isInitial && (isMutatingRef.current || Date.now() - lastMutationMsRef.current < 4000)) {
+      if (!isInitial && (isMutatingRef.current || Date.now() - lastMutationMsRef.current < 1500)) {
         return;
       }
 
@@ -1005,7 +1060,7 @@ function ComandaVozWorkspace() {
           if (
             !isCancelled &&
             !isMutatingRef.current &&
-            Date.now() - lastMutationMsRef.current >= (isInitial ? 0 : 4000) &&
+            Date.now() - lastMutationMsRef.current >= (isInitial ? 0 : 1500) &&
             data.exists
           ) {
             const isCatInit =
@@ -1103,7 +1158,7 @@ function ComandaVozWorkspace() {
     loadFromServerOrLocal(true);
     const intervalId = window.setInterval(() => {
       loadFromServerOrLocal(false);
-    }, 3500);
+    }, 2500);
 
     return () => {
       isCancelled = true;
@@ -1711,13 +1766,17 @@ function ComandaVozWorkspace() {
               updatedAt: serverTimestamp(),
             });
           } else {
+            const addedTotal = Number(
+              (tabState.runningTotal - tabState.previousTotal).toFixed(2)
+            );
+            const addedCount = Math.max(0, tabState.runningCount - tabState.previousCount);
             batch.update(tabRef, {
               status: 'open',
               customerName: tabState.customerName,
               tableLabel: tabState.tableLabel,
-              totalAmount: tabState.runningTotal,
+              totalAmount: increment(addedTotal),
               paidAmount: tabState.previousPaid,
-              itemCount: tabState.runningCount,
+              itemCount: increment(addedCount),
               updatedAt: serverTimestamp(),
             });
           }
@@ -2557,6 +2616,11 @@ function ComandaVozWorkspace() {
     }
   };
 
+  const processOrderPhraseRef = useRef(processOrderPhrase);
+  processOrderPhraseRef.current = processOrderPhrase;
+  const marceloVoiceReplyEnabledRef = useRef(marceloVoiceReplyEnabled);
+  marceloVoiceReplyEnabledRef.current = marceloVoiceReplyEnabled;
+
   // Release any active SpeechRecognition or live tracker stream so AudioContext biometric capture won't hit NotReadableError
   const releaseActiveMicForBiometrics = async () => {
     let hadActiveMic = false;
@@ -2700,25 +2764,25 @@ function ComandaVozWorkspace() {
                     message:
                       'Marcelo na escuta! Pode falar o comando agora (ex: "marca 1 litrão para Tiago").',
                   });
-                  speakAsMarcelo('Pode falar!', marceloVoiceReplyEnabled);
+                  speakAsMarcelo('Pode falar!', marceloVoiceReplyEnabledRef.current);
                 } else if (wakeInfo.commandTranscript) {
                   marceloAwakeUntilMsRef.current = 0;
                   setMarceloAwakeWindowActive(false);
-                  processOrderPhrase(wakeInfo.commandTranscript, 'voz');
+                  processOrderPhraseRef.current(wakeInfo.commandTranscript, 'voz');
                 }
               } else if (nowMs < marceloAwakeUntilMsRef.current) {
                 // Spoken within 12 seconds after saying "Marcelo"
                 marceloAwakeUntilMsRef.current = 0;
                 setMarceloAwakeWindowActive(false);
                 setLastIgnoredOpenMicPhrase('');
-                processOrderPhrase(finalPhrase, 'voz');
+                processOrderPhraseRef.current(finalPhrase, 'voz');
               } else {
                 // Casual conversation with open microphone: ignore silently without interrupting the waiter!
                 setMarceloAwakeWindowActive(false);
                 setLastIgnoredOpenMicPhrase(finalPhrase);
               }
             } else {
-              processOrderPhrase(finalPhrase, 'voz');
+              processOrderPhraseRef.current(finalPhrase, 'voz');
             }
           } else {
             interim += res[0].transcript;
@@ -3300,7 +3364,11 @@ function ComandaVozWorkspace() {
       }
 
       if (isDirectSession) {
-        await syncDirectStoreSnapshot({ voiceOperators: nextOps, actionType: 'remove' });
+        await syncDirectStoreSnapshot({
+          voiceOperators: nextOps,
+          actionType: 'remove',
+          removedOperatorIds: [opId],
+        });
       } else {
         await deleteDoc(doc(db, 'voiceOperators', opId));
       }
@@ -3406,6 +3474,10 @@ function ComandaVozWorkspace() {
           tabs: nextTabs,
           tabItems: nextTabItems,
           actionType: 'remove',
+          removedTabItemIds: undoInfo.addedItemIds,
+          removedTabIds: undoInfo.tabsAffected
+            .filter((t) => t.createdNewTab)
+            .map((t) => t.tabId),
         });
       } else {
         const batch = writeBatch(db);
@@ -3530,9 +3602,9 @@ function ComandaVozWorkspace() {
           status: 'open',
           customerName: selectedTab.customerName,
           tableLabel: selectedTab.tableLabel,
-          totalAmount: newTotal,
+          totalAmount: increment(menuItem.price),
           paidAmount: selectedTab.paidAmount,
-          itemCount: newCount,
+          itemCount: increment(1),
           updatedAt: serverTimestamp(),
         });
 
@@ -3610,6 +3682,7 @@ function ComandaVozWorkspace() {
           tabs: nextTabs,
           tabItems: nextTabItems,
           actionType: delta < 0 ? 'remove' : 'add',
+          removedTabItemIds: nextQty <= 0 ? [item.id] : undefined,
         });
       } else {
         const batch = writeBatch(db);
@@ -3633,9 +3706,9 @@ function ComandaVozWorkspace() {
               : parentTab.status,
           customerName: parentTab.customerName,
           tableLabel: parentTab.tableLabel,
-          totalAmount: nextTabTotal,
+          totalAmount: increment(priceDiff),
           paidAmount: parentTab.paidAmount,
-          itemCount: nextTabCount,
+          itemCount: increment(delta),
           updatedAt: serverTimestamp(),
         });
 
@@ -4095,6 +4168,9 @@ function ComandaVozWorkspace() {
     }
   };
 
+  const registerMenuProductsFromVoiceRef = useRef(registerMenuProductsFromVoice);
+  registerMenuProductsFromVoiceRef.current = registerMenuProductsFromVoice;
+
   // Toggle Voice Capture specifically inside Cardápio tab
   const toggleCardapioVoiceCapture = () => {
     if (!isAdmin) return;
@@ -4173,7 +4249,7 @@ function ComandaVozWorkspace() {
           const finalPhrase = res[0].transcript.trim();
           setMenuVoiceInterim('');
           if (finalPhrase) {
-            registerMenuProductsFromVoice(finalPhrase, false);
+            registerMenuProductsFromVoiceRef.current(finalPhrase, false);
           }
         } else {
           interim += res[0].transcript;
@@ -4265,6 +4341,7 @@ function ComandaVozWorkspace() {
         await syncDirectStoreSnapshot({
           menuItems: nextMenu,
           actionType: 'remove',
+          removedMenuIds: [menuId],
         });
       } else {
         localStorage.setItem(`comanda_voz_fb_menu_seeded_${user.uid}`, 'true');
@@ -4295,6 +4372,7 @@ function ComandaVozWorkspace() {
         await syncDirectStoreSnapshot({
           menuItems: [],
           actionType: 'remove',
+          clearedAllMenu: true,
         });
       } else {
         localStorage.setItem(`comanda_voz_fb_menu_seeded_${user.uid}`, 'true');
